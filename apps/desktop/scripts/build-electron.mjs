@@ -1,9 +1,32 @@
 import { build } from 'vite';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+
+function buildWasapiNativeHelper() {
+  if (process.platform !== 'win32') {
+    return;
+  }
+
+  const cscPath =
+    'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
+  const sourceFile = path.resolve(rootDir, 'native', 'WasapiLoopbackHelper.cs');
+  const outDir = path.resolve(rootDir, 'dist', 'native');
+  const outExe = path.resolve(outDir, 'wasapi-loopback.exe');
+
+  fs.mkdirSync(outDir, { recursive: true });
+
+  execFileSync(
+    cscPath,
+    ['-nologo', '-optimize+', `-out:${outExe}`, sourceFile],
+    { stdio: 'inherit' }
+  );
+  console.log(`✓ Built Windows WASAPI loopback helper: ${outExe}`);
+}
 
 async function buildEntry(entryRelPath, outDirRelPath) {
   await build({
@@ -16,7 +39,7 @@ async function buildEntry(entryRelPath, outDirRelPath) {
       sourcemap: true,
       target: 'node20',
       rollupOptions: {
-        external: ['electron', /^node:/],
+        external: ['electron', 'koffi', /^node:/],
         output: {
           format: 'cjs',
           entryFileNames: 'index.cjs',
@@ -30,5 +53,6 @@ async function buildEntry(entryRelPath, outDirRelPath) {
   });
 }
 
+buildWasapiNativeHelper();
 await buildEntry('src/main/index.ts', 'dist/main');
 await buildEntry('src/preload/index.ts', 'dist/preload');
