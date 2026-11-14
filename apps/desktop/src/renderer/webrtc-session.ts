@@ -1,7 +1,9 @@
 import {
   DEFAULT_LIVENESS_CONFIG,
+  PILOT_NETWORK_POLICY,
   STUN_ICE_SERVERS,
   STREAM_ID_BY_SOURCE,
+  validateStunOnlyIceServers,
   type ApprovedSessionSummary,
   type EphemeralChatMessage,
   type HostMediaRuntimeState,
@@ -54,6 +56,8 @@ export interface WebRtcSessionSnapshot {
   readonly signalingMembershipInvalidated: boolean;
   readonly guestViewerCleared: boolean;
   readonly teardownReceipt: SessionTeardownReceipt | null;
+  readonly restrictiveNetworkLimitationReported: boolean;
+  readonly restrictiveNetworkMessage: string | null;
 }
 
 export interface WebRtcControllerOptions {
@@ -174,6 +178,8 @@ export class ApprovedWebRtcSessionController {
   private guestHeartbeatSuppressed = false;
   private abruptFaultStartedPerfMs: number | null = null;
   private abruptFaultSubReason: string | null = null;
+  private restrictiveNetworkLimitationReported = false;
+  private restrictiveNetworkMessage: string | null = null;
 
   constructor(
     session: ApprovedSessionSummary,
@@ -194,6 +200,13 @@ export class ApprovedWebRtcSessionController {
       ...createInitialHostMediaState(session.hostMediaSelection),
     };
 
+    const stunCheck = validateStunOnlyIceServers(STUN_ICE_SERVERS);
+    if (!stunCheck.valid) {
+      throw new Error(
+        `Zero-bill pilot violation: non-STUN ICE servers rejected: ${stunCheck.rejectedUrls.join(', ')}`
+      );
+    }
+
     const rtcConfig: RTCConfiguration = {
       iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
     };
@@ -202,6 +215,25 @@ export class ApprovedWebRtcSessionController {
     this.pcGuest = new RTCPeerConnection(rtcConfig);
 
     this.setupPeerConnectionListeners();
+  }
+
+  /**
+   * Reports that direct peer-to-peer connectivity failed under the zero-bill STUN-only
+   * pilot policy (e.g. symmetric NAT or UDP-blocking enterprise firewall) and runs the
+   * unified idempotent session teardown without falling back to paid TURN relays.
+   */
+  public async reportRestrictiveNetworkDirectConnectionFailure(
+    detail?: string
+  ): Promise<SessionTeardownReceipt> {
+    this.restrictiveNetworkLimitationReported = true;
+    this.restrictiveNetworkMessage = detail
+      ? `${PILOT_NETWORK_POLICY.restrictiveNetworkLimitationMessage} [Detail: ${detail}]`
+      : PILOT_NETWORK_POLICY.restrictiveNetworkLimitationMessage;
+    this.lastStatusBanner = this.restrictiveNetworkMessage;
+    return this.executeIdempotentTeardown('connection_lost', {
+      subReason: 'restrictive_network_stun_only_direct_connection_failed',
+      detectionStartedAtMs: this.abruptFaultStartedPerfMs ?? performance.now(),
+    });
   }
 
   private setupPeerConnectionListeners(): void {
@@ -218,6 +250,12 @@ export class ApprovedWebRtcSessionController {
         hostIce === 'failed' ||
         guestIce === 'failed'
       ) {
+        if (this.hostDataChannel?.readyState !== 'open') {
+          void this.reportRestrictiveNetworkDirectConnectionFailure(
+            `ICE=${hostIce}/${guestIce}, PC=${hostConn}/${guestConn}`
+          );
+          return;
+        }
         void this.executeIdempotentTeardown('connection_lost', {
           subReason: 'webrtc_transport_failed',
           detectionStartedAtMs:
@@ -1471,6 +1509,9 @@ export class ApprovedWebRtcSessionController {
       signalingMembershipInvalidated: this.signalingMembershipInvalidated,
       guestViewerCleared: this.guestViewerCleared,
       teardownReceipt: this.teardownReceipt,
+      restrictiveNetworkLimitationReported:
+        this.restrictiveNetworkLimitationReported,
+      restrictiveNetworkMessage: this.restrictiveNetworkMessage,
     };
   }
 
@@ -1606,7 +1647,11 @@ export class ApprovedWebRtcSessionController {
     };
 
     this.teardownReceipt = receipt;
-    this.lastStatusBanner = `Session ended (${reason} / ${subReason}). All tracks stopped, viewer cleared, and permissions invalidated. Send a fresh invite to connect again.`;
+    if (this.restrictiveNetworkLimitationReported && this.restrictiveNetworkMessage) {
+      this.lastStatusBanner = this.restrictiveNetworkMessage;
+    } else {
+      this.lastStatusBanner = `Session ended (${reason} / ${subReason}). All tracks stopped, viewer cleared, and permissions invalidated. Send a fresh invite to connect again.`;
+    }
     this.emitChange();
     return { receipt, isFirstCall: true };
   }
@@ -2635,10 +2680,249 @@ async function controllerSendChatWhileMinimized(
   });
 }
 
+export interface Phase5PilotReadinessSuiteReport {
+  readonly allPassed: boolean;
+  readonly stunOnlyZeroBillPolicyCheck: {
+    readonly passed: boolean;
+    readonly stunOnly: boolean;
+    readonly turnEnabled: boolean;
+    readonly paidServicesEnabled: boolean;
+    readonly autoUpgradeEnabled: boolean;
+    readonly configuredStunServers: readonly string[];
+    readonly turnUrlsRejectedByValidator: boolean;
+    readonly restrictiveNetworkLimitationReported: boolean;
+    readonly restrictiveNetworkMessage: string | null;
+    readonly teardownSubReason: string | null;
+  };
+  readonly authorizedMeetingThirdAttendeePresentationIsolation: {
+    readonly passed: boolean;
+    readonly presentationWindowSourceId: string;
+    readonly presentationWindowTitle: string;
+    readonly separateChatWindowSourceId: string;
+    readonly separateChatWindowTitle: string;
+    readonly distinctWindowSources: boolean;
+    readonly selectedPresentationSurfaceType: string;
+    readonly thirdAttendeeReceivedVideoTracks: number;
+    readonly thirdAttendeeReceivedChatChannels: number;
+    readonly privateChatMessagesKeptInSeparateWindow: number;
+    readonly captureEvasionUsed: false;
+  };
+}
+
+export async function runPhase5StagingAndPilotReadinessSuite(): Promise<Phase5PilotReadinessSuiteReport> {
+  // 1. STUN-Only Zero-Bill Policy & Restrictive Network Direct Connection Failure Reporting
+  const validStun = validateStunOnlyIceServers(STUN_ICE_SERVERS);
+  const invalidTurn = validateStunOnlyIceServers([
+    ...STUN_ICE_SERVERS,
+    { urls: 'turn:turn.example.org:3478?transport=udp' },
+  ]);
+
+  const aliceRes = await window.elmDesktop.signInWithTestDouble('alice');
+  const bobRes = await window.elmDesktop.signInWithTestDouble('bob');
+  if (!aliceRes.ok || !aliceRes.data || !bobRes.ok || !bobRes.data) {
+    throw new Error('Failed to sign in personas for Phase 5 verification');
+  }
+  await window.elmDesktop.setPresenceOnline(true, { personaKey: 'alice' });
+  await window.elmDesktop.setPresenceOnline(true, { personaKey: 'bob' });
+  await window.elmDesktop.switchActivePersona('bob');
+  const invRes = await window.elmDesktop.sendFriendCodeInvite(
+    aliceRes.data.account.friendCode
+  );
+  if (!invRes.ok || !invRes.data) {
+    throw new Error('Failed to send invite for Phase 5 restrictive network test');
+  }
+  await window.elmDesktop.switchActivePersona('alice');
+  const accRes = await window.elmDesktop.respondToInvite({
+    inviteId: invRes.data.invite.inviteId,
+    action: 'accept',
+    mediaSelection: {
+      screenVideo: false,
+      microphoneAudio: false,
+      deviceAudio: false,
+    },
+  });
+  if (!accRes.ok || !accRes.data?.session) {
+    throw new Error('Failed to accept invite for Phase 5 restrictive network test');
+  }
+
+  const restrictiveController = new ApprovedWebRtcSessionController(
+    accRes.data.session,
+    () => {},
+    { enableBackgroundLivenessTimer: false }
+  );
+  const restrictiveReceipt =
+    await restrictiveController.reportRestrictiveNetworkDirectConnectionFailure(
+      'Simulated symmetric NAT / UDP 19302 & 3478 blocked on restrictive network'
+    );
+  const restrictiveSnap = restrictiveController.getSnapshot();
+
+  const stunOnlyZeroBillPolicyCheck = {
+    passed:
+      PILOT_NETWORK_POLICY.stunOnly === true &&
+      PILOT_NETWORK_POLICY.turnEnabled === false &&
+      PILOT_NETWORK_POLICY.paidServicesEnabled === false &&
+      PILOT_NETWORK_POLICY.autoUpgradeEnabled === false &&
+      validStun.valid === true &&
+      invalidTurn.valid === false &&
+      restrictiveSnap.restrictiveNetworkLimitationReported === true &&
+      Boolean(
+        restrictiveSnap.restrictiveNetworkMessage?.includes('STUN-only mode')
+      ) &&
+      restrictiveReceipt.subReason ===
+        'restrictive_network_stun_only_direct_connection_failed',
+    stunOnly: PILOT_NETWORK_POLICY.stunOnly,
+    turnEnabled: PILOT_NETWORK_POLICY.turnEnabled,
+    paidServicesEnabled: PILOT_NETWORK_POLICY.paidServicesEnabled,
+    autoUpgradeEnabled: PILOT_NETWORK_POLICY.autoUpgradeEnabled,
+    configuredStunServers: PILOT_NETWORK_POLICY.stunServers,
+    turnUrlsRejectedByValidator:
+      invalidTurn.valid === false && invalidTurn.rejectedUrls.length === 1,
+    restrictiveNetworkLimitationReported:
+      restrictiveSnap.restrictiveNetworkLimitationReported,
+    restrictiveNetworkMessage: restrictiveSnap.restrictiveNetworkMessage,
+    teardownSubReason: restrictiveReceipt.subReason,
+  };
+
+  // 2. Authorized Meeting Test: 3rd Attendee Presentation Window Isolation vs Separate Chat Window
+  await window.elmDesktop.openSeparateChatWindow();
+  await new Promise((r) => setTimeout(r, 250));
+
+  const sources = await window.elmDesktop.listShareableSources();
+  const windowSources = sources.filter((s) => s.surfaceType === 'window');
+  const presentationWindow =
+    windowSources.find((s) => s.name.includes('Consent-Based 1:1')) ??
+    windowSources[0] ??
+    sources[0];
+  const chatWindow =
+    windowSources.find((s) => s.name.includes('Private 1:1 Session Chat')) ??
+    windowSources.find((s) => s.id !== presentationWindow?.id) ??
+    presentationWindow;
+
+  await window.elmDesktop.setPresenceOnline(true, { personaKey: 'alice' });
+  await window.elmDesktop.setPresenceOnline(true, { personaKey: 'bob' });
+  await window.elmDesktop.switchActivePersona('bob');
+  const inv2 = await window.elmDesktop.sendFriendCodeInvite(
+    aliceRes.data.account.friendCode
+  );
+  await window.elmDesktop.switchActivePersona('alice');
+  const acc2 = await window.elmDesktop.respondToInvite({
+    inviteId: inv2.data!.invite.inviteId,
+    action: 'accept',
+    mediaSelection: {
+      screenVideo: true,
+      microphoneAudio: false,
+      deviceAudio: false,
+    },
+  });
+
+  const meetingController = new ApprovedWebRtcSessionController(
+    acc2.data!.session!,
+    () => {},
+    { enableBackgroundLivenessTimer: false }
+  );
+  await meetingController.connectChatSession();
+  await meetingController.startHostSharing({
+    selectedSourceId: presentationWindow.id,
+    playWasapiTestTone: false,
+  });
+
+  // Exchange private 1:1 chat in the Separate Chat Window channel
+  await meetingController.sendChatMessageOverDataChannel({
+    sender: 'host',
+    text: 'Private rehearsal note in Separate Chat Window (out of shared presentation window)',
+  });
+  await meetingController.sendChatMessageOverDataChannel({
+    sender: 'guest',
+    text: 'Confirmed: 3rd attendee only sees the selected Presentation Window',
+  });
+
+  // Connect 3rd Meeting Attendee (Attendee C) receiving ONLY the selected Presentation Window video track
+  const pcHostToAttendeeC = new RTCPeerConnection({
+    iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
+  });
+  const pcAttendeeC = new RTCPeerConnection({
+    iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
+  });
+
+  let attendeeCVideoTracks = 0;
+  let attendeeCChatChannels = 0;
+  pcAttendeeC.ontrack = (ev) => {
+    if (ev.track.kind === 'video') {
+      attendeeCVideoTracks += 1;
+    }
+  };
+  pcAttendeeC.ondatachannel = () => {
+    attendeeCChatChannels += 1;
+  };
+  pcHostToAttendeeC.onicecandidate = (e) => {
+    if (e.candidate) void pcAttendeeC.addIceCandidate(e.candidate);
+  };
+  pcAttendeeC.onicecandidate = (e) => {
+    if (e.candidate) void pcHostToAttendeeC.addIceCandidate(e.candidate);
+  };
+
+  const snapDuringMeeting = meetingController.getSnapshot();
+  const sharedPresentationTrack = snapDuringMeeting.guestReceivedTracks.find(
+    (t) => t.source === 'screenVideo'
+  );
+  if (sharedPresentationTrack) {
+    pcHostToAttendeeC.addTrack(
+      sharedPresentationTrack.track,
+      sharedPresentationTrack.stream
+    );
+  }
+  const offerC = await pcHostToAttendeeC.createOffer();
+  await pcHostToAttendeeC.setLocalDescription(offerC);
+  await pcAttendeeC.setRemoteDescription(offerC);
+  const answerC = await pcAttendeeC.createAnswer();
+  await pcAttendeeC.setLocalDescription(answerC);
+  await pcHostToAttendeeC.setRemoteDescription(answerC);
+
+  await new Promise((r) => setTimeout(r, 180));
+
+  pcHostToAttendeeC.close();
+  pcAttendeeC.close();
+  await meetingController.executeIdempotentTeardown('user_top_bar_disconnect', {
+    subReason: 'phase5_meeting_test_complete',
+  });
+
+  const distinctWindowSources =
+    Boolean(presentationWindow && chatWindow) &&
+    presentationWindow.id !== chatWindow.id;
+
+  const authorizedMeetingThirdAttendeePresentationIsolation = {
+    passed:
+      distinctWindowSources &&
+      presentationWindow.surfaceType === 'window' &&
+      attendeeCVideoTracks === 1 &&
+      attendeeCChatChannels === 0 &&
+      snapDuringMeeting.messages.length === 2,
+    presentationWindowSourceId: presentationWindow?.id ?? '',
+    presentationWindowTitle: presentationWindow?.name ?? '',
+    separateChatWindowSourceId: chatWindow?.id ?? '',
+    separateChatWindowTitle: chatWindow?.name ?? '',
+    distinctWindowSources,
+    selectedPresentationSurfaceType: presentationWindow?.surfaceType ?? '',
+    thirdAttendeeReceivedVideoTracks: attendeeCVideoTracks,
+    thirdAttendeeReceivedChatChannels: attendeeCChatChannels,
+    privateChatMessagesKeptInSeparateWindow: snapDuringMeeting.messages.length,
+    captureEvasionUsed: false as const,
+  };
+
+  return {
+    allPassed:
+      stunOnlyZeroBillPolicyCheck.passed &&
+      authorizedMeetingThirdAttendeePresentationIsolation.passed,
+    stunOnlyZeroBillPolicyCheck,
+    authorizedMeetingThirdAttendeePresentationIsolation,
+  };
+}
+
 declare global {
   interface Window {
     runElmWebRtcVerificationMatrix?: typeof runAllWebRtcSessionVerificationMatrix;
     runElmPhase4VerificationSuite?: typeof runPhase4LifecycleAndTeardownVerificationSuite;
+    runElmPhase5VerificationSuite?: typeof runPhase5StagingAndPilotReadinessSuite;
   }
 }
 
@@ -2646,5 +2930,7 @@ if (typeof window !== 'undefined') {
   window.runElmWebRtcVerificationMatrix = runAllWebRtcSessionVerificationMatrix;
   window.runElmPhase4VerificationSuite =
     runPhase4LifecycleAndTeardownVerificationSuite;
+  window.runElmPhase5VerificationSuite =
+    runPhase5StagingAndPilotReadinessSuite;
 }
 

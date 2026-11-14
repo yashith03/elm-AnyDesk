@@ -5,11 +5,13 @@ node_modules/
 dist/
 out/
 build/
+release/
 *.tsbuildinfo
 
 # Cloudflare Wrangler
 .wrangler/
 .dev.vars
+!.dev.vars.example
 
 # Environment files
 .env

@@ -4,7 +4,7 @@
  * Electron desktop app and the Cloudflare Workers + D1 + SQLite Durable Objects backend.
  */
 
-export const PROTOCOL_VERSION = '0.4.0-phase4' as const;
+export const PROTOCOL_VERSION = '0.5.0-phase5' as const;
 
 /**
  * Default liveness heartbeat configuration.
@@ -26,6 +26,43 @@ export const STUN_ICE_SERVERS: ReadonlyArray<{ readonly urls: string }> =
     Object.freeze({ urls: 'stun:stun.l.google.com:19302' }),
     Object.freeze({ urls: 'stun:stun.cloudflare.com:3478' }),
   ]);
+
+/**
+ * Zero-bill pilot policy constants.
+ * Strictly enforces STUN-only WebRTC, no TURN relays, no paid services, and no automatic upgrades.
+ */
+export const PILOT_NETWORK_POLICY = Object.freeze({
+  stunOnly: true,
+  turnEnabled: false,
+  paidServicesEnabled: false,
+  autoUpgradeEnabled: false,
+  stunServers: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] as const,
+  restrictiveNetworkLimitationMessage:
+    'Direct peer-to-peer connection failed under STUN-only mode (stun:stun.l.google.com:19302, stun:stun.cloudflare.com:3478). Because this zero-bill pilot does not enable paid TURN relays, connections across symmetric NATs or UDP-blocking enterprise firewalls cannot complete. Switch to a less restrictive network or allow outbound UDP on ports 19302/3478.',
+});
+
+/**
+ * Validates that an ICE server list contains only STUN URLs (`stun:` / `stuns:`)
+ * and rejects any `turn:` or `turns:` relay servers.
+ */
+export function validateStunOnlyIceServers(
+  iceServers: ReadonlyArray<{ readonly urls: string | readonly string[] }>
+): { readonly valid: boolean; readonly rejectedUrls: readonly string[] } {
+  const rejectedUrls: string[] = [];
+  for (const entry of iceServers) {
+    const urls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+    for (const rawUrl of urls) {
+      const normalized = String(rawUrl).trim().toLowerCase();
+      if (!normalized.startsWith('stun:') && !normalized.startsWith('stuns:')) {
+        rejectedUrls.push(String(rawUrl));
+      }
+    }
+  }
+  return {
+    valid: rejectedUrls.length === 0 && iceServers.length > 0,
+    rejectedUrls,
+  };
+}
 
 /**
  * Friend Code format: ELM-XXXX-XXXX where X is an unambiguous uppercase alphanumeric
@@ -155,6 +192,7 @@ export type ProtocolErrorCode =
   | 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
   | 'SESSION_ALREADY_ENDED'
   | 'INVALID_SIGNAL_PAYLOAD'
+  | 'RESTRICTIVE_NETWORK_STUN_ONLY_LIMITATION'
   | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2';
 
 /**
@@ -366,11 +404,30 @@ export type CoordinatorServerEvent =
     };
 
 /**
+ * Pilot installer & download metadata served by the Worker download page (`GET /download/manifest.json`).
+ */
+export interface PilotDownloadManifest {
+  readonly appName: string;
+  readonly version: string;
+  readonly protocolVersion: typeof PROTOCOL_VERSION;
+  readonly platform: 'win32-x64';
+  readonly installerFilename: string;
+  readonly installerDownloadUrl: string;
+  readonly installerSha256: string;
+  readonly autoUpgradeEnabled: false;
+  readonly stunOnlyPilot: true;
+  readonly turnEnabled: false;
+  readonly paidServicesEnabled: false;
+  readonly stunServers: readonly string[];
+  readonly restrictiveNetworkNotice: string;
+}
+
+/**
  * API health check response contract.
  */
 export interface ApiHealthResponse {
   readonly status: 'ok';
-  readonly phase: 'phase-4-idempotent-teardown-and-liveness';
+  readonly phase: 'phase-5-staging-and-installer-pilot';
   readonly protocolVersion: typeof PROTOCOL_VERSION;
   readonly timestamp: string;
 }

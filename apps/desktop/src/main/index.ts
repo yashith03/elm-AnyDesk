@@ -257,7 +257,7 @@ function registerIpcHandlers(): void {
       platform: process.platform,
       windowRole: role,
       phase:
-        'Phase 4 — Idempotent Session Teardown, Liveness Detection & Non-Resumable Sessions',
+        'Phase 5 — Windows Installer, Cloudflare Staging & Pilot Verification',
       defaultMediaSelection: DEFAULT_HOST_MEDIA_SELECTION,
       initialSessionState: 'idle',
       securityPosture: {
@@ -727,6 +727,18 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
           } else {
             results.phase4TeardownAndLivenessSuiteError =
               'runElmPhase4VerificationSuite not found on window';
+          }
+
+          // Phase 5: STUN-Only Zero-Bill Policy, Restrictive Network Reporting & Authorized Meeting 3rd Attendee Presentation Isolation
+          if (typeof window.runElmPhase5VerificationSuite === 'function') {
+            results.phase5PilotReadinessSuite = await withTimeout(
+              window.runElmPhase5VerificationSuite(),
+              30000,
+              'runElmPhase5VerificationSuite'
+            );
+          } else {
+            results.phase5PilotReadinessSuiteError =
+              'runElmPhase5VerificationSuite not found on window';
           }
 
           return JSON.stringify(results);

@@ -36,7 +36,7 @@ export interface DesktopRuntimeMetadata {
   readonly protocolVersion: string;
   readonly platform: string;
   readonly windowRole: DesktopWindowRole;
-  readonly phase: 'Phase 4 — Idempotent Session Teardown, Liveness Detection & Non-Resumable Sessions';
+  readonly phase: 'Phase 5 — Windows Installer, Cloudflare Staging & Pilot Verification';
   readonly defaultMediaSelection: HostMediaSelection;
   readonly initialSessionState: SessionLifecycleState;
   readonly securityPosture: DesktopSecurityPosture;

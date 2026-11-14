@@ -1249,3 +1249,66 @@ test('5. Phase 4: Unified idempotent teardown, liveness check vs session duratio
   const session5 = await createAndAcceptFreshSession();
   assert.notEqual(session5.sessionId, session4.sessionId);
 });
+
+test('6. Phase 5: Pilot installer download page, download manifest, STUN-only policy, and zero-TURN/zero-auto-upgrade invariants', async () => {
+  const env = createTestEnv();
+  const worker = createApiWorker();
+
+  const healthRes = await worker.fetch!(
+    new Request('https://api.elm.local/health'),
+    env,
+    dummyCtx
+  );
+  assert.equal(healthRes.status, 200);
+  const healthBody = (await healthRes.json()) as {
+    status: string;
+    phase: string;
+    protocolVersion: string;
+  };
+  assert.equal(healthBody.status, 'ok');
+  assert.equal(healthBody.phase, 'phase-5-staging-and-installer-pilot');
+  assert.equal(healthBody.protocolVersion, '0.5.0-phase5');
+
+  const manifestRes = await worker.fetch!(
+    new Request('https://api.elm.local/download/manifest.json'),
+    env,
+    dummyCtx
+  );
+  assert.equal(manifestRes.status, 200);
+  const manifest = (await manifestRes.json()) as {
+    appName: string;
+    platform: string;
+    installerFilename: string;
+    autoUpgradeEnabled: boolean;
+    stunOnlyPilot: boolean;
+    turnEnabled: boolean;
+    paidServicesEnabled: boolean;
+    stunServers: string[];
+    restrictiveNetworkNotice: string;
+  };
+  assert.equal(manifest.appName, 'Elm-AnyDesk');
+  assert.equal(manifest.platform, 'win32-x64');
+  assert.equal(manifest.installerFilename, 'Elm-AnyDesk-Setup-0.5.0-x64.exe');
+  assert.equal(manifest.autoUpgradeEnabled, false);
+  assert.equal(manifest.stunOnlyPilot, true);
+  assert.equal(manifest.turnEnabled, false);
+  assert.equal(manifest.paidServicesEnabled, false);
+  assert.ok(manifest.stunServers.every((s) => s.startsWith('stun:')));
+  assert.ok(manifest.restrictiveNetworkNotice.includes('STUN-only mode'));
+
+  const pageRes = await worker.fetch!(
+    new Request('https://api.elm.local/download', {
+      headers: { Accept: 'text/html' },
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(pageRes.status, 200);
+  assert.ok(pageRes.headers.get('Content-Type')?.includes('text/html'));
+  const html = await pageRes.text();
+  assert.ok(html.includes('Elm-AnyDesk-Setup-0.5.0-x64.exe'));
+  assert.ok(html.includes('Zero-Bill STUN-Only Pilot'));
+  assert.ok(html.includes('TURN Disabled'));
+  assert.ok(html.includes('Auto-Upgrade Disabled'));
+});
+

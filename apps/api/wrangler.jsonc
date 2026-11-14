@@ -3,6 +3,15 @@
   "name": "elm-anydesk-api",
   "main": "src/index.ts",
   "compatibility_date": "2025-02-01",
+  "vars": {
+    "ENVIRONMENT": "development",
+    "INSTALLER_VERSION": "0.5.0-phase5",
+    "INSTALLER_FILENAME": "Elm-AnyDesk-Setup-0.5.0-x64.exe",
+    "INSTALLER_DOWNLOAD_URL": "/releases/Elm-AnyDesk-Setup-0.5.0-x64.exe",
+    "INSTALLER_SHA256": "SEE_RELEASE_MANIFEST_SHA256",
+    "PILOT_STUN_ONLY": "true",
+    "AUTO_UPDATE_ENABLED": "false"
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -24,5 +33,35 @@
       "tag": "v1",
       "new_sqlite_classes": ["SignalingCoordinator"]
     }
-  ]
+  ],
+  "env": {
+    "staging": {
+      "name": "elm-anydesk-api-staging",
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "INSTALLER_VERSION": "0.5.0-phase5",
+        "INSTALLER_FILENAME": "Elm-AnyDesk-Setup-0.5.0-x64.exe",
+        "INSTALLER_DOWNLOAD_URL": "https://elm-anydesk-api-staging.workers.dev/download",
+        "INSTALLER_SHA256": "SEE_RELEASE_MANIFEST_SHA256",
+        "PILOT_STUN_ONLY": "true",
+        "AUTO_UPDATE_ENABLED": "false"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "elm-anydesk-db-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "SIGNALING_COORDINATOR",
+            "class_name": "SignalingCoordinator"
+          }
+        ]
+      }
+    }
+  }
 }

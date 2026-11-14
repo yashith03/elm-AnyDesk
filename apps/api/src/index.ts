@@ -1,11 +1,13 @@
 import {
   isValidFriendCode,
   normalizeFriendCode,
+  PILOT_NETWORK_POLICY,
   PROTOCOL_VERSION,
   type AccountProfile,
   type ApiHealthResponse,
   type AuthSessionResponse,
   type HostMediaSelection,
+  type PilotDownloadManifest,
   type ProtocolErrorCode,
 } from '@elm/protocol';
 import {
@@ -33,6 +35,13 @@ export interface Env {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   SESSION_HMAC_SECRET?: string;
+  ENVIRONMENT?: string;
+  INSTALLER_VERSION?: string;
+  INSTALLER_FILENAME?: string;
+  INSTALLER_DOWNLOAD_URL?: string;
+  INSTALLER_SHA256?: string;
+  PILOT_STUN_ONLY?: string;
+  AUTO_UPDATE_ENABLED?: string;
 }
 
 export interface ApiWorkerDependencies {
@@ -119,6 +128,193 @@ function getCoordinatorStub(env: Env): DurableObjectStub {
   return env.SIGNALING_COORDINATOR.get(id);
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildPilotDownloadManifest(env: Env): PilotDownloadManifest {
+  return {
+    appName: 'Elm-AnyDesk',
+    version: env.INSTALLER_VERSION?.trim() || '0.5.0-phase5',
+    protocolVersion: PROTOCOL_VERSION,
+    platform: 'win32-x64',
+    installerFilename:
+      env.INSTALLER_FILENAME?.trim() || 'Elm-AnyDesk-Setup-0.5.0-x64.exe',
+    installerDownloadUrl:
+      env.INSTALLER_DOWNLOAD_URL?.trim() ||
+      '/releases/Elm-AnyDesk-Setup-0.5.0-x64.exe',
+    installerSha256:
+      env.INSTALLER_SHA256?.trim() || 'SEE_RELEASE_MANIFEST_SHA256',
+    autoUpgradeEnabled: false,
+    stunOnlyPilot: true,
+    turnEnabled: false,
+    paidServicesEnabled: false,
+    stunServers: [...PILOT_NETWORK_POLICY.stunServers],
+    restrictiveNetworkNotice:
+      PILOT_NETWORK_POLICY.restrictiveNetworkLimitationMessage,
+  };
+}
+
+function renderPilotDownloadPageHtml(manifest: PilotDownloadManifest): string {
+  const safeFilename = escapeHtml(manifest.installerFilename);
+  const safeUrl = escapeHtml(manifest.installerDownloadUrl);
+  const safeVersion = escapeHtml(manifest.version);
+  const safeSha256 = escapeHtml(manifest.installerSha256);
+  const safeNotice = escapeHtml(manifest.restrictiveNetworkNotice);
+  const stunList = manifest.stunServers
+    .map((s) => `<code>${escapeHtml(s)}</code>`)
+    .join(', ');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Elm-AnyDesk — Windows 11 Pilot Installer Download</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 32px 20px;
+      background: #0b1120;
+      color: #e2e8f0;
+      line-height: 1.55;
+    }
+    .container {
+      max-width: 880px;
+      margin: 0 auto;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      padding: 28px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+    }
+    h1 {
+      margin-top: 0;
+      color: #f8fafc;
+      font-size: 1.75rem;
+    }
+    h2 {
+      color: #93c5fd;
+      font-size: 1.15rem;
+      margin-top: 24px;
+      border-bottom: 1px solid #1e293b;
+      padding-bottom: 6px;
+    }
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+    .badge {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #bfdbfe;
+      font-size: 0.8rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .download-box {
+      background: #111c33;
+      border: 1px solid #2563eb;
+      border-radius: 10px;
+      padding: 20px;
+      margin: 18px 0;
+    }
+    .btn {
+      display: inline-block;
+      background: #2563eb;
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 600;
+      padding: 12px 22px;
+      border-radius: 8px;
+      margin-top: 8px;
+    }
+    .btn:hover {
+      background: #1d4ed8;
+    }
+    .limitation-box {
+      background: rgba(120, 53, 15, 0.25);
+      border: 1px solid #d97706;
+      color: #fde68a;
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-top: 18px;
+    }
+    code, pre {
+      font-family: "Cascadia Code", Consolas, monospace;
+      background: #090e1a;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #bae6fd;
+    }
+    pre {
+      padding: 12px;
+      overflow-x: auto;
+      border: 1px solid #1e293b;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>Elm-AnyDesk — Windows 11 Pilot Download</h1>
+    <div class="badge-row">
+      <span class="badge">Platform: Windows 11 (x64)</span>
+      <span class="badge">Version: ${safeVersion}</span>
+      <span class="badge">Protocol: ${escapeHtml(manifest.protocolVersion)}</span>
+      <span class="badge">Zero-Bill STUN-Only Pilot</span>
+      <span class="badge">TURN Disabled</span>
+      <span class="badge">Auto-Upgrade Disabled</span>
+    </div>
+
+    <p>
+      Consent-based 1:1 screen sharing, optional independent Microphone &amp; Device Audio, and a separate ephemeral private chat window for Windows 11.
+    </p>
+
+    <section class="download-box">
+      <div><strong>Windows 11 x64 Installer Package:</strong> <code>${safeFilename}</code></div>
+      <div style="margin-top: 6px; font-size: 0.9rem;">
+        <strong>SHA-256 Checksum:</strong> <code>${safeSha256}</code>
+      </div>
+      <a class="btn" href="${safeUrl}" download="${safeFilename}">Download ${safeFilename}</a>
+    </section>
+
+    <section class="limitation-box">
+      <strong>STUN-Only Zero-Bill Pilot Network Notice (No Paid TURN Relay):</strong>
+      <p style="margin: 6px 0 0 0;">
+        ${safeNotice}
+      </p>
+      <p style="margin: 6px 0 0 0; font-size: 0.88rem;">
+        Configured STUN servers: ${stunList}
+      </p>
+    </section>
+
+    <h2>Verify Installer Integrity (PowerShell)</h2>
+    <pre>Get-FileHash .\\${safeFilename} -Algorithm SHA256</pre>
+
+    <h2>Consent &amp; Security Guarantees</h2>
+    <ul>
+      <li><strong>Permanent Friend Code:</strong> Generated once per account; knowing a code never grants automatic access.</li>
+      <li><strong>Granular Host Consent:</strong> Host A chooses Screen Video (Window or Display only — never webcam), Microphone Audio (default OFF), and Device Audio (default OFF) before accepting, and must click <em>Start Sharing</em> explicitly.</li>
+      <li><strong>Separate Ephemeral Chat Window:</strong> Private chat runs in its own window with message previews disabled and zero database or disk persistence.</li>
+      <li><strong>Non-Resumable Sessions:</strong> Disconnect, app close, or connection loss terminates the session permanently; reconnecting requires a fresh invite and fresh acceptance.</li>
+    </ul>
+  </main>
+</body>
+</html>`;
+}
+
 /**
  * Creates the Cloudflare Worker fetch handler.
  * Production entrypoint always uses GitHubOAuthProvider; tests can inject a test double
@@ -149,11 +345,39 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
       if (request.method === 'GET' && url.pathname === '/health') {
         const payload: ApiHealthResponse = {
           status: 'ok',
-          phase: 'phase-4-idempotent-teardown-and-liveness',
+          phase: 'phase-5-staging-and-installer-pilot',
           protocolVersion: PROTOCOL_VERSION,
           timestamp: new Date().toISOString(),
         };
         return withCors(Response.json(payload));
+      }
+
+      // 1b. Pilot Installer Download Page & Manifest (GET /, GET /download, GET /download/manifest.json)
+      if (
+        request.method === 'GET' &&
+        url.pathname === '/download/manifest.json'
+      ) {
+        const manifest = buildPilotDownloadManifest(env);
+        return withCors(Response.json(manifest));
+      }
+
+      if (
+        request.method === 'GET' &&
+        (url.pathname === '/' || url.pathname === '/download')
+      ) {
+        const manifest = buildPilotDownloadManifest(env);
+        if (request.headers.get('Accept')?.includes('application/json')) {
+          return withCors(Response.json(manifest));
+        }
+        return withCors(
+          new Response(renderPilotDownloadPageHtml(manifest), {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+            },
+          })
+        );
       }
 
       // 2. Desktop-Safe Browser Sign-In Start: GET /auth/login
