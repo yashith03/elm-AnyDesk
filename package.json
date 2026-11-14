@@ -10,6 +10,7 @@
   "scripts": {
     "typecheck": "npm run build --workspace=@elm/protocol && npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspace=@elm/protocol && npm run build --workspace=@elm/api && npm run build --workspace=@elm/desktop",
+    "test": "npm run build --workspace=@elm/protocol && npm run test --workspaces --if-present",
     "dev:desktop": "npm run dev --workspace=@elm/desktop",
     "start:desktop": "npm run start --workspace=@elm/desktop",
     "dev:api": "npm run dev --workspace=@elm/api"

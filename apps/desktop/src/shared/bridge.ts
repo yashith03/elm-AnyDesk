@@ -1,6 +1,11 @@
 import type {
+  AccountProfile,
   AllowedScreenSurface,
+  ApprovedSessionSummary,
   HostMediaSelection,
+  InviteSummary,
+  PresenceStateSnapshot,
+  ProtocolErrorCode,
   SessionLifecycleState,
 } from '@elm/protocol';
 
@@ -24,10 +29,11 @@ export interface DesktopRuntimeMetadata {
   readonly protocolVersion: string;
   readonly platform: string;
   readonly windowRole: DesktopWindowRole;
-  readonly phase: 'Phase 2 — Local Windows 11 Prototype (Taskbar/DWM & Media Capture)';
+  readonly phase: 'Phase 2 — Sign-In, Permanent Friend Codes, Presence & Invite Flow';
   readonly defaultMediaSelection: HostMediaSelection;
   readonly initialSessionState: SessionLifecycleState;
   readonly securityPosture: DesktopSecurityPosture;
+  readonly apiBaseUrl: string;
 }
 
 export interface TaskbarTransitionEvent {
@@ -93,13 +99,60 @@ export interface WasapiAudioChunkPayload {
   readonly pcmFloat32Base64: string;
 }
 
+export interface ApiActionResult<T> {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly data?: T;
+  readonly errorCode?: ProtocolErrorCode | string;
+  readonly errorMessage?: string;
+}
+
 /**
  * Narrow preload bridge contract exposed on `window.elmDesktop`.
- * Raw Electron IPC primitives are never exposed to the renderer.
+ * Raw Electron IPC primitives and provider secrets are never exposed to the renderer.
  */
 export interface ElmDesktopBridge {
   getRuntimeMetadata: () => Promise<DesktopRuntimeMetadata>;
   openSeparateChatWindow: () => Promise<{ opened: boolean }>;
+  copyTextToClipboard: (text: string) => Promise<{ copied: boolean }>;
+
+  // Phase 2: Authentication, Friend Codes, Presence & Invites
+  getStoredAuthSession: () => Promise<
+    ApiActionResult<{ account: AccountProfile; snapshot: PresenceStateSnapshot }>
+  >;
+  startBrowserOAuthSignIn: () => Promise<
+    ApiActionResult<{ authUrlOpened: boolean; message: string }>
+  >;
+  signInWithTestDouble: (personaKey: string) => Promise<
+    ApiActionResult<{ account: AccountProfile; snapshot: PresenceStateSnapshot }>
+  >;
+  switchActivePersona: (personaKey: string) => Promise<
+    ApiActionResult<{ account: AccountProfile; snapshot: PresenceStateSnapshot }>
+  >;
+  signOut: () => Promise<{ signedOut: boolean }>;
+  getPresenceSnapshot: () => Promise<
+    ApiActionResult<{ snapshot: PresenceStateSnapshot }>
+  >;
+  setPresenceOnline: (online: boolean) => Promise<
+    ApiActionResult<{ snapshot: PresenceStateSnapshot }>
+  >;
+  sendFriendCodeInvite: (friendCode: string) => Promise<
+    ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
+  >;
+  respondToInvite: (params: {
+    inviteId: string;
+    action: 'accept' | 'decline';
+    mediaSelection?: HostMediaSelection;
+  }) => Promise<
+    ApiActionResult<{
+      invite: InviteSummary;
+      session: ApprovedSessionSummary | null;
+      snapshot: PresenceStateSnapshot;
+    }>
+  >;
+  disconnectActiveSession: (sessionId?: string) => Promise<
+    ApiActionResult<{ disconnected: boolean; snapshot: PresenceStateSnapshot }>
+  >;
 
   // Windows 11 Taskbar & DWM Preview Prototype
   getTaskbarDwmTelemetry: () => Promise<TaskbarDwmTelemetry>;

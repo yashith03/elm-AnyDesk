@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import type { HostMediaSelection } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
   ElmDesktopBridge,
@@ -13,7 +14,32 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.invoke('elm:get-runtime-metadata'),
   openSeparateChatWindow: (): Promise<{ opened: boolean }> =>
     ipcRenderer.invoke('elm:open-separate-chat-window'),
+  copyTextToClipboard: (text: string): Promise<{ copied: boolean }> =>
+    ipcRenderer.invoke('elm:copy-text-to-clipboard', text),
 
+  // Phase 2: Authentication, Friend Codes, Presence & Invites
+  getStoredAuthSession: () => ipcRenderer.invoke('elm:auth-get-stored-session'),
+  startBrowserOAuthSignIn: () =>
+    ipcRenderer.invoke('elm:auth-start-browser-oauth'),
+  signInWithTestDouble: (personaKey: string) =>
+    ipcRenderer.invoke('elm:auth-signin-test-double', personaKey),
+  switchActivePersona: (personaKey: string) =>
+    ipcRenderer.invoke('elm:auth-switch-persona', personaKey),
+  signOut: () => ipcRenderer.invoke('elm:auth-sign-out'),
+  getPresenceSnapshot: () => ipcRenderer.invoke('elm:presence-get-snapshot'),
+  setPresenceOnline: (online: boolean) =>
+    ipcRenderer.invoke('elm:presence-set-online', online),
+  sendFriendCodeInvite: (friendCode: string) =>
+    ipcRenderer.invoke('elm:invites-send', friendCode),
+  respondToInvite: (params: {
+    inviteId: string;
+    action: 'accept' | 'decline';
+    mediaSelection?: HostMediaSelection;
+  }) => ipcRenderer.invoke('elm:invites-respond', params),
+  disconnectActiveSession: (sessionId?: string) =>
+    ipcRenderer.invoke('elm:sessions-disconnect', sessionId),
+
+  // Windows 11 Taskbar & DWM Preview Prototype
   getTaskbarDwmTelemetry: (): Promise<TaskbarDwmTelemetry> =>
     ipcRenderer.invoke('elm:get-taskbar-dwm-telemetry'),
   minimizeMainWindow: (): Promise<TaskbarDwmTelemetry> =>
@@ -25,6 +51,7 @@ const bridge: ElmDesktopBridge = Object.freeze({
   verifyStaticThumbnailAndPeek: (): Promise<TaskbarDwmTelemetry> =>
     ipcRenderer.invoke('elm:verify-static-thumbnail-and-peek'),
 
+  // Explicit Source Picker
   listShareableSources: (): Promise<ShareableSourceDescriptor[]> =>
     ipcRenderer.invoke('elm:list-shareable-sources'),
   selectShareableSource: (
@@ -32,6 +59,7 @@ const bridge: ElmDesktopBridge = Object.freeze({
   ): Promise<{ selectedSourceId: string; sourceName: string }> =>
     ipcRenderer.invoke('elm:select-shareable-source', sourceId),
 
+  // WASAPI Loopback Prototype
   probeWasapiLoopback: (): Promise<WasapiEndpointProbeResult> =>
     ipcRenderer.invoke('elm:probe-wasapi-loopback'),
   startWasapiLoopback: (options: {
@@ -43,7 +71,10 @@ const bridge: ElmDesktopBridge = Object.freeze({
   onWasapiAudioChunk: (
     listener: (chunk: WasapiAudioChunkPayload) => void
   ): (() => void) => {
-    const wrapped = (_event: IpcRendererEvent, payload: WasapiAudioChunkPayload) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      payload: WasapiAudioChunkPayload
+    ) => {
       listener(payload);
     };
     ipcRenderer.on('elm:wasapi-loopback-chunk', wrapped);

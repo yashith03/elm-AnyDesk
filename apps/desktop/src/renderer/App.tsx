@@ -1,530 +1,206 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import type {
+  AccountProfile,
+  HostMediaSelection,
+  InviteSummary,
+  PresenceStateSnapshot,
+} from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
-  ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
-  WasapiAudioChunkPayload,
-  WasapiEndpointProbeResult,
 } from '../shared/bridge';
-
-interface TrackDiagnostic {
-  readonly active: boolean;
-  readonly id: string;
-  readonly kind: string;
-  readonly label: string;
-  readonly readyState: string;
-  readonly enabled: boolean;
-  readonly muted: boolean;
-  readonly details: string;
-}
-
-const INACTIVE_TRACK: TrackDiagnostic = {
-  active: false,
-  id: 'none',
-  kind: 'none',
-  label: 'Not started',
-  readyState: 'ended',
-  enabled: false,
-  muted: false,
-  details: 'No active MediaStreamTrack',
-};
-
-function decodeBase64Float32(b64: string): Float32Array {
-  const binary = window.atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return new Float32Array(bytes.buffer);
-}
 
 export function App(): React.ReactElement {
   const [metadata, setMetadata] = useState<DesktopRuntimeMetadata | null>(null);
+  const [account, setAccount] = useState<AccountProfile | null>(null);
+  const [snapshot, setSnapshot] = useState<PresenceStateSnapshot | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+
+  // Copy Friend Code feedback
+  const [copiedCode, setCopiedCode] = useState<boolean>(false);
+
+  // Enter Friend Code input
+  const [enteredFriendCode, setEnteredFriendCode] = useState<string>('');
+
+  // Pre-Accept Media Controls chosen independently by User A (Both audio options default OFF)
+  const [preAcceptMedia, setPreAcceptMedia] = useState<HostMediaSelection>({
+    screenVideo: false,
+    microphoneAudio: false,
+    deviceAudio: false,
+  });
+
+  // Prototype drawer state
+  const [showPrototypeDrawer, setShowPrototypeDrawer] =
+    useState<boolean>(false);
   const [dwmTelemetry, setDwmTelemetry] = useState<TaskbarDwmTelemetry | null>(
     null
   );
-  const [error, setError] = useState<string | null>(null);
-  const [chatWindowStatus, setChatWindowStatus] = useState<string>('Closed');
-
-  // Independent Media Toggles (Both audio options default OFF; Screen Video defaults OFF)
-  const [wantScreenVideo, setWantScreenVideo] = useState<boolean>(false);
-  const [wantMicAudio, setWantMicAudio] = useState<boolean>(false);
-  const [wantDeviceAudio, setWantDeviceAudio] = useState<boolean>(false);
-  const [playTestTone, setPlayTestTone] = useState<boolean>(true);
-
-  // Explicit Source Picker State
-  const [sources, setSources] = useState<ShareableSourceDescriptor[]>([]);
-  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
-  const [selectedSourceName, setSelectedSourceName] = useState<string>('None');
-
-  // Active Track Diagnostics & Telemetry
-  const [videoTrackDiag, setVideoTrackDiag] =
-    useState<TrackDiagnostic>(INACTIVE_TRACK);
-  const [micTrackDiag, setMicTrackDiag] =
-    useState<TrackDiagnostic>(INACTIVE_TRACK);
-  const [deviceAudioTrackDiag, setDeviceAudioTrackDiag] =
-    useState<TrackDiagnostic>(INACTIVE_TRACK);
-
-  const [micLevel, setMicLevel] = useState<{ rms: number; peak: number }>({
-    rms: 0,
-    peak: 0,
-  });
-  const [deviceAudioLevel, setDeviceAudioLevel] = useState<{
-    rms: number;
-    peak: number;
-    chunksReceived: number;
-  }>({ rms: 0, peak: 0, chunksReceived: 0 });
-
-  const [wasapiProbe, setWasapiProbe] =
-    useState<WasapiEndpointProbeResult | null>(null);
-  const [electronDisplayAudioOnlyResult, setElectronDisplayAudioOnlyResult] =
-    useState<string>('Not tested yet');
-  const [sharingStatus, setSharingStatus] = useState<string>(
-    'Idle — Waiting for explicit Start Sharing action'
-  );
-
-  // Media Element & Stream Refs
-  const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
-  const micAudioPreviewRef = useRef<HTMLAudioElement | null>(null);
-  const deviceAudioPreviewRef = useRef<HTMLAudioElement | null>(null);
-
-  const screenStreamRef = useRef<MediaStream | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micAudioContextRef = useRef<AudioContext | null>(null);
-  const micRafRef = useRef<number | null>(null);
-
-  const wasapiAudioContextRef = useRef<AudioContext | null>(null);
-  const wasapiDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
-    null
-  );
-  const wasapiNextPlayTimeRef = useRef<number>(0);
-  const wasapiUnsubscribeRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     let mounted = true;
     Promise.all([
       window.elmDesktop.getRuntimeMetadata(),
+      window.elmDesktop.getStoredAuthSession(),
       window.elmDesktop.getTaskbarDwmTelemetry().catch(() => null),
-      window.elmDesktop.probeWasapiLoopback().catch(() => null),
     ])
-      .then(([meta, dwm, probe]) => {
+      .then(([meta, storedRes, dwm]) => {
         if (!mounted) return;
         setMetadata(meta);
         if (dwm) setDwmTelemetry(dwm);
-        if (probe) setWasapiProbe(probe);
+        if (storedRes.ok && storedRes.data) {
+          setAccount(storedRes.data.account);
+          setSnapshot(storedRes.data.snapshot);
+        }
       })
       .catch((err: unknown) => {
         if (mounted) {
-          setError(err instanceof Error ? err.message : String(err));
+          setErrorMessage(err instanceof Error ? err.message : String(err));
         }
       });
 
     return () => {
       mounted = false;
-      stopScreenVideoTrack();
-      stopMicrophoneTrack();
-      void stopDeviceAudioTrack();
     };
   }, []);
 
-  const refreshDwmTelemetry = async () => {
-    try {
-      const data = await window.elmDesktop.getTaskbarDwmTelemetry();
-      setDwmTelemetry(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+  const clearAlerts = () => {
+    setErrorMessage(null);
+    setErrorCode(null);
+    setStatusMessage(null);
+  };
+
+  const handleBrowserOAuthSignIn = async () => {
+    clearAlerts();
+    const res = await window.elmDesktop.startBrowserOAuthSignIn();
+    if (!res.ok) {
+      setErrorCode(res.errorCode ?? 'AUTH_PROVIDER_NOT_CONFIGURED');
+      setErrorMessage(
+        res.errorMessage ?? 'Browser OAuth sign-in is not configured.'
+      );
+      return;
+    }
+    setStatusMessage(res.data?.message ?? 'Opened browser for OAuth sign-in.');
+  };
+
+  const handleTestDoubleSignIn = async (personaKey: string) => {
+    clearAlerts();
+    const res = await window.elmDesktop.signInWithTestDouble(personaKey);
+    if (!res.ok || !res.data) {
+      setErrorCode(res.errorCode ?? 'UNAUTHORIZED');
+      setErrorMessage(res.errorMessage ?? 'Failed to sign in.');
+      return;
+    }
+    setAccount(res.data.account);
+    setSnapshot(res.data.snapshot);
+    setPreAcceptMedia({
+      screenVideo: false,
+      microphoneAudio: false,
+      deviceAudio: false,
+    });
+    setStatusMessage(
+      `Signed in as ${res.data.account.displayName}. Permanent Friend Code (${res.data.account.friendCode}) loaded from D1 store.`
+    );
+  };
+
+  const handleSignOut = async () => {
+    clearAlerts();
+    await window.elmDesktop.signOut();
+    setAccount(null);
+    setSnapshot(null);
+    setStatusMessage('Signed out. Sign back in anytime to reuse your permanent Friend Code.');
+  };
+
+  const handleCopyFriendCode = async () => {
+    if (!account) return;
+    await window.elmDesktop.copyTextToClipboard(account.friendCode);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const handleTogglePresence = async (nextOnline: boolean) => {
+    clearAlerts();
+    const res = await window.elmDesktop.setPresenceOnline(nextOnline);
+    if (res.ok && res.data) {
+      setSnapshot(res.data.snapshot);
+      setStatusMessage(
+        nextOnline
+          ? 'Presence is now ONLINE (ready to receive invites).'
+          : 'Presence is now OFFLINE (incoming invites will be rejected as TARGET_OFFLINE).'
+      );
     }
   };
 
-  const handleMinimizeForManualHover = async () => {
-    try {
-      const data = await window.elmDesktop.minimizeMainWindow();
-      setDwmTelemetry(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+  const handleSendInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    clearAlerts();
+    const res = await window.elmDesktop.sendFriendCodeInvite(enteredFriendCode);
+    if (!res.ok || !res.data) {
+      setErrorCode(res.errorCode ?? 'INVITE_ERROR');
+      setErrorMessage(res.errorMessage ?? 'Could not send invite.');
+      return;
     }
+    setSnapshot(res.data.snapshot);
+    setStatusMessage(
+      `Invite sent to ${res.data.invite.targetDisplayName} (${res.data.invite.targetFriendCode}). Waiting for owner to Accept or Decline.`
+    );
+    setEnteredFriendCode('');
+  };
+
+  const handleRespondToInvite = async (
+    invite: InviteSummary,
+    action: 'accept' | 'decline'
+  ) => {
+    clearAlerts();
+    const res = await window.elmDesktop.respondToInvite({
+      inviteId: invite.inviteId,
+      action,
+      mediaSelection: action === 'accept' ? preAcceptMedia : undefined,
+    });
+    if (!res.ok || !res.data) {
+      setErrorCode(res.errorCode ?? 'RESPOND_ERROR');
+      setErrorMessage(res.errorMessage ?? 'Could not respond to invite.');
+      return;
+    }
+    setSnapshot(res.data.snapshot);
+    if (action === 'accept' && res.data.session) {
+      setStatusMessage(
+        `Accepted invite from ${invite.requesterDisplayName} (${invite.requesterFriendCode}). 1:1 Session ${res.data.session.sessionId} is now approved.`
+      );
+    } else {
+      setStatusMessage(
+        `Declined invite from ${invite.requesterDisplayName} (${invite.requesterFriendCode}).`
+      );
+    }
+  };
+
+  const handleDisconnectSession = async () => {
+    clearAlerts();
+    const res = await window.elmDesktop.disconnectActiveSession(
+      snapshot?.activeSession?.sessionId
+    );
+    if (!res.ok || !res.data) {
+      setErrorCode(res.errorCode ?? 'DISCONNECT_ERROR');
+      setErrorMessage(res.errorMessage ?? 'Failed to disconnect session.');
+      return;
+    }
+    setSnapshot(res.data.snapshot);
+    setStatusMessage(
+      'Session ended for both participants. Ended sessions never resume; connecting again requires a fresh invite and fresh acceptance.'
+    );
   };
 
   const handleRunMinimizeRestoreCycle = async () => {
-    try {
-      const data = await window.elmDesktop.runTaskbarMinimizeRestoreCycle();
-      setDwmTelemetry(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleVerifyStaticThumbnailAndPeek = async () => {
-    try {
-      const data = await window.elmDesktop.verifyStaticThumbnailAndPeek();
-      setDwmTelemetry(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleLoadSources = async () => {
-    try {
-      const list = await window.elmDesktop.listShareableSources();
-      setSources(list);
-      if (list.length > 0 && !selectedSourceId) {
-        const first = list[0];
-        const res = await window.elmDesktop.selectShareableSource(first.id);
-        setSelectedSourceId(res.selectedSourceId);
-        setSelectedSourceName(`${first.name} (${first.surfaceType})`);
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleSelectSource = async (source: ShareableSourceDescriptor) => {
-    try {
-      const res = await window.elmDesktop.selectShareableSource(source.id);
-      setSelectedSourceId(res.selectedSourceId);
-      setSelectedSourceName(`${source.name} (${source.surfaceType})`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleTestElectronAudioOnlyDisplayMedia = async () => {
-    try {
-      // Test whether Electron 34's setDisplayMediaRequestHandler with callback({ audio: 'loopback' })
-      // can provide independent device-only audio when getDisplayMedia({ video: false, audio: true }) is called.
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: false,
-        audio: true,
-      });
-      const vTracks = stream.getVideoTracks();
-      const aTracks = stream.getAudioTracks();
-      const summary = `AudioTracks=${aTracks.length} (${
-        aTracks[0]?.label ?? 'none'
-      }, state=${aTracks[0]?.readyState ?? 'none'}), VideoTracks=${
-        vTracks.length
-      } (video never enabled)`;
-      stream.getTracks().forEach((t) => t.stop());
-      setElectronDisplayAudioOnlyResult(`PASS in Electron 34.5.8: ${summary}`);
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      setElectronDisplayAudioOnlyResult(`Failed: ${msg}`);
-    }
-  };
-
-  const stopScreenVideoTrack = () => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop());
-      screenStreamRef.current = null;
-    }
-    if (videoPreviewRef.current) {
-      videoPreviewRef.current.srcObject = null;
-    }
-    setVideoTrackDiag(INACTIVE_TRACK);
-  };
-
-  const stopMicrophoneTrack = () => {
-    if (micRafRef.current !== null) {
-      cancelAnimationFrame(micRafRef.current);
-      micRafRef.current = null;
-    }
-    if (micAudioContextRef.current) {
-      void micAudioContextRef.current.close().catch(() => undefined);
-      micAudioContextRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
-    if (micAudioPreviewRef.current) {
-      micAudioPreviewRef.current.srcObject = null;
-    }
-    setMicLevel({ rms: 0, peak: 0 });
-    setMicTrackDiag(INACTIVE_TRACK);
-  };
-
-  const stopDeviceAudioTrack = async () => {
-    if (wasapiUnsubscribeRef.current) {
-      wasapiUnsubscribeRef.current();
-      wasapiUnsubscribeRef.current = null;
-    }
-    await window.elmDesktop.stopWasapiLoopback().catch(() => undefined);
-    if (wasapiDestinationRef.current) {
-      wasapiDestinationRef.current.stream.getTracks().forEach((t) => t.stop());
-      wasapiDestinationRef.current = null;
-    }
-    if (wasapiAudioContextRef.current) {
-      await wasapiAudioContextRef.current.close().catch(() => undefined);
-      wasapiAudioContextRef.current = null;
-    }
-    if (deviceAudioPreviewRef.current) {
-      deviceAudioPreviewRef.current.srcObject = null;
-    }
-    setDeviceAudioLevel({ rms: 0, peak: 0, chunksReceived: 0 });
-    setDeviceAudioTrackDiag(INACTIVE_TRACK);
-  };
-
-  const startScreenVideoCapture = async () => {
-    stopScreenVideoTrack();
-    if (!selectedSourceId) {
-      throw new Error(
-        'Please explicitly select a Window or Display source before starting Screen Video.'
-      );
-    }
-
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: false,
-    });
-    screenStreamRef.current = stream;
-
-    const videoTrack = stream.getVideoTracks()[0];
-    if (!videoTrack) {
-      throw new Error('No video track returned from getDisplayMedia.');
-    }
-
-    if (videoPreviewRef.current) {
-      videoPreviewRef.current.srcObject = stream;
-      await videoPreviewRef.current.play().catch(() => undefined);
-    }
-
-    const settings = videoTrack.getSettings();
-    setVideoTrackDiag({
-      active: true,
-      id: videoTrack.id,
-      kind: videoTrack.kind,
-      label: videoTrack.label || selectedSourceName,
-      readyState: videoTrack.readyState,
-      enabled: videoTrack.enabled,
-      muted: videoTrack.muted,
-      details: `${settings.width ?? '?'}x${settings.height ?? '?'} @ ${
-        settings.frameRate ?? '?'
-      }fps (Source: ${selectedSourceName})`,
-    });
-  };
-
-  const startMicrophoneCapture = async () => {
-    stopMicrophoneTrack();
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: false,
-    });
-    micStreamRef.current = stream;
-
-    const audioTrack = stream.getAudioTracks()[0];
-    if (!audioTrack) {
-      throw new Error('No audio track returned from getUserMedia({ audio: true }).');
-    }
-
-    if (micAudioPreviewRef.current) {
-      micAudioPreviewRef.current.srcObject = stream;
-      await micAudioPreviewRef.current.play().catch(() => undefined);
-    }
-
-    const audioCtx = new AudioContext();
-    micAudioContextRef.current = audioCtx;
-    const sourceNode = audioCtx.createMediaStreamSource(stream);
-    const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 512;
-    sourceNode.connect(analyser);
-
-    const timeData = new Float32Array(analyser.fftSize);
-    const updateMeter = () => {
-      analyser.getFloatTimeDomainData(timeData);
-      let sum = 0;
-      let peak = 0;
-      for (let i = 0; i < timeData.length; i++) {
-        const v = Math.abs(timeData[i]);
-        sum += v * v;
-        if (v > peak) peak = v;
-      }
-      const rms = Math.sqrt(sum / timeData.length);
-      setMicLevel({ rms, peak });
-      micRafRef.current = requestAnimationFrame(updateMeter);
-    };
-    micRafRef.current = requestAnimationFrame(updateMeter);
-
-    const settings = audioTrack.getSettings();
-    setMicTrackDiag({
-      active: true,
-      id: audioTrack.id,
-      kind: audioTrack.kind,
-      label: audioTrack.label || 'Default Microphone',
-      readyState: audioTrack.readyState,
-      enabled: audioTrack.enabled,
-      muted: audioTrack.muted,
-      details: `sampleRate=${settings.sampleRate ?? audioCtx.sampleRate}Hz, channels=${
-        settings.channelCount ?? 1
-      }`,
-    });
-  };
-
-  const startDeviceAudioWasapiCapture = async () => {
-    await stopDeviceAudioTrack();
-
-    // Create a WebAudio pipeline that turns native WASAPI loopback PCM chunks
-    // into a standard live WebRTC MediaStreamTrack (kind: 'audio') WITHOUT video!
-    const audioCtx = new AudioContext({ sampleRate: 48000 });
-    await audioCtx.resume();
-    wasapiAudioContextRef.current = audioCtx;
-
-    const destination = audioCtx.createMediaStreamDestination();
-    wasapiDestinationRef.current = destination;
-    wasapiNextPlayTimeRef.current = audioCtx.currentTime;
-
-    let chunksCount = 0;
-
-    const unsubscribe = window.elmDesktop.onWasapiAudioChunk(
-      (chunk: WasapiAudioChunkPayload) => {
-        chunksCount += 1;
-        setDeviceAudioLevel({
-          rms: chunk.rms,
-          peak: chunk.peak,
-          chunksReceived: chunksCount,
-        });
-
-        const samples = decodeBase64Float32(chunk.pcmFloat32Base64);
-        if (samples.length === 0 || !wasapiAudioContextRef.current) return;
-
-        const ctx = wasapiAudioContextRef.current;
-        const audioBuffer = ctx.createBuffer(
-          1,
-          samples.length,
-          chunk.sampleRate || 48000
-        );
-        audioBuffer.getChannelData(0).set(samples);
-
-        const bufferSource = ctx.createBufferSource();
-        bufferSource.buffer = audioBuffer;
-        bufferSource.connect(destination);
-
-        const now = ctx.currentTime;
-        if (wasapiNextPlayTimeRef.current < now) {
-          wasapiNextPlayTimeRef.current = now + 0.015;
-        }
-        bufferSource.start(wasapiNextPlayTimeRef.current);
-        wasapiNextPlayTimeRef.current += audioBuffer.duration;
-      }
-    );
-    wasapiUnsubscribeRef.current = unsubscribe;
-
-    const startRes = await window.elmDesktop.startWasapiLoopback({
-      playTestTone,
-    });
-    setWasapiProbe(startRes);
-
-    if (!startRes.ok) {
-      await stopDeviceAudioTrack();
-      throw new Error(
-        `WASAPI Loopback failed to start: ${startRes.error ?? 'Unknown error'}`
-      );
-    }
-
-    const loopbackTrack = destination.stream.getAudioTracks()[0];
-    if (!loopbackTrack) {
-      throw new Error('Failed to create MediaStreamTrack from WASAPI loopback.');
-    }
-
-    if (deviceAudioPreviewRef.current) {
-      deviceAudioPreviewRef.current.srcObject = destination.stream;
-      await deviceAudioPreviewRef.current.play().catch(() => undefined);
-    }
-
-    setDeviceAudioTrackDiag({
-      active: true,
-      id: loopbackTrack.id,
-      kind: loopbackTrack.kind,
-      label: `WASAPI Loopback (${startRes.endpointId})`,
-      readyState: loopbackTrack.readyState,
-      enabled: loopbackTrack.enabled,
-      muted: loopbackTrack.muted,
-      details: `Native WASAPI Shared Loopback @ ${startRes.sampleRate}Hz (${startRes.channels}ch -> WebRTC MediaStreamTrack, ScreenVideo=${
-        screenStreamRef.current ? 'ON' : 'OFF'
-      })`,
-    });
-  };
-
-  const handleExplicitStartSharing = async () => {
-    setError(null);
-    try {
-      // Never turn video on automatically to enable audio!
-      if (wantScreenVideo) {
-        await startScreenVideoCapture();
-      } else {
-        stopScreenVideoTrack();
-      }
-
-      if (wantMicAudio) {
-        await startMicrophoneCapture();
-      } else {
-        stopMicrophoneTrack();
-      }
-
-      if (wantDeviceAudio) {
-        await startDeviceAudioWasapiCapture();
-      } else {
-        await stopDeviceAudioTrack();
-      }
-
-      const activeList: string[] = [];
-      if (wantScreenVideo) activeList.push('Screen Video');
-      if (wantMicAudio) activeList.push('Microphone Audio');
-      if (wantDeviceAudio) activeList.push('Device Audio (WASAPI Loopback)');
-
-      setSharingStatus(
-        activeList.length > 0
-          ? `Active Sharing: ${activeList.join(' + ')}`
-          : 'All Media OFF (Chat-Only / Idle State)'
-      );
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const handleStopAllSharing = async () => {
-    stopScreenVideoTrack();
-    stopMicrophoneTrack();
-    await stopDeviceAudioTrack();
-    setSharingStatus('Stopped all media tracks');
-  };
-
-  const handleOpenChatWindow = async () => {
-    try {
-      const result = await window.elmDesktop.openSeparateChatWindow();
-      if (result.opened) {
-        setChatWindowStatus('Opened / Focused (Separate BrowserWindow)');
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    const data = await window.elmDesktop.runTaskbarMinimizeRestoreCycle();
+    setDwmTelemetry(data);
   };
 
   if (!metadata) {
     return (
       <main className="app-shell">
         <section className="card">
-          <p>Loading Windows 11 Prototype runtime metadata...</p>
-        </section>
-      </main>
-    );
-  }
-
-  if (metadata.windowRole === 'chat') {
-    return (
-      <main className="app-shell">
-        <header className="top-bar">
-          <div>
-            <span className="badge">Separate Chat Window</span>
-            <h1>Private 1:1 Session Chat (Prototype)</h1>
-          </div>
-        </header>
-        <section className="card">
-          <h2>Separate Chat Window Verification</h2>
-          <ul className="feature-list">
-            <li>Dedicated separate Electron BrowserWindow</li>
-            <li>OS Notification Previews: <strong>OFF</strong></li>
-            <li>DWM Static Thumbnail & Disallow Peek: <strong>Active</strong></li>
-          </ul>
+          <p>Loading Elm-AnyDesk runtime...</p>
         </section>
       </main>
     );
@@ -535,451 +211,460 @@ export function App(): React.ReactElement {
       <header className="top-bar">
         <div>
           <span className="badge">{metadata.phase}</span>
-          <h1>Elm-AnyDesk — Windows 11 Taskbar/DWM & Media Capture Prototype</h1>
+          <h1>Elm-AnyDesk — Consent-Based 1:1 Screen Sharing</h1>
         </div>
-        <div className="meta-pill">
-          Electron <code>{metadata.electronVersion}</code> | Chromium{' '}
-          <code>{metadata.chromeVersion}</code> | OS{' '}
-          <code>{metadata.osRelease}</code>
-        </div>
-      </header>
-
-      {/* High-contrast non-sensitive test banner to verify it NEVER leaks into the taskbar hover thumbnail */}
-      <section className="test-content-banner">
-        <div className="banner-marker">
-          NON-SENSITIVE LIVE WINDOW CONTENT MARKER: <strong>ALPHA-7392-TEST</strong>
-        </div>
-        <p>
-          When this window is minimized and you hover its taskbar icon on Windows 11,
-          this yellow/crimson banner MUST NOT appear in the thumbnail preview—only the
-          static blue Elm-AnyDesk shield logo bitmap is supplied to DWM.
-        </p>
-      </section>
-
-      {error && (
-        <section className="card card-error">
-          <h2>Prototype Error / Diagnostic Notice</h2>
-          <p>{error}</p>
-        </section>
-      )}
-
-      <div className="grid">
-        {/* SECTION 1: Windows 11 Taskbar & DWM Static Thumbnail / Peek */}
-        <section className="card card-full">
-          <h2>1. Windows 11 Unpinned Taskbar, Static Logo Thumbnail & Disabled Peek</h2>
-          <p className="muted">
-            While open or restored, <code>setSkipTaskbar(true)</code> hides the running
-            taskbar icon. On minimize, <code>setSkipTaskbar(false)</code> reveals the
-            main taskbar icon for click-to-restore, while{' '}
-            <code>DWMWA_FORCE_ICONIC_REPRESENTATION</code>,{' '}
-            <code>DWMWA_HAS_ICONIC_BITMAP</code>, and <code>DWMWA_DISALLOW_PEEK</code>{' '}
-            supply a static logo bitmap and disable full-size Aero Peek.
-          </p>
-
-          <div className="actions-row">
-            <button
-              type="button"
-              className="primary-btn"
-              onClick={handleMinimizeForManualHover}
-            >
-              Minimize Window (Test Taskbar Icon, Hover & Click-to-Restore)
-            </button>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={handleRunMinimizeRestoreCycle}
-            >
-              Run Automated Open → Minimize → Thumbnail → Restore Cycle
-            </button>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={handleVerifyStaticThumbnailAndPeek}
-            >
-              Trigger DWM Static Thumbnail Callback
-            </button>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={refreshDwmTelemetry}
-            >
-              Refresh DWM Telemetry
-            </button>
-          </div>
-
-          {dwmTelemetry && (
-            <div className="telemetry-grid">
-              <div className="subcard">
-                <h3>Win32 Window & Taskbar State</h3>
-                <ul className="feature-list">
-                  <li>
-                    HWND: <code>{dwmTelemetry.hwndHex}</code>
-                  </li>
-                  <li>
-                    Minimized / Iconic:{' '}
-                    <code>
-                      {String(dwmTelemetry.isMinimized)} /{' '}
-                      {String(dwmTelemetry.win32IsIconic)}
-                    </code>
-                  </li>
-                  <li>
-                    skipTaskbar Applied (Hidden when Open):{' '}
-                    <code>{String(dwmTelemetry.skipTaskbarApplied)}</code>
-                  </li>
-                  <li>
-                    WS_EX_APPWINDOW (True only when Minimized):{' '}
-                    <code>{String(dwmTelemetry.wsExAppWindow)}</code>
-                  </li>
-                </ul>
-              </div>
-
-              <div className="subcard">
-                <h3>DWM Attributes & Iconic Bitmap Callbacks</h3>
-                <ul className="feature-list">
-                  <li>
-                    DWMWA_FORCE_ICONIC_REPRESENTATION (7):{' '}
-                    <code>
-                      {dwmTelemetry.dwmAttributes.forceIconicRepresentation}
-                    </code>
-                  </li>
-                  <li>
-                    DWMWA_HAS_ICONIC_BITMAP (10):{' '}
-                    <code>{dwmTelemetry.dwmAttributes.hasIconicBitmap}</code>
-                  </li>
-                  <li>
-                    DWMWA_DISALLOW_PEEK (11):{' '}
-                    <code>{dwmTelemetry.dwmAttributes.disallowPeek}</code>
-                  </li>
-                  <li>
-                    DWMWA_EXCLUDED_FROM_PEEK (12):{' '}
-                    <code>{dwmTelemetry.dwmAttributes.excludedFromPeek}</code>
-                  </li>
-                  <li>
-                    DwmSetIconicThumbnail Calls:{' '}
-                    <code>
-                      {dwmTelemetry.iconicThumbnail.callbackCount} (last:{' '}
-                      {dwmTelemetry.iconicThumbnail.lastHResult},{' '}
-                      {dwmTelemetry.iconicThumbnail.lastWidth}x
-                      {dwmTelemetry.iconicThumbnail.lastHeight})
-                    </code>
-                  </li>
-                </ul>
-              </div>
-            </div>
-          )}
-
-          {dwmTelemetry && dwmTelemetry.transitions.length > 0 && (
-            <div className="log-box">
-              <h3>Taskbar & DWM Transition Log (Open → Minimize → Hover/Bitmap → Restore)</h3>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Event / Action</th>
-                    <th>Minimized</th>
-                    <th>skipTaskbar</th>
-                    <th>WS_EX_APPWINDOW</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {dwmTelemetry.transitions.slice(-8).map((t, idx) => (
-                    <tr key={`${t.timestamp}-${idx}`}>
-                      <td>{t.timestamp.slice(11, 23)}</td>
-                      <td>
-                        <code>{t.action}</code>
-                      </td>
-                      <td>{String(t.isMinimized)}</td>
-                      <td>{String(t.skipTaskbarApplied)}</td>
-                      <td>{String(t.wsExAppWindow)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        {/* SECTION 2: Explicit Source Selection & Independent Media Capture */}
-        <section className="card card-full">
-          <h2>
-            2. Explicit Source Selection, Microphone, Device Audio & Device Audio with
-            Screen Video OFF
-          </h2>
-          <p className="muted">
-            User A independently toggles Screen Video (window/display only, never
-            webcam), Microphone Audio (default OFF), and Device Audio (default OFF).
-            Media starts ONLY after clicking <strong>Start Sharing</strong>. Video is{' '}
-            <strong>never</strong> turned on automatically to enable audio.
-          </p>
-
-          <div className="toggle-bar">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={wantScreenVideo}
-                onChange={(e) => setWantScreenVideo(e.target.checked)}
-              />
-              <span>Screen Video (Window / Display Only)</span>
-            </label>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={wantMicAudio}
-                onChange={(e) => setWantMicAudio(e.target.checked)}
-              />
-              <span>Microphone Audio (Default OFF)</span>
-            </label>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={wantDeviceAudio}
-                onChange={(e) => setWantDeviceAudio(e.target.checked)}
-              />
-              <span>Device Audio — WASAPI Loopback (Default OFF, Works with Video OFF)</span>
-            </label>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={playTestTone}
-                onChange={(e) => setPlayTestTone(e.target.checked)}
-              />
-              <span>Play Non-Sensitive 440Hz System Test Tone during WASAPI Capture</span>
-            </label>
-          </div>
-
-          <div className="actions-row">
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={handleLoadSources}
-            >
-              1. Load Shareable Windows & Displays
-            </button>
-            <button
-              type="button"
-              className="primary-btn"
-              onClick={handleExplicitStartSharing}
-            >
-              2. Start Sharing (Explicit User A Action)
-            </button>
+        <div className="top-bar-right">
+          {snapshot?.activeSession && (
             <button
               type="button"
               className="danger-btn"
-              onClick={handleStopAllSharing}
+              onClick={handleDisconnectSession}
             >
-              Stop All Media
+              Disconnect Active Session
             </button>
+          )}
+          <div className="meta-pill">
+            Protocol <code>{metadata.protocolVersion}</code> | Electron{' '}
+            <code>{metadata.electronVersion}</code>
+          </div>
+        </div>
+      </header>
+
+      {errorMessage && (
+        <section className="card card-error">
+          <div className="alert-header">
+            <strong>
+              {errorCode ? `[${errorCode}] ` : ''}
+              Action Blocked
+            </strong>
             <button
               type="button"
-              className="secondary-btn"
-              onClick={handleTestElectronAudioOnlyDisplayMedia}
+              className="small-secondary-btn"
+              onClick={clearAlerts}
             >
-              Test Electron getDisplayMedia(video: false, audio: true)
+              Dismiss
             </button>
           </div>
+          <p>{errorMessage}</p>
+        </section>
+      )}
 
-          <div className="status-strip">
-            <div>
-              <strong>Session Media Status:</strong> <code>{sharingStatus}</code>
-            </div>
-            <div>
-              <strong>Selected Screen Source:</strong>{' '}
-              <code>{selectedSourceName}</code>
-            </div>
-            <div>
-              <strong>Electron Display-Capture Audio-Only Check:</strong>{' '}
-              <code>{electronDisplayAudioOnlyResult}</code>
-            </div>
-          </div>
+      {statusMessage && (
+        <section className="card card-info">
+          <p>{statusMessage}</p>
+        </section>
+      )}
 
-          {sources.length > 0 && (
-            <div className="sources-grid">
-              {sources.map((src) => {
-                const isSelected = src.id === selectedSourceId;
-                return (
-                  <button
-                    key={src.id}
-                    type="button"
-                    className={`source-card ${isSelected ? 'selected' : ''}`}
-                    onClick={() => handleSelectSource(src)}
+      {/* SIGN-IN SCREEN WHEN UNATHENTICATED */}
+      {!account ? (
+        <div className="grid">
+          <section className="card">
+            <h2>1. Production Desktop-Safe Browser Sign-In</h2>
+            <p className="muted">
+              Uses GitHub OAuth 2.0 in your system browser with a local loopback
+              callback listener (<code>127.0.0.1</code>). Provider secrets live
+              strictly on the Cloudflare Worker (<code>apps/api/.dev.vars</code>)
+              and are never bundled into Electron.
+            </p>
+            <div className="actions-row">
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={handleBrowserOAuthSignIn}
+              >
+                Sign In with GitHub (System Browser)
+              </button>
+            </div>
+          </section>
+
+          <section className="card">
+            <h2>2. Local Test-Double Adapter (No Secrets Required)</h2>
+            <p className="muted">
+              Isolated behind <code>AuthProviderAdapter</code> for local
+              development & multi-peer testing when OAuth secrets are unavailable
+              locally. Creates a permanent Friend Code once in D1 storage and
+              reuses it across restarts and sign-ins.
+            </p>
+            <div className="actions-row">
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => handleTestDoubleSignIn('alice')}
+              >
+                Sign In as Alice (Host A)
+              </button>
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => handleTestDoubleSignIn('bob')}
+              >
+                Sign In as Bob (Requester B)
+              </button>
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => handleTestDoubleSignIn('charlie')}
+              >
+                Sign In as Charlie (Peer C)
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : (
+        <>
+          {/* ACCOUNT & PRESENCE BAR */}
+          <section className="card card-full">
+            <div className="subcard-header">
+              <div>
+                <h2>
+                  Signed In: {account.displayName}{' '}
+                  <span
+                    className={`presence-pill ${
+                      snapshot?.online ? 'online' : 'offline'
+                    }`}
                   >
-                    <img
-                      src={src.thumbnailDataUrl}
-                      alt={src.name}
-                      className="source-thumb"
-                    />
-                    <div className="source-meta">
-                      <span className="source-type">{src.surfaceType}</span>
-                      <span className="source-name" title={src.name}>
-                        {src.name}
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
+                    {snapshot?.online ? 'ONLINE' : 'OFFLINE'}
+                  </span>
+                </h2>
+                <p className="muted">
+                  Account ID: <code>{account.accountId}</code> | Provider:{' '}
+                  <code>
+                    {account.provider}:{account.providerSubject}
+                  </code>
+                </p>
+              </div>
+              <div className="actions-row">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => handleTogglePresence(!snapshot?.online)}
+                >
+                  {snapshot?.online ? 'Go Offline' : 'Reconnect Presence Online'}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={handleSignOut}
+                >
+                  Sign Out
+                </button>
+              </div>
             </div>
+
+            <div className="persona-switcher-bar">
+              <span className="muted">
+                Quick Multi-Peer Switcher (simulates switching between signed-in
+                accounts on one machine):
+              </span>
+              <div className="actions-row">
+                <button
+                  type="button"
+                  className="small-secondary-btn"
+                  onClick={() => handleTestDoubleSignIn('alice')}
+                >
+                  Switch to Alice (Host A)
+                </button>
+                <button
+                  type="button"
+                  className="small-secondary-btn"
+                  onClick={() => handleTestDoubleSignIn('bob')}
+                >
+                  Switch to Bob (Requester B)
+                </button>
+                <button
+                  type="button"
+                  className="small-secondary-btn"
+                  onClick={() => handleTestDoubleSignIn('charlie')}
+                >
+                  Switch to Charlie (Peer C)
+                </button>
+              </div>
+            </div>
+          </section>
+
+          {/* APPROVED ACTIVE 1:1 SESSION BANNER */}
+          {snapshot?.activeSession && (
+            <section className="card card-full card-session-active">
+              <div className="subcard-header">
+                <div>
+                  <span className="badge badge-green">
+                    Approved 1:1 Session Active (One Session Per User Enforced)
+                  </span>
+                  <h2>Session ID: {snapshot.activeSession.sessionId}</h2>
+                </div>
+                <button
+                  type="button"
+                  className="danger-btn"
+                  onClick={handleDisconnectSession}
+                >
+                  Top-Bar Disconnect (Ends for Both)
+                </button>
+              </div>
+              <div className="telemetry-grid">
+                <div className="subcard">
+                  <h3>Approved Participants</h3>
+                  <ul className="feature-list">
+                    <li>
+                      Host (User A):{' '}
+                      <strong>{snapshot.activeSession.hostDisplayName}</strong> (
+                      <code>{snapshot.activeSession.hostFriendCode}</code>)
+                    </li>
+                    <li>
+                      Guest (User B):{' '}
+                      <strong>{snapshot.activeSession.guestDisplayName}</strong> (
+                      <code>{snapshot.activeSession.guestFriendCode}</code>)
+                    </li>
+                    <li>
+                      Knowing Friend Code Can Join?:{' '}
+                      <code>NO (Strictly Bound to Approved Participant IDs)</code>
+                    </li>
+                  </ul>
+                </div>
+                <div className="subcard">
+                  <h3>Host A Pre-Selected Media Consent</h3>
+                  <ul className="feature-list">
+                    <li>
+                      Screen Video (Window/Display only):{' '}
+                      <code>
+                        {snapshot.activeSession.hostMediaSelection.screenVideo
+                          ? 'ON (Awaiting Explicit Start Sharing)'
+                          : 'OFF'}
+                      </code>
+                    </li>
+                    <li>
+                      Microphone Audio:{' '}
+                      <code>
+                        {snapshot.activeSession.hostMediaSelection
+                          .microphoneAudio
+                          ? 'ON'
+                          : 'OFF'}
+                      </code>
+                    </li>
+                    <li>
+                      Device Audio:{' '}
+                      <code>
+                        {snapshot.activeSession.hostMediaSelection.deviceAudio
+                          ? 'ON'
+                          : 'OFF'}
+                      </code>
+                    </li>
+                  </ul>
+                  <p className="muted-hint">
+                    Note: Media and chat transport are deferred to the next
+                    phases per phase scope.
+                  </p>
+                </div>
+              </div>
+            </section>
           )}
 
-          {/* Track Inspector & Live Playback Cards */}
-          <div className="telemetry-grid">
-            {/* Screen Video Track */}
-            <div className="subcard">
-              <div className="subcard-header">
-                <h3>Screen Video Track & Playback</h3>
-                {videoTrackDiag.active && (
-                  <button
-                    type="button"
-                    className="small-danger-btn"
-                    onClick={stopScreenVideoTrack}
-                  >
-                    Stop Video Only
-                  </button>
-                )}
-              </div>
-              <ul className="feature-list">
-                <li>
-                  Active: <code>{String(videoTrackDiag.active)}</code> | State:{' '}
-                  <code>{videoTrackDiag.readyState}</code>
-                </li>
-                <li>
-                  Track Label: <code>{videoTrackDiag.label}</code>
-                </li>
-                <li>
-                  Details: <code>{videoTrackDiag.details}</code>
-                </li>
-              </ul>
-              <video
-                ref={videoPreviewRef}
-                className="video-preview"
-                muted
-                playsInline
-                controls
-              />
-            </div>
+          {/* INCOMING INVITES ACCEPT / DECLINE SCREEN (USER A) */}
+          {snapshot && snapshot.incomingInvites.length > 0 && (
+            <section className="card card-full card-incoming-invite">
+              <span className="badge">Incoming Session Invite</span>
+              <h2>Incoming Invite — Choose Media Consent Before Accepting</h2>
+              <p className="muted">
+                Choose Screen Video, Microphone Audio, and Device Audio
+                independently before accepting. Both audio options default{' '}
+                <strong>OFF</strong>. The requester cannot enable your capture.
+                Screen Video means a window or display selected by you, never a
+                webcam.
+              </p>
 
-            {/* Microphone Audio Track */}
-            <div className="subcard">
-              <div className="subcard-header">
-                <h3>Microphone Audio Track & Playback</h3>
-                {micTrackDiag.active && (
-                  <button
-                    type="button"
-                    className="small-danger-btn"
-                    onClick={stopMicrophoneTrack}
-                  >
-                    Stop Mic Only
-                  </button>
-                )}
-              </div>
-              <ul className="feature-list">
-                <li>
-                  Active: <code>{String(micTrackDiag.active)}</code> | State:{' '}
-                  <code>{micTrackDiag.readyState}</code>
-                </li>
-                <li>
-                  Track Label: <code>{micTrackDiag.label}</code>
-                </li>
-                <li>
-                  Details: <code>{micTrackDiag.details}</code>
-                </li>
-                <li>
-                  Live RMS / Peak:{' '}
-                  <code>
-                    {micLevel.rms.toFixed(4)} / {micLevel.peak.toFixed(4)}
-                  </code>
-                </li>
-              </ul>
-              <div className="meter-track">
-                <div
-                  className="meter-fill"
-                  style={{
-                    width: `${Math.min(100, micLevel.peak * 100)}%`,
-                  }}
-                />
-              </div>
-              <audio ref={micAudioPreviewRef} controls muted className="audio-player" />
-              <span className="muted-hint">
-                (Unmute control above to monitor local microphone loopback)
-              </span>
-            </div>
+              <div className="toggle-bar">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={preAcceptMedia.screenVideo}
+                    onChange={(e) =>
+                      setPreAcceptMedia((prev) => ({
+                        ...prev,
+                        screenVideo: e.target.checked,
+                      }))
+                    }
+                  />
+                  <span>
+                    Screen Video (Window / Display Only — Never Webcam)
+                  </span>
+                </label>
 
-            {/* Device Audio Track (WASAPI Loopback) */}
-            <div className="subcard">
-              <div className="subcard-header">
-                <h3>Device Audio Track (WASAPI Loopback)</h3>
-                {deviceAudioTrackDiag.active && (
-                  <button
-                    type="button"
-                    className="small-danger-btn"
-                    onClick={() => void stopDeviceAudioTrack()}
-                  >
-                    Stop Device Audio Only
-                  </button>
-                )}
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={preAcceptMedia.microphoneAudio}
+                    onChange={(e) =>
+                      setPreAcceptMedia((prev) => ({
+                        ...prev,
+                        microphoneAudio: e.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Microphone Audio (Default OFF)</span>
+                </label>
+
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={preAcceptMedia.deviceAudio}
+                    onChange={(e) =>
+                      setPreAcceptMedia((prev) => ({
+                        ...prev,
+                        deviceAudio: e.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Device / System Audio (Default OFF)</span>
+                </label>
               </div>
-              <ul className="feature-list">
-                <li>
-                  Active: <code>{String(deviceAudioTrackDiag.active)}</code> | State:{' '}
-                  <code>{deviceAudioTrackDiag.readyState}</code>
-                </li>
-                <li>
-                  Screen Video Required?:{' '}
-                  <code>
-                    NO (Active Video Tracks = {videoTrackDiag.active ? 1 : 0})
-                  </code>
-                </li>
-                <li>
-                  WASAPI Endpoint:{' '}
-                  <code>
-                    {wasapiProbe?.ok
-                      ? `${wasapiProbe.sampleRate}Hz ${wasapiProbe.channels}ch (${wasapiProbe.bitsPerSample}-bit)`
-                      : wasapiProbe?.error || 'Not probed'}
-                  </code>
-                </li>
-                <li>
-                  Live RMS / Peak / Chunks:{' '}
-                  <code>
-                    {deviceAudioLevel.rms.toFixed(4)} /{' '}
-                    {deviceAudioLevel.peak.toFixed(4)} (
-                    {deviceAudioLevel.chunksReceived} chunks)
-                  </code>
-                </li>
-              </ul>
-              <div className="meter-track">
-                <div
-                  className="meter-fill meter-fill-cyan"
-                  style={{
-                    width: `${Math.min(100, deviceAudioLevel.peak * 250)}%`,
-                  }}
+
+              <div className="telemetry-grid">
+                {snapshot.incomingInvites.map((inv) => (
+                  <div key={inv.inviteId} className="subcard">
+                    <h3>Requester Identity</h3>
+                    <ul className="feature-list">
+                      <li>
+                        Display Name: <strong>{inv.requesterDisplayName}</strong>
+                      </li>
+                      <li>
+                        Friend Code: <code>{inv.requesterFriendCode}</code>
+                      </li>
+                      <li>
+                        Account ID: <code>{inv.requesterAccountId}</code>
+                      </li>
+                      <li>
+                        Invite ID: <code>{inv.inviteId}</code>
+                      </li>
+                    </ul>
+                    <div className="actions-row">
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        onClick={() => handleRespondToInvite(inv, 'accept')}
+                      >
+                        Accept Invite
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-btn"
+                        onClick={() => handleRespondToInvite(inv, 'decline')}
+                      >
+                        Decline Invite
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* MAIN TWO-COLUMN: MY FRIEND CODE & ENTER FRIEND CODE */}
+          <div className="grid">
+            {/* MY FRIEND CODE & COPY CODE */}
+            <section className="card">
+              <h2>My Friend Code</h2>
+              <p className="muted">
+                Your permanent, reusable Friend Code. It is created once in D1,
+                never expires, reuses the same value across restarts and
+                sign-ins, and never grants automatic access on its own.
+              </p>
+              <div className="friend-code-display">
+                <code className="friend-code-value">{account.friendCode}</code>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={handleCopyFriendCode}
+                >
+                  {copiedCode ? 'Copied!' : 'Copy Code'}
+                </button>
+              </div>
+            </section>
+
+            {/* ENTER FRIEND CODE & SEND INVITE */}
+            <section className="card">
+              <h2>Enter Friend Code & Send Invite</h2>
+              <p className="muted">
+                Enter your peer&apos;s Friend Code (<code>ELM-XXXX-XXXX</code>)
+                to send a 1:1 session invite. They must be online and explicitly
+                Accept.
+              </p>
+              <form className="invite-form" onSubmit={handleSendInvite}>
+                <input
+                  type="text"
+                  className="code-input"
+                  placeholder="ELM-XXXX-XXXX"
+                  value={enteredFriendCode}
+                  onChange={(e) =>
+                    setEnteredFriendCode(e.target.value.toUpperCase())
+                  }
+                  maxLength={13}
                 />
-              </div>
-              <audio
-                ref={deviceAudioPreviewRef}
-                controls
-                className="audio-player"
-              />
-            </div>
+                <button type="submit" className="primary-btn">
+                  Send Invite
+                </button>
+              </form>
+
+              {snapshot?.outgoingInvite && (
+                <div className="subcard">
+                  <h3>Outgoing Invite Pending</h3>
+                  <ul className="feature-list">
+                    <li>
+                      Target: <strong>{snapshot.outgoingInvite.targetDisplayName}</strong>{' '}
+                      (<code>{snapshot.outgoingInvite.targetFriendCode}</code>)
+                    </li>
+                    <li>
+                      Status: <code>{snapshot.outgoingInvite.status}</code> (No
+                      signaling admitted before acceptance)
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </section>
           </div>
-        </section>
+        </>
+      )}
 
-        {/* SECTION 3: Separate Chat Window */}
-        <section className="card card-full">
-          <h2>3. Separate Chat Window (Notification Previews OFF)</h2>
+      {/* COLLAPSIBLE WINDOWS 11 PROTOTYPE DRAWER */}
+      <section className="card card-full">
+        <div className="subcard-header">
+          <h2>Windows 11 Taskbar / DWM Prototype Telemetry</h2>
           <div className="actions-row">
             <button
               type="button"
-              className="secondary-btn"
-              onClick={handleOpenChatWindow}
+              className="small-secondary-btn"
+              onClick={() => setShowPrototypeDrawer((v) => !v)}
             >
-              Open Separate Chat Window
+              {showPrototypeDrawer ? 'Hide Telemetry' : 'Show Telemetry'}
             </button>
-            <span className="status-text">Status: {chatWindowStatus}</span>
+            <button
+              type="button"
+              className="small-secondary-btn"
+              onClick={handleRunMinimizeRestoreCycle}
+            >
+              Run Open → Minimize → Thumbnail → Restore Cycle
+            </button>
           </div>
-        </section>
-      </div>
+        </div>
+        {showPrototypeDrawer && dwmTelemetry && (
+          <div className="telemetry-grid">
+            <div className="subcard">
+              <h3>Win32 Taskbar State</h3>
+              <ul className="feature-list">
+                <li>
+                  HWND: <code>{dwmTelemetry.hwndHex}</code> | skipTaskbar:{' '}
+                  <code>{String(dwmTelemetry.skipTaskbarApplied)}</code>
+                </li>
+                <li>
+                  DWM Force Iconic / Disallow Peek:{' '}
+                  <code>
+                    {dwmTelemetry.dwmAttributes.forceIconicRepresentation} /{' '}
+                    {dwmTelemetry.dwmAttributes.disallowPeek}
+                  </code>
+                </li>
+              </ul>
+            </div>
+          </div>
+        )}
+      </section>
     </main>
   );
 }

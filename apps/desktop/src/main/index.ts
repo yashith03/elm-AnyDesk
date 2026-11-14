@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   desktopCapturer,
   ipcMain,
   session,
@@ -11,6 +12,7 @@ import path from 'node:path';
 import {
   DEFAULT_HOST_MEDIA_SELECTION,
   PROTOCOL_VERSION,
+  type HostMediaSelection,
 } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
@@ -18,12 +20,14 @@ import type {
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
 } from '../shared/bridge';
+import { DesktopAuthAndInviteController } from './auth-invite-client';
 import { Win11TaskbarDwmController } from './win11-dwm';
 import { WasapiLoopbackManager } from './wasapi-loopback';
 
 let mainWindow: BrowserWindow | null = null;
 let chatWindow: BrowserWindow | null = null;
 let taskbarDwmController: Win11TaskbarDwmController | null = null;
+let authInviteController: DesktopAuthAndInviteController | null = null;
 const wasapiManager = new WasapiLoopbackManager();
 
 let explicitlySelectedSourceId: string | null = null;
@@ -36,6 +40,13 @@ const windowRoles = new WeakMap<BrowserWindow, DesktopWindowRole>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getAuthController(): DesktopAuthAndInviteController {
+  if (!authInviteController) {
+    authInviteController = new DesktopAuthAndInviteController();
+  }
+  return authInviteController;
 }
 
 function createSecureWebPreferences() {
@@ -63,11 +74,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   const win = new BrowserWindow({
-    width: 1120,
-    height: 820,
-    minWidth: 880,
-    minHeight: 620,
-    title: 'Elm-AnyDesk — Local Windows 11 Prototype',
+    width: 1140,
+    height: 860,
+    minWidth: 900,
+    minHeight: 640,
+    title: 'Elm-AnyDesk — Consent-Based 1:1 Screen Share',
     autoHideMenuBar: true,
     backgroundColor: '#0f172a',
     webPreferences: createSecureWebPreferences(),
@@ -108,7 +119,7 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     height: 580,
     minWidth: 340,
     minHeight: 420,
-    title: 'Elm-AnyDesk — Private 1:1 Session Chat (Prototype)',
+    title: 'Elm-AnyDesk — Private 1:1 Session Chat (Scaffold)',
     autoHideMenuBar: true,
     backgroundColor: '#0f172a',
     webPreferences: createSecureWebPreferences(),
@@ -144,11 +155,11 @@ function registerDisplayMediaHandler(): void {
           videoRequested: request.videoRequested,
           audioRequested: request.audioRequested,
         };
-        // Hard requirement: Never turn video on automatically to enable audio.
         if (!request.videoRequested) {
           if (request.audioRequested) {
-            // Test whether Electron allows audio-only loopback without a video stream
-            callback({ audio: 'loopback' } as unknown as Parameters<typeof callback>[0]);
+            callback({ audio: 'loopback' } as unknown as Parameters<
+              typeof callback
+            >[0]);
             return;
           }
           callback({});
@@ -156,7 +167,6 @@ function registerDisplayMediaHandler(): void {
         }
 
         if (!explicitlySelectedSourceId) {
-          // Never auto-select a screen source without User A's explicit choice
           callback({});
           return;
         }
@@ -187,6 +197,7 @@ function registerIpcHandlers(): void {
     const senderWindow = BrowserWindow.fromWebContents(event.sender);
     const role: DesktopWindowRole =
       (senderWindow && windowRoles.get(senderWindow)) || 'main';
+    const controller = getAuthController();
 
     return {
       appName: app.getName(),
@@ -199,7 +210,7 @@ function registerIpcHandlers(): void {
       platform: process.platform,
       windowRole: role,
       phase:
-        'Phase 2 — Local Windows 11 Prototype (Taskbar/DWM & Media Capture)',
+        'Phase 2 — Sign-In, Permanent Friend Codes, Presence & Invite Flow',
       defaultMediaSelection: DEFAULT_HOST_MEDIA_SELECTION,
       initialSessionState: 'idle',
       securityPosture: {
@@ -209,12 +220,69 @@ function registerIpcHandlers(): void {
         webSecurity: true,
         narrowPreloadBridge: true,
       },
+      apiBaseUrl: controller.apiBaseUrl,
     };
   });
 
   ipcMain.handle('elm:open-separate-chat-window', async () => {
     await createOrFocusChatWindow();
     return { opened: true };
+  });
+
+  ipcMain.handle('elm:copy-text-to-clipboard', (_event, text: string) => {
+    clipboard.writeText(String(text ?? ''));
+    return { copied: true };
+  });
+
+  // Phase 2: Auth, Permanent Friend Code, Presence & Invites
+  ipcMain.handle('elm:auth-get-stored-session', () => {
+    return getAuthController().getStoredAuthSession();
+  });
+
+  ipcMain.handle('elm:auth-start-browser-oauth', async () => {
+    return getAuthController().startBrowserOAuthSignIn();
+  });
+
+  ipcMain.handle('elm:auth-signin-test-double', (_event, personaKey: string) => {
+    return getAuthController().signInWithTestDouble(String(personaKey ?? ''));
+  });
+
+  ipcMain.handle('elm:auth-switch-persona', (_event, personaKey: string) => {
+    return getAuthController().switchActivePersona(String(personaKey ?? ''));
+  });
+
+  ipcMain.handle('elm:auth-sign-out', () => {
+    return getAuthController().signOut();
+  });
+
+  ipcMain.handle('elm:presence-get-snapshot', () => {
+    return getAuthController().getPresenceSnapshot();
+  });
+
+  ipcMain.handle('elm:presence-set-online', (_event, online: boolean) => {
+    return getAuthController().setPresenceOnline(Boolean(online));
+  });
+
+  ipcMain.handle('elm:invites-send', (_event, friendCode: string) => {
+    return getAuthController().sendFriendCodeInvite(String(friendCode ?? ''));
+  });
+
+  ipcMain.handle(
+    'elm:invites-respond',
+    (
+      _event,
+      params: {
+        inviteId: string;
+        action: 'accept' | 'decline';
+        mediaSelection?: HostMediaSelection;
+      }
+    ) => {
+      return getAuthController().respondToInvite(params);
+    }
+  );
+
+  ipcMain.handle('elm:sessions-disconnect', (_event, sessionId?: string) => {
+    return getAuthController().disconnectActiveSession(sessionId);
   });
 
   // Taskbar & DWM Telemetry + Prototype Controls
@@ -341,8 +409,6 @@ function registerIpcHandlers(): void {
 }
 
 app.whenReady().then(async () => {
-  // Allow local media permissions for explicit microphone & display capture tests;
-  // strictly deny notifications and all other permissions.
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, permission, callback) => {
       if (permission === 'media') {
@@ -369,23 +435,17 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
       throw new Error('taskbarDwmController not initialized');
     }
 
-    // 1. Open state telemetry
     const openState = taskbarDwmController.getTelemetry();
-
-    // 2. Minimize state + DWM thumbnail/peek callback verification
     win.minimize();
     await sleep(250);
     const minimizedState =
       taskbarDwmController.triggerIconicThumbnailVerification();
-
-    // 3. Restore state telemetry
     await sleep(150);
     win.restore();
     win.focus();
     await sleep(250);
     const restoredState = taskbarDwmController.getTelemetry();
 
-    // 4-7. Renderer media & track verification (with userGesture = true and per-step timeouts)
     const mediaSuiteResult = await win.webContents.executeJavaScript(
       `
       (async () => {
@@ -399,258 +459,37 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
 
         const results = {};
 
-        // A. Explicit source enumeration & Screen Video capture + playback
-        try {
-          const sources = await withTimeout(
-            window.elmDesktop.listShareableSources(),
-            2500,
-            'listShareableSources'
-          );
-          const onlyScreenOrWindow = sources.every(
-            (s) => s.surfaceType === 'display' || s.surfaceType === 'window'
-          );
-          results.sourceEnumeration = {
-            count: sources.length,
-            onlyScreenOrWindow,
-            sampleSources: sources.slice(0, 4).map((s) => ({
-              id: s.id,
-              name: s.name,
-              surfaceType: s.surfaceType,
-            })),
-          };
+        // Desktop Auth, Permanent Friend Code & Invite UI Bridge Check
+        const aliceLogin = await window.elmDesktop.signInWithTestDouble('alice');
+        const aliceSecondLogin = await window.elmDesktop.signInWithTestDouble('alice');
+        const bobLogin = await window.elmDesktop.signInWithTestDouble('bob');
+        const inviteRes = await window.elmDesktop.sendFriendCodeInvite(
+          aliceLogin.data.account.friendCode
+        );
+        await window.elmDesktop.switchActivePersona('alice');
+        const acceptRes = await window.elmDesktop.respondToInvite({
+          inviteId: inviteRes.data.invite.inviteId,
+          action: 'accept',
+          mediaSelection: {
+            screenVideo: true,
+            microphoneAudio: false,
+            deviceAudio: false,
+          },
+        });
+        await window.elmDesktop.disconnectActiveSession(
+          acceptRes.data.session.sessionId
+        );
 
-          // Prefer a window source first, or fallback to first source
-          const preferred =
-            sources.find((s) => s.surfaceType === 'window') || sources[0];
-          if (preferred) {
-            await window.elmDesktop.selectShareableSource(preferred.id);
-            const screenStream = await withTimeout(
-              navigator.mediaDevices.getDisplayMedia({
-                video: true,
-                audio: false,
-              }),
-              2500,
-              'getDisplayMedia'
-            );
-            const vTrack = screenStream.getVideoTracks()[0];
-            const vidEl = document.createElement('video');
-            vidEl.muted = true;
-            vidEl.playsInline = true;
-            vidEl.srcObject = screenStream;
-            let playError = null;
-            try {
-              await withTimeout(vidEl.play(), 1000, 'video.play');
-            } catch (pe) {
-              playError = pe instanceof Error ? pe.message : String(pe);
-            }
-            await new Promise((r) => setTimeout(r, 250));
-
-            const settings = vTrack ? vTrack.getSettings() : {};
-            results.screenVideoCapture = {
-              ok: Boolean(vTrack && vTrack.readyState === 'live'),
-              selectedSource: preferred.name + ' (' + preferred.surfaceType + ')',
-              trackId: vTrack?.id ?? null,
-              kind: vTrack?.kind ?? null,
-              label: vTrack?.label ?? null,
-              readyState: vTrack?.readyState ?? null,
-              settingsWidth: settings.width ?? null,
-              settingsHeight: settings.height ?? null,
-              videoElementWidth: vidEl.videoWidth,
-              videoElementHeight: vidEl.videoHeight,
-              paused: vidEl.paused,
-              playNote: playError,
-            };
-
-            screenStream.getTracks().forEach((t) => t.stop());
-            results.screenVideoCapture.stoppedState = vTrack?.readyState ?? null;
-          }
-        } catch (err) {
-          results.screenVideoCapture = {
-            ok: false,
-            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
-          };
-        }
-
-        // B. Microphone capture & playback check
-        try {
-          const micStream = await withTimeout(
-            navigator.mediaDevices.getUserMedia({
-              audio: true,
-              video: false,
-            }),
-            2000,
-            'getUserMedia(audio)'
-          );
-          const mTrack = micStream.getAudioTracks()[0];
-          const micEl = document.createElement('audio');
-          micEl.muted = true;
-          micEl.srcObject = micStream;
-          await withTimeout(micEl.play().catch(() => undefined), 1000, 'mic.play');
-          await new Promise((r) => setTimeout(r, 200));
-          results.microphoneCapture = {
-            ok: Boolean(mTrack && mTrack.readyState === 'live'),
-            trackId: mTrack?.id ?? null,
-            kind: mTrack?.kind ?? null,
-            label: mTrack?.label ?? null,
-            readyState: mTrack?.readyState ?? null,
-            videoTracksCount: micStream.getVideoTracks().length,
-            paused: micEl.paused,
-          };
-          micStream.getTracks().forEach((t) => t.stop());
-        } catch (err) {
-          results.microphoneCapture = {
-            ok: false,
-            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
-          };
-        }
-
-        // C. Electron getDisplayMedia with Screen Video OFF (video: false, audio: true)
-        try {
-          // Start the 440Hz test tone via WASAPI helper so system audio has active signal
-          await window.elmDesktop.startWasapiLoopback({ playTestTone: true });
-          await new Promise((r) => setTimeout(r, 250));
-
-          const s = await withTimeout(
-            navigator.mediaDevices.getDisplayMedia({
-              video: false,
-              audio: true,
-            }),
-            1500,
-            'getDisplayMedia(video:false)'
-          );
-          const vTracks = s.getVideoTracks().map((t) => ({
-            id: t.id,
-            kind: t.kind,
-            label: t.label,
-            readyState: t.readyState,
-          }));
-          const aTracks = s.getAudioTracks().map((t) => ({
-            id: t.id,
-            kind: t.kind,
-            label: t.label,
-            readyState: t.readyState,
-          }));
-
-          // Measure whether Electron's "System audio" track actually delivers non-zero audio samples
-          let sysAudioMaxRms = 0;
-          let sysAudioMaxPeak = 0;
-          if (aTracks.length > 0) {
-            const checkCtx = new AudioContext();
-            await checkCtx.resume().catch(() => undefined);
-            const srcNode = checkCtx.createMediaStreamSource(s);
-            const analyser = checkCtx.createAnalyser();
-            analyser.fftSize = 512;
-            srcNode.connect(analyser);
-            const buf = new Float32Array(analyser.fftSize);
-            for (let i = 0; i < 10; i++) {
-              await new Promise((r) => setTimeout(r, 40));
-              analyser.getFloatTimeDomainData(buf);
-              let sum = 0;
-              let pk = 0;
-              for (let j = 0; j < buf.length; j++) {
-                const v = Math.abs(buf[j]);
-                sum += v * v;
-                if (v > pk) pk = v;
-              }
-              const rms = Math.sqrt(sum / buf.length);
-              if (rms > sysAudioMaxRms) sysAudioMaxRms = rms;
-              if (pk > sysAudioMaxPeak) sysAudioMaxPeak = pk;
-            }
-            await checkCtx.close().catch(() => undefined);
-          }
-
-          s.getTracks().forEach((t) => t.stop());
-          await window.elmDesktop.stopWasapiLoopback();
-
-          results.electronAudioOnlyDisplayMedia = {
-            supportedNativelyWithVideoOff: aTracks.length > 0 && vTracks.length === 0,
-            videoTracksReturned: vTracks,
-            audioTracksReturned: aTracks,
-            measuredRms: Number(sysAudioMaxRms.toFixed(6)),
-            measuredPeak: Number(sysAudioMaxPeak.toFixed(6)),
-          };
-        } catch (err) {
-          await window.elmDesktop.stopWasapiLoopback().catch(() => undefined);
-          results.electronAudioOnlyDisplayMedia = {
-            supportedNativelyWithVideoOff: false,
-            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
-          };
-        }
-
-        // D. Windows-native WASAPI Loopback with Screen Video OFF
-        try {
-          const audioCtx = new AudioContext({ sampleRate: 48000 });
-          await withTimeout(audioCtx.resume().catch(() => undefined), 1000, 'audioCtx.resume');
-          const dest = audioCtx.createMediaStreamDestination();
-          let nextTime = audioCtx.currentTime;
-          let chunks = 0;
-          let maxRms = 0;
-          let maxPeak = 0;
-
-          const unsub = window.elmDesktop.onWasapiAudioChunk((chunk) => {
-            chunks += 1;
-            if (chunk.rms > maxRms) maxRms = chunk.rms;
-            if (chunk.peak > maxPeak) maxPeak = chunk.peak;
-
-            const bin = window.atob(chunk.pcmFloat32Base64);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const floats = new Float32Array(bytes.buffer);
-            const buf = audioCtx.createBuffer(1, floats.length, chunk.sampleRate || 48000);
-            buf.getChannelData(0).set(floats);
-            const src = audioCtx.createBufferSource();
-            src.buffer = buf;
-            src.connect(dest);
-            const now = audioCtx.currentTime;
-            if (nextTime < now) nextTime = now + 0.015;
-            src.start(nextTime);
-            nextTime += buf.duration;
-          });
-
-          const wasapiStart = await withTimeout(
-            window.elmDesktop.startWasapiLoopback({
-              playTestTone: true,
-            }),
-            2000,
-            'startWasapiLoopback'
-          );
-          const player = document.createElement('audio');
-          player.muted = true;
-          player.srcObject = dest.stream;
-          await withTimeout(player.play().catch(() => undefined), 1000, 'wasapiPlayer.play');
-
-          await new Promise((r) => setTimeout(r, 600));
-
-          const wasapiTrack = dest.stream.getAudioTracks()[0];
-          results.wasapiLoopbackWithVideoOff = {
-            ok: Boolean(
-              wasapiStart.ok &&
-                wasapiTrack &&
-                wasapiTrack.readyState === 'live' &&
-                chunks > 5 &&
-                maxPeak > 0.02
-            ),
-            endpoint: wasapiStart,
-            trackId: wasapiTrack?.id ?? null,
-            kind: wasapiTrack?.kind ?? null,
-            readyState: wasapiTrack?.readyState ?? null,
-            videoTracksCount: dest.stream.getVideoTracks().length,
-            chunksReceived: chunks,
-            maxRms: Number(maxRms.toFixed(6)),
-            maxPeak: Number(maxPeak.toFixed(6)),
-            audioElementPaused: player.paused,
-            audioElementCurrentTime: Number(player.currentTime.toFixed(3)),
-          };
-
-          unsub();
-          await window.elmDesktop.stopWasapiLoopback();
-          await audioCtx.close().catch(() => undefined);
-        } catch (err) {
-          results.wasapiLoopbackWithVideoOff = {
-            ok: false,
-            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
-          };
-        }
+        results.phase2AuthInviteBridge = {
+          friendCodeReused:
+            aliceLogin.data.account.friendCode ===
+            aliceSecondLogin.data.account.friendCode,
+          aliceFriendCode: aliceLogin.data.account.friendCode,
+          bobFriendCode: bobLogin.data.account.friendCode,
+          inviteStatusAfterAccept: acceptRes.data.invite.status,
+          approvedSessionHostId: acceptRes.data.session.hostAccountId,
+          approvedSessionGuestId: acceptRes.data.session.guestAccountId,
+        };
 
         return results;
       })();
