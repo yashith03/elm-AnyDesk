@@ -87,12 +87,12 @@ Every Electron `BrowserWindow` (both Main Window and Chat Window) enforces:
 ---
 
 ## 6. Phased Implementation Plan
-- **Phase 1 (Current)**: Project brief (`PROJECT_BRIEF.md`) and monorepo scaffold (`apps/desktop`, `apps/api`, `packages/protocol`) with local renderer bundling, strict Electron security flags, and typecheck/build verification.
-- **Phase 2**: Authentication, account creation, and permanent reusable Friend Code assignment (D1 + Worker API + Desktop UI).
+- **Phase 1 (Completed)**: Project brief (`PROJECT_BRIEF.md`) and monorepo scaffold (`apps/desktop`, `apps/api`, `packages/protocol`) with local renderer bundling, strict Electron security flags, and typecheck/build verification.
+- **Phase 2A (Completed — Local Windows 11 Prototype)**: Local Electron prototype verifying Windows 11 unpinned taskbar behavior (`setSkipTaskbar` + `WS_EX_APPWINDOW`), DWM static logo thumbnail (`DWMWA_FORCE_ICONIC_REPRESENTATION`, `DWMWA_HAS_ICONIC_BITMAP`, `DwmSetIconicThumbnail`) & disabled Aero Peek (`DWMWA_DISALLOW_PEEK`, `DWMWA_EXCLUDED_FROM_PEEK`), explicit window/display source picker, independent Microphone & Device Audio capture with Screen Video OFF, and the Windows-native WASAPI loopback helper (`wasapi-loopback.exe`). See [`WINDOWS_PROTOTYPE_TEST_MATRIX.md`](./WINDOWS_PROTOTYPE_TEST_MATRIX.md) for the full test matrix and reproduction steps.
+- **Phase 2B (Next)**: Authentication, account creation, and permanent reusable Friend Code assignment (D1 + Worker API + Desktop UI).
 - **Phase 3**: Online invite service, real-time invite/accept/decline state machine via SQLite-backed Durable Objects, and pre-accept media consent toggles.
 - **Phase 4**: Ephemeral 1:1 separate chat window (notification previews off) and session termination lifecycle (top-bar Disconnect, app close, connection loss, non-resumable enforcement).
-- **Phase 5**: Explicit "Start Sharing" flow, window/display source picker (no webcam), independent Screen Video / Mic Audio / Device Audio tracks over STUN-only WebRTC.
-- **Phase 6**: Windows 11 taskbar state management (`setSkipTaskbar` on restore/minimize) and DWM static logo thumbnail + disabled Aero Peek (`DWMWA_FORCE_ICONIC_REPRESENTATION`, `DWMWA_HAS_ICONIC_BITMAP`, `DWMWA_DISALLOW_PEEK`).
+- **Phase 5**: End-to-end 1:1 WebRTC session integration combining explicit "Start Sharing" flow, window/display source picker (no webcam), and independent Screen Video / Mic Audio / Device Audio tracks over STUN-only WebRTC.
 
 ---
 

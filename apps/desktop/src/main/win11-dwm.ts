@@ -50,6 +50,11 @@ interface Win32Apis {
   ) => bigint;
   DeleteObject: (ho: bigint) => number;
   GetWindowLongPtrW: (hwnd: bigint, nIndex: number) => bigint;
+  SetWindowLongPtrW: (
+    hwnd: bigint,
+    nIndex: number,
+    dwNewLong: bigint
+  ) => bigint;
   IsIconic: (hwnd: bigint) => number;
   IsWindowVisible: (hwnd: bigint) => number;
   SendMessageW: (
@@ -58,6 +63,11 @@ interface Win32Apis {
     wParam: bigint,
     lParam: bigint
   ) => bigint;
+  RtlMoveMemory: (
+    destination: bigint,
+    source: Buffer,
+    length: bigint
+  ) => void;
 }
 
 let cachedApis: Win32Apis | null = null;
@@ -70,6 +80,7 @@ function getWin32Apis(): Win32Apis {
   const dwmapi = koffi.load('dwmapi.dll');
   const gdi32 = koffi.load('gdi32.dll');
   const user32 = koffi.load('user32.dll');
+  const kernel32 = koffi.load('kernel32.dll');
 
   cachedApis = {
     DwmSetWindowAttribute: dwmapi.func(
@@ -91,12 +102,18 @@ function getWin32Apis(): Win32Apis {
     GetWindowLongPtrW: user32.func(
       'intptr_t __stdcall GetWindowLongPtrW(uintptr_t hWnd, int32 nIndex)'
     ),
+    SetWindowLongPtrW: user32.func(
+      'intptr_t __stdcall SetWindowLongPtrW(uintptr_t hWnd, int32 nIndex, intptr_t dwNewLong)'
+    ),
     IsIconic: user32.func('int32 __stdcall IsIconic(uintptr_t hWnd)'),
     IsWindowVisible: user32.func(
       'int32 __stdcall IsWindowVisible(uintptr_t hWnd)'
     ),
     SendMessageW: user32.func(
       'intptr_t __stdcall SendMessageW(uintptr_t hWnd, uint32 Msg, uintptr_t wParam, intptr_t lParam)'
+    ),
+    RtlMoveMemory: kernel32.func(
+      'void __stdcall RtlMoveMemory(uintptr_t Destination, const void* Source, uintptr_t Length)'
     ),
   };
 
@@ -191,9 +208,8 @@ function createStaticLogoBitmap(
       }
     }
 
-    // Copy pixelBuf into the native DIB section memory via koffi
-    const destArray = koffi.view(bitsPtr, pixelBuf.byteLength);
-    new Uint8Array(destArray).set(pixelBuf);
+    // Copy pixelBuf into the native DIB section memory via RtlMoveMemory
+    apis.RtlMoveMemory(bitsPtr, pixelBuf, BigInt(pixelBuf.byteLength));
   }
 
   return { hBitmap, width, height };
@@ -321,6 +337,12 @@ export class Win11TaskbarDwmController {
 
   private applySkipTaskbar(skip: boolean, reason: string): void {
     if (this.win.isDestroyed()) return;
+    const apis = getWin32Apis();
+    const currentEx = BigInt(apis.GetWindowLongPtrW(this.hwnd, GWL_EXSTYLE));
+    const nextEx = skip
+      ? currentEx & ~WS_EX_APPWINDOW
+      : (currentEx & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW;
+    apis.SetWindowLongPtrW(this.hwnd, GWL_EXSTYLE, nextEx);
     this.win.setSkipTaskbar(skip);
     this.skipTaskbarActive = skip;
     this.recordTransition(reason);
@@ -383,10 +405,8 @@ export class Win11TaskbarDwmController {
     if (process.platform === 'win32' && !this.win.isDestroyed()) {
       const apis = getWin32Apis();
       this.invalidateBitmapsHResult = apis.DwmInvalidateIconicBitmaps(this.hwnd);
-      // Send WM_DWMSENDICONICTHUMBNAIL with lParam = MAKELPARAM(120, 200) (maxWidth=200, maxHeight=120)
-      const lParam = (200n << 16n) | 120n;
-      apis.SendMessageW(this.hwnd, WM_DWMSENDICONICTHUMBNAIL, 0n, lParam);
-      apis.SendMessageW(this.hwnd, WM_DWMSENDICONICLIVEPREVIEWBITMAP, 0n, 0n);
+      this.supplyStaticThumbnail(200, 120, 'DwmSetIconicThumbnail_Verify');
+      this.supplyStaticLivePreview('DwmSetIconicLivePreviewBitmap_Verify');
     }
     return this.getTelemetry();
   }

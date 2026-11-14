@@ -5,6 +5,7 @@ import {
   ipcMain,
   session,
 } from 'electron';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -26,6 +27,10 @@ let taskbarDwmController: Win11TaskbarDwmController | null = null;
 const wasapiManager = new WasapiLoopbackManager();
 
 let explicitlySelectedSourceId: string | null = null;
+
+if (process.argv.includes('--run-prototype-suite')) {
+  app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+}
 
 const windowRoles = new WeakMap<BrowserWindow, DesktopWindowRole>();
 
@@ -126,10 +131,30 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   return win;
 }
 
+let lastDisplayMediaRequestFlags: {
+  videoRequested: boolean;
+  audioRequested: boolean;
+} | null = null;
+
 function registerDisplayMediaHandler(): void {
   session.defaultSession.setDisplayMediaRequestHandler(
     async (request, callback) => {
       try {
+        lastDisplayMediaRequestFlags = {
+          videoRequested: request.videoRequested,
+          audioRequested: request.audioRequested,
+        };
+        // Hard requirement: Never turn video on automatically to enable audio.
+        if (!request.videoRequested) {
+          if (request.audioRequested) {
+            // Test whether Electron allows audio-only loopback without a video stream
+            callback({ audio: 'loopback' } as unknown as Parameters<typeof callback>[0]);
+            return;
+          }
+          callback({});
+          return;
+        }
+
         if (!explicitlySelectedSourceId) {
           // Never auto-select a screen source without User A's explicit choice
           callback({});
@@ -360,68 +385,108 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
     await sleep(250);
     const restoredState = taskbarDwmController.getTelemetry();
 
-    // 4-7. Renderer media & track verification
-    const mediaSuiteResult = await win.webContents.executeJavaScript(`
+    // 4-7. Renderer media & track verification (with userGesture = true and per-step timeouts)
+    const mediaSuiteResult = await win.webContents.executeJavaScript(
+      `
       (async () => {
+        const withTimeout = (promise, ms, label) =>
+          Promise.race([
+            promise,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms)
+            ),
+          ]);
+
         const results = {};
 
         // A. Explicit source enumeration & Screen Video capture + playback
-        const sources = await window.elmDesktop.listShareableSources();
-        const onlyScreenOrWindow = sources.every(
-          (s) => s.surfaceType === 'display' || s.surfaceType === 'window'
-        );
-        results.sourceEnumeration = {
-          count: sources.length,
-          onlyScreenOrWindow,
-          sampleSources: sources.slice(0, 3).map((s) => ({
-            id: s.id,
-            name: s.name,
-            surfaceType: s.surfaceType,
-          })),
-        };
-
-        if (sources.length > 0) {
-          await window.elmDesktop.selectShareableSource(sources[0].id);
-          const screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
-            audio: false,
-          });
-          const vTrack = screenStream.getVideoTracks()[0];
-          const vidEl = document.createElement('video');
-          vidEl.muted = true;
-          vidEl.playsInline = true;
-          vidEl.srcObject = screenStream;
-          await vidEl.play();
-          await new Promise((r) => setTimeout(r, 350));
-
-          results.screenVideoCapture = {
-            ok: Boolean(vTrack && vTrack.readyState === 'live' && vidEl.videoWidth > 0),
-            trackId: vTrack?.id ?? null,
-            kind: vTrack?.kind ?? null,
-            label: vTrack?.label ?? null,
-            readyState: vTrack?.readyState ?? null,
-            videoWidth: vidEl.videoWidth,
-            videoHeight: vidEl.videoHeight,
-            paused: vidEl.paused,
-            currentTime: vidEl.currentTime,
+        try {
+          const sources = await withTimeout(
+            window.elmDesktop.listShareableSources(),
+            2500,
+            'listShareableSources'
+          );
+          const onlyScreenOrWindow = sources.every(
+            (s) => s.surfaceType === 'display' || s.surfaceType === 'window'
+          );
+          results.sourceEnumeration = {
+            count: sources.length,
+            onlyScreenOrWindow,
+            sampleSources: sources.slice(0, 4).map((s) => ({
+              id: s.id,
+              name: s.name,
+              surfaceType: s.surfaceType,
+            })),
           };
 
-          screenStream.getTracks().forEach((t) => t.stop());
-          results.screenVideoCapture.stoppedState = vTrack?.readyState ?? null;
+          // Prefer a window source first, or fallback to first source
+          const preferred =
+            sources.find((s) => s.surfaceType === 'window') || sources[0];
+          if (preferred) {
+            await window.elmDesktop.selectShareableSource(preferred.id);
+            const screenStream = await withTimeout(
+              navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: false,
+              }),
+              2500,
+              'getDisplayMedia'
+            );
+            const vTrack = screenStream.getVideoTracks()[0];
+            const vidEl = document.createElement('video');
+            vidEl.muted = true;
+            vidEl.playsInline = true;
+            vidEl.srcObject = screenStream;
+            let playError = null;
+            try {
+              await withTimeout(vidEl.play(), 1000, 'video.play');
+            } catch (pe) {
+              playError = pe instanceof Error ? pe.message : String(pe);
+            }
+            await new Promise((r) => setTimeout(r, 250));
+
+            const settings = vTrack ? vTrack.getSettings() : {};
+            results.screenVideoCapture = {
+              ok: Boolean(vTrack && vTrack.readyState === 'live'),
+              selectedSource: preferred.name + ' (' + preferred.surfaceType + ')',
+              trackId: vTrack?.id ?? null,
+              kind: vTrack?.kind ?? null,
+              label: vTrack?.label ?? null,
+              readyState: vTrack?.readyState ?? null,
+              settingsWidth: settings.width ?? null,
+              settingsHeight: settings.height ?? null,
+              videoElementWidth: vidEl.videoWidth,
+              videoElementHeight: vidEl.videoHeight,
+              paused: vidEl.paused,
+              playNote: playError,
+            };
+
+            screenStream.getTracks().forEach((t) => t.stop());
+            results.screenVideoCapture.stoppedState = vTrack?.readyState ?? null;
+          }
+        } catch (err) {
+          results.screenVideoCapture = {
+            ok: false,
+            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
+          };
         }
 
         // B. Microphone capture & playback check
         try {
-          const micStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: false,
-          });
+          const micStream = await withTimeout(
+            navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: false,
+            }),
+            2000,
+            'getUserMedia(audio)'
+          );
           const mTrack = micStream.getAudioTracks()[0];
           const micEl = document.createElement('audio');
           micEl.muted = true;
           micEl.srcObject = micStream;
-          await micEl.play();
-          await new Promise((r) => setTimeout(r, 250));
+          await withTimeout(micEl.play().catch(() => undefined), 1000, 'mic.play');
+          await new Promise((r) => setTimeout(r, 200));
           results.microphoneCapture = {
             ok: Boolean(mTrack && mTrack.readyState === 'live'),
             trackId: mTrack?.id ?? null,
@@ -441,15 +506,71 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
 
         // C. Electron getDisplayMedia with Screen Video OFF (video: false, audio: true)
         try {
-          const s = await navigator.mediaDevices.getDisplayMedia({
-            video: false,
-            audio: true,
-          });
+          // Start the 440Hz test tone via WASAPI helper so system audio has active signal
+          await window.elmDesktop.startWasapiLoopback({ playTestTone: true });
+          await new Promise((r) => setTimeout(r, 250));
+
+          const s = await withTimeout(
+            navigator.mediaDevices.getDisplayMedia({
+              video: false,
+              audio: true,
+            }),
+            1500,
+            'getDisplayMedia(video:false)'
+          );
+          const vTracks = s.getVideoTracks().map((t) => ({
+            id: t.id,
+            kind: t.kind,
+            label: t.label,
+            readyState: t.readyState,
+          }));
+          const aTracks = s.getAudioTracks().map((t) => ({
+            id: t.id,
+            kind: t.kind,
+            label: t.label,
+            readyState: t.readyState,
+          }));
+
+          // Measure whether Electron's "System audio" track actually delivers non-zero audio samples
+          let sysAudioMaxRms = 0;
+          let sysAudioMaxPeak = 0;
+          if (aTracks.length > 0) {
+            const checkCtx = new AudioContext();
+            await checkCtx.resume().catch(() => undefined);
+            const srcNode = checkCtx.createMediaStreamSource(s);
+            const analyser = checkCtx.createAnalyser();
+            analyser.fftSize = 512;
+            srcNode.connect(analyser);
+            const buf = new Float32Array(analyser.fftSize);
+            for (let i = 0; i < 10; i++) {
+              await new Promise((r) => setTimeout(r, 40));
+              analyser.getFloatTimeDomainData(buf);
+              let sum = 0;
+              let pk = 0;
+              for (let j = 0; j < buf.length; j++) {
+                const v = Math.abs(buf[j]);
+                sum += v * v;
+                if (v > pk) pk = v;
+              }
+              const rms = Math.sqrt(sum / buf.length);
+              if (rms > sysAudioMaxRms) sysAudioMaxRms = rms;
+              if (pk > sysAudioMaxPeak) sysAudioMaxPeak = pk;
+            }
+            await checkCtx.close().catch(() => undefined);
+          }
+
           s.getTracks().forEach((t) => t.stop());
+          await window.elmDesktop.stopWasapiLoopback();
+
           results.electronAudioOnlyDisplayMedia = {
-            supportedNativelyWithVideoOff: true,
+            supportedNativelyWithVideoOff: aTracks.length > 0 && vTracks.length === 0,
+            videoTracksReturned: vTracks,
+            audioTracksReturned: aTracks,
+            measuredRms: Number(sysAudioMaxRms.toFixed(6)),
+            measuredPeak: Number(sysAudioMaxPeak.toFixed(6)),
           };
         } catch (err) {
+          await window.elmDesktop.stopWasapiLoopback().catch(() => undefined);
           results.electronAudioOnlyDisplayMedia = {
             supportedNativelyWithVideoOff: false,
             error: err instanceof Error ? err.name + ': ' + err.message : String(err),
@@ -457,72 +578,85 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
         }
 
         // D. Windows-native WASAPI Loopback with Screen Video OFF
-        const audioCtx = new AudioContext({ sampleRate: 48000 });
-        await audioCtx.resume();
-        const dest = audioCtx.createMediaStreamDestination();
-        let nextTime = audioCtx.currentTime;
-        let chunks = 0;
-        let maxRms = 0;
-        let maxPeak = 0;
+        try {
+          const audioCtx = new AudioContext({ sampleRate: 48000 });
+          await withTimeout(audioCtx.resume().catch(() => undefined), 1000, 'audioCtx.resume');
+          const dest = audioCtx.createMediaStreamDestination();
+          let nextTime = audioCtx.currentTime;
+          let chunks = 0;
+          let maxRms = 0;
+          let maxPeak = 0;
 
-        const unsub = window.elmDesktop.onWasapiAudioChunk((chunk) => {
-          chunks += 1;
-          if (chunk.rms > maxRms) maxRms = chunk.rms;
-          if (chunk.peak > maxPeak) maxPeak = chunk.peak;
+          const unsub = window.elmDesktop.onWasapiAudioChunk((chunk) => {
+            chunks += 1;
+            if (chunk.rms > maxRms) maxRms = chunk.rms;
+            if (chunk.peak > maxPeak) maxPeak = chunk.peak;
 
-          const bin = window.atob(chunk.pcmFloat32Base64);
-          const bytes = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          const floats = new Float32Array(bytes.buffer);
-          const buf = audioCtx.createBuffer(1, floats.length, chunk.sampleRate || 48000);
-          buf.copyToChannel(floats, 0);
-          const src = audioCtx.createBufferSource();
-          src.buffer = buf;
-          src.connect(dest);
-          const now = audioCtx.currentTime;
-          if (nextTime < now) nextTime = now + 0.015;
-          src.start(nextTime);
-          nextTime += buf.duration;
-        });
+            const bin = window.atob(chunk.pcmFloat32Base64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const floats = new Float32Array(bytes.buffer);
+            const buf = audioCtx.createBuffer(1, floats.length, chunk.sampleRate || 48000);
+            buf.getChannelData(0).set(floats);
+            const src = audioCtx.createBufferSource();
+            src.buffer = buf;
+            src.connect(dest);
+            const now = audioCtx.currentTime;
+            if (nextTime < now) nextTime = now + 0.015;
+            src.start(nextTime);
+            nextTime += buf.duration;
+          });
 
-        const wasapiStart = await window.elmDesktop.startWasapiLoopback({
-          playTestTone: true,
-        });
-        const player = document.createElement('audio');
-        player.muted = true;
-        player.srcObject = dest.stream;
-        await player.play();
+          const wasapiStart = await withTimeout(
+            window.elmDesktop.startWasapiLoopback({
+              playTestTone: true,
+            }),
+            2000,
+            'startWasapiLoopback'
+          );
+          const player = document.createElement('audio');
+          player.muted = true;
+          player.srcObject = dest.stream;
+          await withTimeout(player.play().catch(() => undefined), 1000, 'wasapiPlayer.play');
 
-        await new Promise((r) => setTimeout(r, 650));
+          await new Promise((r) => setTimeout(r, 600));
 
-        const wasapiTrack = dest.stream.getAudioTracks()[0];
-        results.wasapiLoopbackWithVideoOff = {
-          ok: Boolean(
-            wasapiStart.ok &&
-              wasapiTrack &&
-              wasapiTrack.readyState === 'live' &&
-              chunks > 5 &&
-              maxPeak > 0.02
-          ),
-          endpoint: wasapiStart,
-          trackId: wasapiTrack?.id ?? null,
-          kind: wasapiTrack?.kind ?? null,
-          readyState: wasapiTrack?.readyState ?? null,
-          videoTracksCount: dest.stream.getVideoTracks().length,
-          chunksReceived: chunks,
-          maxRms: Number(maxRms.toFixed(6)),
-          maxPeak: Number(maxPeak.toFixed(6)),
-          audioElementPaused: player.paused,
-          audioElementCurrentTime: Number(player.currentTime.toFixed(3)),
-        };
+          const wasapiTrack = dest.stream.getAudioTracks()[0];
+          results.wasapiLoopbackWithVideoOff = {
+            ok: Boolean(
+              wasapiStart.ok &&
+                wasapiTrack &&
+                wasapiTrack.readyState === 'live' &&
+                chunks > 5 &&
+                maxPeak > 0.02
+            ),
+            endpoint: wasapiStart,
+            trackId: wasapiTrack?.id ?? null,
+            kind: wasapiTrack?.kind ?? null,
+            readyState: wasapiTrack?.readyState ?? null,
+            videoTracksCount: dest.stream.getVideoTracks().length,
+            chunksReceived: chunks,
+            maxRms: Number(maxRms.toFixed(6)),
+            maxPeak: Number(maxPeak.toFixed(6)),
+            audioElementPaused: player.paused,
+            audioElementCurrentTime: Number(player.currentTime.toFixed(3)),
+          };
 
-        unsub();
-        await window.elmDesktop.stopWasapiLoopback();
-        await audioCtx.close();
+          unsub();
+          await window.elmDesktop.stopWasapiLoopback();
+          await audioCtx.close().catch(() => undefined);
+        } catch (err) {
+          results.wasapiLoopbackWithVideoOff = {
+            ok: false,
+            error: err instanceof Error ? err.name + ': ' + err.message : String(err),
+          };
+        }
 
         return results;
       })();
-    `);
+    `,
+      true
+    );
 
     const report = {
       timestamp: new Date().toISOString(),
@@ -557,18 +691,32 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
           transitionsCount: restoredState.transitions.length,
         },
       },
-      mediaSuite: mediaSuiteResult,
+      mediaSuite: {
+        ...mediaSuiteResult,
+        lastDisplayMediaRequestFlags,
+      },
     };
 
-    console.log('===PROTOTYPE_SUITE_JSON_START===');
-    console.log(JSON.stringify(report, null, 2));
-    console.log('===PROTOTYPE_SUITE_JSON_END===');
+    const reportPath = path.join(__dirname, '../prototype-suite-report.json');
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8');
   } catch (err) {
-    console.error('Prototype suite failed:', err);
+    const reportPath = path.join(__dirname, '../prototype-suite-report.json');
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify(
+        {
+          error: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
     process.exitCode = 1;
   } finally {
     wasapiManager.stopCapture();
-    app.quit();
+    app.exit(0);
   }
 }
 

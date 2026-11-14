@@ -1,0 +1,94 @@
+# Windows 11 Prototype Test Matrix (Taskbar/DWM & Media Capture)
+
+## 1. Environment & Versions
+
+- **Operating System**: Microsoft Windows 11 Home — `Windows_NT 10.0.26300 (x64)` (Build `26300`)
+- **Electron**: `34.5.8`
+- **Chromium**: `132.0.6834.210`
+- **Node.js (Electron Embedded)**: `20.19.1` (Workspace CLI Node: `v24.18.1`)
+- **Native Bindings / Helpers**:
+  - `koffi` FFI in `apps/desktop/src/main/win11-dwm.ts` (`dwmapi.dll`, `gdi32.dll`, `user32.dll`, `kernel32.dll`)
+  - Native C# WASAPI Loopback helper in `apps/desktop/native/WasapiLoopbackHelper.cs` (`apps/desktop/dist/native/wasapi-loopback.exe`)
+
+---
+
+## 2. Why Visual Shell Cases Are Marked `Not Run` in Antigravity
+
+When Electron is launched from the Antigravity command tool (`npx electron apps/desktop`), the process runs inside a restricted Windows sandbox desktop token:
+- Chromium logs `Failed to assign the desktop to the current thread: 170 (ERROR_BUSY)` and `MouseCursorMonitorWin::Capture: Unable to get cursor info. Error = 5 (ERROR_ACCESS_DENIED)`.
+- Because the agent cannot visually observe the interactive Windows 11 `explorer.exe` taskbar shell or move the physical mouse cursor over the taskbar button, **all visual/interactive shell verification cases are marked `Not Run`** (never claimed as `Pass`).
+- All **programmatic Win32/DWM/WebRTC/WASAPI API and track invariants** that executed on Windows 11 Build 26300 are recorded below with their exact measured telemetry.
+
+---
+
+## 3. Windows 11 Test Matrix
+
+| ID | Test Case | Status | Automated / Measured Result | Steps to Reproduce |
+| :--- | :--- | :--- | :--- | :--- |
+| **TC-01** | **Unpinned Taskbar — Window Open State (API/Style)** | **Pass** | `isMinimized: false`, `win32IsIconic: false`, `skipTaskbarApplied: true`, `wsExAppWindow: false` (`ITaskbarList::DeleteTab` + `WS_EX_APPWINDOW` cleared). | Run `npx electron apps/desktop --run-prototype-suite` or launch app and inspect "Win32 Window & Taskbar State" panel while open. |
+| **TC-02** | **Unpinned Taskbar — Window Minimized State (API/Style)** | **Pass** | `isMinimized: true`, `win32IsIconic: true`, `skipTaskbarApplied: false`, `wsExAppWindow: true` (`ITaskbarList::AddTab` + `WS_EX_APPWINDOW` set). | Click **Minimize Window** in UI or run `runTaskbarMinimizeRestoreCycle`. |
+| **TC-03** | **Unpinned Taskbar — Window Restored State (API/Style)** | **Pass** | `isMinimized: false`, `win32IsIconic: false`, `skipTaskbarApplied: true`, `wsExAppWindow: false` restored after 60ms settle delay. | Restore the minimized window and inspect Transition Log in UI. |
+| **TC-04** | **DWM Attributes Applied (`FORCE_ICONIC`, `HAS_ICONIC_BITMAP`, `DISALLOW_PEEK`, `EXCLUDED_FROM_PEEK`)** | **Pass** | All 4 `DwmSetWindowAttribute` calls on `HWND` returned `0x00000000` (`S_OK`), and `DwmInvalidateIconicBitmaps` returned `0x00000000` (`S_OK`). | Launch app and check "DWM Attributes & Iconic Bitmap Callbacks" card. |
+| **TC-05** | **DWM Static Logo Bitmap Supply (`DwmSetIconicThumbnail` & `DwmSetIconicLivePreviewBitmap`)** | **Pass** | 32-bit bottom-up BGRA DIB (`200x120`) containing only the static Elm-AnyDesk shield logo accepted by `DwmSetIconicThumbnail` (`0x00000000` `S_OK`) and `DwmSetIconicLivePreviewBitmap` (`0x00000000` `S_OK`). | Click **Trigger DWM Static Thumbnail Callback** in UI or run `--run-prototype-suite`. |
+| **TC-06** | **Visual Taskbar Verification: Open → Minimize → Hover → Click-to-Restore (Unpinned)** | **Not Run** *(Manual GUI Required)* | Requires human visual verification on the interactive Windows 11 desktop taskbar (`explorer.exe`). | See **Section 5 (Manual PowerShell Launch & Step-by-Step Verification)** below. |
+| **TC-07** | **Visual Hover Popup vs. Content Privacy & Disabled Full-Size Peek** | **Not Run** *(Manual GUI Required)* | Requires physical mouse hover over the minimized taskbar icon to verify: (a) OS hover popup container still appears, (b) static logo is shown with zero live `ALPHA-7392-TEST` content, and (c) full-size Peek does not trigger. | See **Section 5 (Manual PowerShell Launch & Step-by-Step Verification)** below. |
+| **TC-08** | **Explicit Source Enumeration (Displays & Windows Only, No Webcam)** | **Pass** | `desktopCapturer.getSources({ types: ['screen', 'window'] })` returned only `display` / `window` surfaces (`onlyScreenOrWindow: true`). No media starts before explicit **Start Sharing**. | Click **1. Load Shareable Windows & Displays** in UI. |
+| **TC-09** | **Screen Video Track Creation (`getDisplayMedia` with Selected Source)** | **Pass** | Live video `MediaStreamTrack` created (`kind: "video"`, `label: "Screen 1"`, `readyState: "live"`, `1920x1080`), cleanly transitions to `readyState: "ended"` on stop. | Select a source, check **Screen Video**, and click **2. Start Sharing**. |
+| **TC-10** | **Screen Video `<video>` Element Live Frame Rendering** | **Not Run** *(Manual GUI Required)* | In the Antigravity sandbox desktop token, DXGI desktop duplication is blocked by OS `Error = 5 (ERROR_ACCESS_DENIED)`, causing `videoWidth: 0` inside the automated runner. Must be verified in interactive user desktop session. | Launch from interactive PowerShell, select a Window/Display, check **Screen Video**, click **2. Start Sharing**, and verify `<video>` preview renders live frames. |
+| **TC-11** | **Independent Microphone Audio Capture & Playback (`video: false`)** | **Pass** | Live audio `MediaStreamTrack` created (`kind: "audio"`, `label: "Default - Microphone Array (2- Realtek(R) Audio)"`, `readyState: "live"`, `videoTracksCount: 0`, `<audio>` `paused: false`). | Check **Microphone Audio** (leave Screen Video OFF) and click **2. Start Sharing**. |
+| **TC-12** | **Electron `getDisplayMedia({ video: false, audio: true })` with `callback({ audio: 'loopback' })` (Screen Video OFF)** | **Pass** | In Electron `34.5.8`, `setDisplayMediaRequestHandler` receives `videoRequested: false, audioRequested: true`; passing `callback({ audio: 'loopback' })` returns `audioTracks: 1` (`label: "System audio"`, `readyState: "live"`, `measuredRms: 0.074854`, `measuredPeak: 0.11414`) and `videoTracks: 0` (video never turned on). | Click **Test Electron getDisplayMedia(video: false, audio: true)** in UI. |
+| **TC-13** | **Windows-Native WASAPI Loopback Prototype with Screen Video OFF** | **Pass** | `wasapi-loopback.exe` captures default render endpoint (`48000Hz`, `2ch`, `32-bit`), feeds WebAudio `MediaStreamAudioDestinationNode` (`kind: "audio"`, `readyState: "live"`, `videoTracksCount: 0`, `chunksReceived: 29`, `maxRms: 0.081152`, `maxPeak: 0.133304`), and plays in `<audio>` (`paused: false`, `currentTime: 0.51s`) with Screen Video OFF. | Check **Device Audio — WASAPI Loopback** (leave Screen Video OFF) and click **2. Start Sharing**. |
+
+---
+
+## 4. Architectural Findings & Trade-Off Notes
+
+### 4.1 Taskbar Hover Popup vs. Content Privacy vs. System Tray Trade-Off
+1. **Does the Windows 11 hover popup container still appear when minimized?**
+   - **Yes.** Whenever a window has a visible taskbar button on Windows 11 (`setSkipTaskbar(false)` while minimized), hovering the taskbar icon instructs the Windows 11 shell (`explorer.exe`) to display the taskbar thumbnail popup container card (window title + thumbnail box + close `X` button). Windows 11 does not provide an unprivileged per-window Win32 API to suppress the shell popup frame itself while keeping a normal taskbar button, and we **do not** modify global Windows registry/Explorer settings.
+2. **Is any real application content visible inside the hover popup or Peek?**
+   - **No.** Because `DWMWA_FORCE_ICONIC_REPRESENTATION = 1` and `DWMWA_HAS_ICONIC_BITMAP = 1` are set on the `HWND`, DWM never captures the live window surface. Instead, DWM sends `WM_DWMSENDICONICTHUMBNAIL (0x0323)` and our main process supplies a static in-memory 32-bit BGRA Elm-AnyDesk shield logo bitmap (`DwmSetIconicThumbnail` -> `0x00000000` `S_OK`). In addition, `DWMWA_DISALLOW_PEEK = 1` and `DWMWA_EXCLUDED_FROM_PEEK = 1` disable full-size Aero Peek on hover.
+3. **Documented Tray Alternative (Not Enabled Automatically)**:
+   - If product requirements strictly forbid even the static-logo hover popup card while minimized, the only way on Windows 11 without changing global OS settings is keeping `setSkipTaskbar(true)` at all times (even when minimized) and placing an icon in the **Windows System Tray (`Tray`)** where single-clicking the tray icon restores the window. We have preserved the main taskbar behavior (`setSkipTaskbar(false)` on minimize) as requested.
+
+### 4.2 Device Audio Capture with Screen Video OFF
+1. **Electron 34.5.8 `setDisplayMediaRequestHandler` (`audio: 'loopback'` without `video`)**:
+   - When the renderer calls `navigator.mediaDevices.getDisplayMedia({ video: false, audio: true })`, Electron 34.5.8 invokes `setDisplayMediaRequestHandler` with `request.videoRequested === false` and `request.audioRequested === true`. Returning `callback({ audio: 'loopback' })` (without any `video` property) yields a live `"System audio"` `MediaStreamTrack` with `0` video tracks (`videoTracksReturned: []`).
+2. **Windows-Native WASAPI Loopback Prototype (`wasapi-loopback.exe`)**:
+   - In addition to Electron's loopback handler, we built and verified `apps/desktop/native/WasapiLoopbackHelper.cs` (`dist/native/wasapi-loopback.exe`), which opens `IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)` with `AUDCLNT_STREAMFLAGS_LOOPBACK` completely outside Chromium's display capture stack and bridges PCM float32 frames into a WebRTC-ready `MediaStreamTrack` (`MediaStreamAudioDestinationNode`). This guarantees independent device-only audio even across Chromium versions that enforce W3C `getDisplayMedia` video constraints, while **never** turning video on automatically.
+
+---
+
+## 5. Manual PowerShell Launch Command & Exact Verification Steps
+
+Run these commands in an **interactive Windows 11 PowerShell window** on your desktop (make sure the app is **not pinned** to the taskbar):
+
+```powershell
+cd D:\Downloads\Elm-AnyDesk
+npm run build
+npm run start:desktop
+```
+
+### Step-by-Step Manual Verification Checklist
+
+1. **Verify Unpinned Open State (`TC-06`)**:
+   - Confirm the Elm-AnyDesk window is open on your desktop and displays the yellow/crimson banner `NON-SENSITIVE LIVE WINDOW CONTENT MARKER: ALPHA-7392-TEST`.
+   - Look at the Windows 11 taskbar: confirm **no Elm-AnyDesk icon is visible** on the taskbar while the window is open (`skipTaskbarApplied: true`, `WS_EX_APPWINDOW: false`).
+2. **Verify Minimize & Taskbar Icon Appearance (`TC-06`)**:
+   - Click the **Minimize Window (Test Taskbar Icon, Hover & Click-to-Restore)** button (or the window title bar `_` minimize button).
+   - Look at the Windows 11 taskbar: confirm the **Elm-AnyDesk taskbar icon appears** while the window is minimized (`skipTaskbarApplied: false`, `WS_EX_APPWINDOW: true`).
+3. **Verify Hover Thumbnail Static Logo & Disabled Peek (`TC-07`)**:
+   - Move your mouse cursor over the minimized Elm-AnyDesk icon on the Windows 11 taskbar.
+   - Verify separately:
+     - **Hover Popup Container**: The OS thumbnail popup card appears above the taskbar icon.
+     - **No Real App Content**: Inside the popup card, verify you see the **static dark-slate & blue Elm-AnyDesk shield logo** and **none** of the `ALPHA-7392-TEST` yellow/crimson banner or UI text.
+     - **Full-Size Peek Disabled**: Move your mouse cursor onto the thumbnail image inside the popup and confirm Windows 11 **does not** trigger a full-screen live Aero Peek preview of the window.
+4. **Verify Click-to-Restore & Taskbar Icon Hiding (`TC-06`)**:
+   - Click the Elm-AnyDesk icon on the Windows 11 taskbar.
+   - Confirm the window restores to the foreground, and once restored, its running icon **disappears from the Windows 11 taskbar** again.
+   - Check the **Taskbar & DWM Transition Log** table inside the window to confirm `DwmSetIconicThumbnail` returned `0x00000000` (`S_OK`).
+5. **Verify Explicit Source Selection & Independent Media Tracks (`TC-08` – `TC-13`)**:
+   - Click **1. Load Shareable Windows & Displays** and click one of the displayed window or screen cards. Confirm no capture has started yet.
+   - Check **Device Audio — WASAPI Loopback** (leave **Screen Video** unchecked/OFF) and click **2. Start Sharing (Explicit User A Action)**.
+   - Confirm the **Device Audio Track (WASAPI Loopback)** card shows `Active: true`, `Screen Video Required?: NO (Active Video Tracks = 0)`, live RMS/Peak meter movement, and audible 440Hz test tone playback in the `<audio>` control.
+   - Check **Screen Video**, click **2. Start Sharing**, and confirm the `<video>` preview renders live video frames from your selected window/display and **Stop Video Only** stops video without dropping Device Audio.

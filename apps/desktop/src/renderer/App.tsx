@@ -190,21 +190,25 @@ export function App(): React.ReactElement {
 
   const handleTestElectronAudioOnlyDisplayMedia = async () => {
     try {
-      // Explicitly test whether Electron/Chromium getDisplayMedia can capture
-      // device audio with video: false (without turning video on automatically).
+      // Test whether Electron 34's setDisplayMediaRequestHandler with callback({ audio: 'loopback' })
+      // can provide independent device-only audio when getDisplayMedia({ video: false, audio: true }) is called.
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: false,
         audio: true,
       });
+      const vTracks = stream.getVideoTracks();
+      const aTracks = stream.getAudioTracks();
+      const summary = `AudioTracks=${aTracks.length} (${
+        aTracks[0]?.label ?? 'none'
+      }, state=${aTracks[0]?.readyState ?? 'none'}), VideoTracks=${
+        vTracks.length
+      } (video never enabled)`;
       stream.getTracks().forEach((t) => t.stop());
-      setElectronDisplayAudioOnlyResult(
-        'Unexpectedly succeeded with video: false'
-      );
+      setElectronDisplayAudioOnlyResult(`PASS in Electron 34.5.8: ${summary}`);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      setElectronDisplayAudioOnlyResult(
-        `Confirmed Chromium/Electron restriction (video never auto-enabled): ${msg}`
-      );
+      const msg =
+        err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      setElectronDisplayAudioOnlyResult(`Failed: ${msg}`);
     }
   };
 
