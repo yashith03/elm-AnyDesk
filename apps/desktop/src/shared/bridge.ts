@@ -2,11 +2,16 @@ import type {
   AccountProfile,
   AllowedScreenSurface,
   ApprovedSessionSummary,
+  EphemeralChatMessage,
+  HostMediaRuntimeState,
   HostMediaSelection,
   InviteSummary,
+  MediaSourceKind,
   PresenceStateSnapshot,
   ProtocolErrorCode,
   SessionLifecycleState,
+  WebRtcSignalEnvelope,
+  WebRtcSignalPayload,
 } from '@elm/protocol';
 
 export type DesktopWindowRole = 'main' | 'chat';
@@ -29,7 +34,7 @@ export interface DesktopRuntimeMetadata {
   readonly protocolVersion: string;
   readonly platform: string;
   readonly windowRole: DesktopWindowRole;
-  readonly phase: 'Phase 2 — Sign-In, Permanent Friend Codes, Presence & Invite Flow';
+  readonly phase: 'Phase 3 — WebRTC Media (A -> B) & Separate DataChannel Chat Window';
   readonly defaultMediaSelection: HostMediaSelection;
   readonly initialSessionState: SessionLifecycleState;
   readonly securityPosture: DesktopSecurityPosture;
@@ -108,6 +113,20 @@ export interface ApiActionResult<T> {
 }
 
 /**
+ * In-memory volatile session & chat state shared between the Main Window and the
+ * Separate Chat Window. Never persisted to disk, SQLite, D1, or localStorage.
+ */
+export interface VolatileSessionUiState {
+  readonly session: ApprovedSessionSummary | null;
+  readonly currentAccount: AccountProfile | null;
+  readonly connectionState: string;
+  readonly dataChannelState: 'closed' | 'connecting' | 'open';
+  readonly messagePreviewsEnabled: boolean;
+  readonly messages: readonly EphemeralChatMessage[];
+  readonly hostMediaState: HostMediaRuntimeState | null;
+}
+
+/**
  * Narrow preload bridge contract exposed on `window.elmDesktop`.
  * Raw Electron IPC primitives and provider secrets are never exposed to the renderer.
  */
@@ -153,6 +172,52 @@ export interface ElmDesktopBridge {
   disconnectActiveSession: (sessionId?: string) => Promise<
     ApiActionResult<{ disconnected: boolean; snapshot: PresenceStateSnapshot }>
   >;
+
+  // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
+  sendSessionSignal: (params: {
+    sessionId: string;
+    senderAccountId?: string;
+    payload: WebRtcSignalPayload;
+  }) => Promise<
+    ApiActionResult<{
+      admitted: boolean;
+      session: ApprovedSessionSummary;
+      envelope: WebRtcSignalEnvelope;
+    }>
+  >;
+  pollSessionSignals: (params: {
+    sessionId: string;
+    receiverAccountId?: string;
+    afterSeq: number;
+  }) => Promise<
+    ApiActionResult<{
+      session: ApprovedSessionSummary;
+      signals: readonly WebRtcSignalEnvelope[];
+    }>
+  >;
+  getVolatileSessionUiState: () => Promise<VolatileSessionUiState>;
+  syncVolatileSessionUiState: (
+    patch: Partial<VolatileSessionUiState>
+  ) => Promise<VolatileSessionUiState>;
+  sendChatFromChatWindow: (params: {
+    text: string;
+    senderOverride?: 'host' | 'guest';
+  }) => Promise<{ queued: boolean }>;
+  requestHostStopSharingFromChatWindow: (
+    target: MediaSourceKind | 'all'
+  ) => Promise<{ requested: boolean }>;
+  onVolatileSessionUiStateUpdated: (
+    listener: (state: VolatileSessionUiState) => void
+  ) => () => void;
+  onChatWindowOutboundSend: (
+    listener: (params: {
+      text: string;
+      senderOverride?: 'host' | 'guest';
+    }) => void
+  ) => () => void;
+  onHostStopSharingRequest: (
+    listener: (target: MediaSourceKind | 'all') => void
+  ) => () => void;
 
   // Windows 11 Taskbar & DWM Preview Prototype
   getTaskbarDwmTelemetry: () => Promise<TaskbarDwmTelemetry>;

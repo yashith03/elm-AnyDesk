@@ -4,7 +4,18 @@
  * Electron desktop app and the Cloudflare Workers + D1 + SQLite Durable Objects backend.
  */
 
-export const PROTOCOL_VERSION = '0.2.0-phase2' as const;
+export const PROTOCOL_VERSION = '0.3.0-phase3' as const;
+
+/**
+ * Free-tier STUN-only ICE server configuration for WebRTC peer connections.
+ * Media and private chat flow peer-to-peer (media A -> B, chat bidirectional via reliable DataChannel).
+ * The Cloudflare Worker only coordinates signaling and session state.
+ */
+export const STUN_ICE_SERVERS: ReadonlyArray<{ readonly urls: string }> =
+  Object.freeze([
+    Object.freeze({ urls: 'stun:stun.l.google.com:19302' }),
+    Object.freeze({ urls: 'stun:stun.cloudflare.com:3478' }),
+  ]);
 
 /**
  * Friend Code format: ELM-XXXX-XXXX where X is an unambiguous uppercase alphanumeric
@@ -132,7 +143,111 @@ export type ProtocolErrorCode =
   | 'NOT_INVITE_OWNER'
   | 'UNAUTHORIZED_SESSION_PARTICIPANT'
   | 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
+  | 'INVALID_SIGNAL_PAYLOAD'
   | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2';
+
+/**
+ * Distinct media capture sources controlled strictly by Host A.
+ */
+export type MediaSourceKind =
+  | 'screenVideo'
+  | 'microphoneAudio'
+  | 'deviceAudio';
+
+export const STREAM_ID_BY_SOURCE: Readonly<Record<MediaSourceKind, string>> =
+  Object.freeze({
+    screenVideo: 'elm-stream-screenVideo',
+    microphoneAudio: 'elm-stream-microphoneAudio',
+    deviceAudio: 'elm-stream-deviceAudio',
+  });
+
+export type MediaSourceStatusKind =
+  | 'off'
+  | 'approved_awaiting_start'
+  | 'starting'
+  | 'active'
+  | 'stopped_by_host'
+  | 'permission_denied'
+  | 'source_disappeared'
+  | 'unsupported';
+
+export interface MediaSourceStatusDescriptor {
+  readonly source: MediaSourceKind;
+  readonly approved: boolean;
+  readonly active: boolean;
+  readonly status: MediaSourceStatusKind;
+  readonly message: string;
+  readonly trackId: string | null;
+  readonly streamId: string | null;
+  readonly label: string | null;
+}
+
+export type HostMediaRuntimeState = Readonly<
+  Record<MediaSourceKind, MediaSourceStatusDescriptor>
+>;
+
+export interface WebRtcTrackDescriptor {
+  readonly source: MediaSourceKind;
+  readonly kind: 'video' | 'audio';
+  readonly trackId: string;
+  readonly streamId: string;
+  readonly label: string;
+}
+
+/**
+ * WebRTC signaling payloads exchanged through SignalingCoordinator ONLY after
+ * an invite is accepted. The Worker coordinates SDP/ICE and session state,
+ * never media frames or chat payloads.
+ */
+export type WebRtcSignalPayload =
+  | {
+      readonly type: 'offer';
+      readonly sdp: string;
+      readonly activeTracks: readonly WebRtcTrackDescriptor[];
+    }
+  | {
+      readonly type: 'answer';
+      readonly sdp: string;
+    }
+  | {
+      readonly type: 'ice-candidate';
+      readonly candidate: string;
+      readonly sdpMid: string | null;
+      readonly sdpMLineIndex: number | null;
+    }
+  | {
+      readonly type: 'media-status';
+      readonly activeTracks: readonly WebRtcTrackDescriptor[];
+      readonly sourceStatuses: Partial<
+        Record<
+          MediaSourceKind,
+          { readonly status: MediaSourceStatusKind; readonly message: string }
+        >
+      >;
+    };
+
+export interface WebRtcSignalEnvelope {
+  readonly seq: number;
+  readonly signalId: string;
+  readonly sessionId: string;
+  readonly senderAccountId: string;
+  readonly targetAccountId: string;
+  readonly payload: WebRtcSignalPayload;
+  readonly createdAt: string;
+}
+
+/**
+ * Ephemeral private chat message sent peer-to-peer over a reliable, ordered
+ * WebRTC DataChannel ('elm-private-chat'). Never persisted in D1, SQLite, or disk.
+ */
+export interface EphemeralChatMessage {
+  readonly messageId: string;
+  readonly sessionId: string;
+  readonly senderAccountId: string;
+  readonly senderDisplayName: string;
+  readonly text: string;
+  readonly sentAt: string;
+}
 
 export type InviteStatus =
   | 'pending'
@@ -196,6 +311,10 @@ export type CoordinatorServerEvent =
       readonly session: ApprovedSessionSummary;
     }
   | {
+      readonly type: 'session:signal';
+      readonly envelope: WebRtcSignalEnvelope;
+    }
+  | {
       readonly type: 'session:ended';
       readonly sessionId: string;
       readonly reason: SessionTerminationReason;
@@ -211,7 +330,7 @@ export type CoordinatorServerEvent =
  */
 export interface ApiHealthResponse {
   readonly status: 'ok';
-  readonly phase: 'phase-2-auth-invites-presence';
+  readonly phase: 'phase-3-webrtc-media-and-datachannel-chat';
   readonly protocolVersion: typeof PROTOCOL_VERSION;
   readonly timestamp: string;
 }

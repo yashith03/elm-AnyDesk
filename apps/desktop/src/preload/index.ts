@@ -1,10 +1,15 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import type { HostMediaSelection } from '@elm/protocol';
+import type {
+  HostMediaSelection,
+  MediaSourceKind,
+  WebRtcSignalPayload,
+} from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
   ElmDesktopBridge,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
+  VolatileSessionUiState,
   WasapiAudioChunkPayload,
   WasapiEndpointProbeResult,
 } from '../shared/bridge';
@@ -38,6 +43,78 @@ const bridge: ElmDesktopBridge = Object.freeze({
   }) => ipcRenderer.invoke('elm:invites-respond', params),
   disconnectActiveSession: (sessionId?: string) =>
     ipcRenderer.invoke('elm:sessions-disconnect', sessionId),
+
+  // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
+  sendSessionSignal: (params: {
+    sessionId: string;
+    senderAccountId?: string;
+    payload: WebRtcSignalPayload;
+  }) => ipcRenderer.invoke('elm:sessions-send-signal', params),
+  pollSessionSignals: (params: {
+    sessionId: string;
+    receiverAccountId?: string;
+    afterSeq: number;
+  }) => ipcRenderer.invoke('elm:sessions-poll-signals', params),
+  getVolatileSessionUiState: (): Promise<VolatileSessionUiState> =>
+    ipcRenderer.invoke('elm:volatile-ui-get'),
+  syncVolatileSessionUiState: (
+    patch: Partial<VolatileSessionUiState>
+  ): Promise<VolatileSessionUiState> =>
+    ipcRenderer.invoke('elm:volatile-ui-sync', patch),
+  sendChatFromChatWindow: (params: {
+    text: string;
+    senderOverride?: 'host' | 'guest';
+  }): Promise<{ queued: boolean }> =>
+    ipcRenderer.invoke('elm:chat-window-outbound-send', params),
+  requestHostStopSharingFromChatWindow: (
+    target: MediaSourceKind | 'all'
+  ): Promise<{ requested: boolean }> =>
+    ipcRenderer.invoke('elm:chat-window-stop-sharing', target),
+  onVolatileSessionUiStateUpdated: (
+    listener: (state: VolatileSessionUiState) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      state: VolatileSessionUiState
+    ) => {
+      listener(state);
+    };
+    ipcRenderer.on('elm:volatile-ui-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:volatile-ui-updated', wrapped);
+    };
+  },
+  onChatWindowOutboundSend: (
+    listener: (params: {
+      text: string;
+      senderOverride?: 'host' | 'guest';
+    }) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      params: { text: string; senderOverride?: 'host' | 'guest' }
+    ) => {
+      listener(params);
+    };
+    ipcRenderer.on('elm:chat-window-outbound-event', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:chat-window-outbound-event', wrapped);
+    };
+  },
+  onHostStopSharingRequest: (
+    listener: (target: MediaSourceKind | 'all') => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      target: MediaSourceKind | 'all'
+    ) => {
+      listener(target);
+    };
+    ipcRenderer.on('elm:host-stop-sharing-event', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:host-stop-sharing-event', wrapped);
+    };
+  },
 
   // Windows 11 Taskbar & DWM Preview Prototype
   getTaskbarDwmTelemetry: (): Promise<TaskbarDwmTelemetry> =>

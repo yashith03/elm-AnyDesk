@@ -9,6 +9,8 @@ import {
   type PresenceStateSnapshot,
   type ProtocolErrorCode,
   type SessionTerminationReason,
+  type WebRtcSignalEnvelope,
+  type WebRtcSignalPayload,
 } from '@elm/protocol';
 
 interface InviteRow extends Record<string, SqlStorageValue> {
@@ -34,6 +36,16 @@ interface ActiveSessionRow extends Record<string, SqlStorageValue> {
   guest_friend_code: string;
   guest_display_name: string;
   host_media_selection_json: string;
+  created_at: string;
+}
+
+interface SessionSignalRow extends Record<string, SqlStorageValue> {
+  seq: number;
+  signal_id: string;
+  session_id: string;
+  sender_account_id: string;
+  target_account_id: string;
+  payload_json: string;
   created_at: string;
 }
 
@@ -144,6 +156,16 @@ export class SignalingCoordinator implements DurableObject {
         guest_friend_code TEXT NOT NULL,
         guest_display_name TEXT NOT NULL,
         host_media_selection_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS session_signals (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL,
+        sender_account_id TEXT NOT NULL,
+        target_account_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
     `);
@@ -301,6 +323,10 @@ export class SignalingCoordinator implements DurableObject {
         `DELETE FROM active_sessions WHERE session_id = ?`,
         activeSession.sessionId
       );
+      sql.exec(
+        `DELETE FROM session_signals WHERE session_id = ?`,
+        activeSession.sessionId
+      );
       this.sendEventToAccount(activeSession.hostAccountId, {
         type: 'session:ended',
         sessionId: activeSession.sessionId,
@@ -312,6 +338,63 @@ export class SignalingCoordinator implements DurableObject {
         reason,
       });
     }
+  }
+
+  private recordAndDeliverSignal(
+    session: ApprovedSessionSummary,
+    senderAccountId: string,
+    payload: WebRtcSignalPayload
+  ): WebRtcSignalEnvelope {
+    this.ensureSchema();
+    const sql = this.state.storage.sql;
+    const targetAccountId =
+      senderAccountId === session.hostAccountId
+        ? session.guestAccountId
+        : session.hostAccountId;
+    const signalId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    sql.exec(
+      `INSERT INTO session_signals (
+        signal_id,
+        session_id,
+        sender_account_id,
+        target_account_id,
+        payload_json,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+      signalId,
+      session.sessionId,
+      senderAccountId,
+      targetAccountId,
+      JSON.stringify(payload),
+      createdAt
+    );
+
+    const rows = sql
+      .exec<{ seq: number }>(
+        `SELECT seq FROM session_signals WHERE signal_id = ? LIMIT 1`,
+        signalId
+      )
+      .toArray();
+    const seq = rows[0]?.seq ?? 0;
+
+    const envelope: WebRtcSignalEnvelope = {
+      seq,
+      signalId,
+      sessionId: session.sessionId,
+      senderAccountId,
+      targetAccountId,
+      payload,
+      createdAt,
+    };
+
+    this.sendEventToAccount(targetAccountId, {
+      type: 'session:signal',
+      envelope,
+    });
+
+    return envelope;
   }
 
   private handleWebSocketUpgrade(
@@ -355,6 +438,7 @@ export class SignalingCoordinator implements DurableObject {
           type?: string;
           sessionId?: string;
           friendCode?: string;
+          payload?: WebRtcSignalPayload;
         };
 
         if (parsed.type === 'presence:ping') {
@@ -379,13 +463,24 @@ export class SignalingCoordinator implements DurableObject {
             parsed.sessionId,
             parsed.friendCode
           );
-          serverSocket.send(
-            JSON.stringify({
-              type: 'error',
-              code: check.code,
-              message: check.message,
-            } satisfies CoordinatorServerEvent)
-          );
+          if (!check.allowed) {
+            serverSocket.send(
+              JSON.stringify({
+                type: 'error',
+                code: check.code,
+                message: check.message,
+              } satisfies CoordinatorServerEvent)
+            );
+            return;
+          }
+
+          if (parsed.payload && typeof parsed.payload.type === 'string') {
+            this.recordAndDeliverSignal(
+              check.session,
+              account.accountId,
+              parsed.payload
+            );
+          }
         }
       } catch {
         // Ignore malformed client frames
@@ -413,7 +508,9 @@ export class SignalingCoordinator implements DurableObject {
     callerAccountId: string,
     sessionId?: string,
     attemptedFriendCode?: string
-  ): { allowed: false; status: number; code: ProtocolErrorCode; message: string } {
+  ):
+    | { allowed: true; session: ApprovedSessionSummary }
+    | { allowed: false; status: number; code: ProtocolErrorCode; message: string } {
     this.ensureSchema();
 
     // 1. Knowing a Friend Code NEVER grants permission to join or signal an approved session
@@ -461,11 +558,8 @@ export class SignalingCoordinator implements DurableObject {
       }
 
       return {
-        allowed: false,
-        status: 501,
-        code: 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2',
-        message:
-          'Session is approved for this participant, but media and chat transport are deferred in Phase 2.',
+        allowed: true,
+        session: mapSessionRow(session),
       };
     }
 
@@ -482,11 +576,8 @@ export class SignalingCoordinator implements DurableObject {
     }
 
     return {
-      allowed: false,
-      status: 501,
-      code: 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2',
-      message:
-        'Session is approved, but media and chat transport are deferred in Phase 2.',
+      allowed: true,
+      session: callerSession,
     };
   }
 
@@ -940,6 +1031,10 @@ export class SignalingCoordinator implements DurableObject {
         `DELETE FROM active_sessions WHERE session_id = ?`,
         activeSession.sessionId
       );
+      sql.exec(
+        `DELETE FROM session_signals WHERE session_id = ?`,
+        activeSession.sessionId
+      );
 
       this.sendEventToAccount(activeSession.hostAccountId, {
         type: 'session:ended',
@@ -958,10 +1053,11 @@ export class SignalingCoordinator implements DurableObject {
       });
     }
 
-    // Security Gate Endpoint: Join or Signal Session
+    // Security Gate & WebRTC Signaling Endpoint: Join or Signal Session
     // Verifies:
     // 1. Knowing a Friend Code cannot join an approved session.
     // 2. No signaling is admitted before acceptance.
+    // 3. Only approved participants (Host A or Guest B) can exchange SDP/ICE/media-status signals.
     if (
       request.method === 'POST' &&
       url.pathname === '/internal/sessions/join-or-signal'
@@ -971,6 +1067,7 @@ export class SignalingCoordinator implements DurableObject {
         sessionId?: string;
         friendCode?: string;
         signalType?: string;
+        payload?: WebRtcSignalPayload;
       };
 
       const gate = this.evaluateSignalingGate(
@@ -978,7 +1075,90 @@ export class SignalingCoordinator implements DurableObject {
         body.sessionId,
         body.friendCode
       );
-      return errorResponse(gate.status, gate.code, gate.message);
+      if (!gate.allowed) {
+        return errorResponse(gate.status, gate.code, gate.message);
+      }
+
+      if (body.payload) {
+        const pType = body.payload.type;
+        if (
+          pType !== 'offer' &&
+          pType !== 'answer' &&
+          pType !== 'ice-candidate' &&
+          pType !== 'media-status'
+        ) {
+          return errorResponse(
+            400,
+            'INVALID_SIGNAL_PAYLOAD',
+            'Worker only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status), never media frames or chat payloads.'
+          );
+        }
+
+        const envelope = this.recordAndDeliverSignal(
+          gate.session,
+          body.caller.accountId,
+          body.payload
+        );
+        return Response.json({
+          admitted: true,
+          session: gate.session,
+          envelope,
+        });
+      }
+
+      return Response.json({
+        admitted: true,
+        session: gate.session,
+      });
+    }
+
+    // Poll / Dequeue WebRTC Signals for an Approved Session Participant
+    if (
+      request.method === 'POST' &&
+      url.pathname === '/internal/sessions/signals'
+    ) {
+      const body = (await request.json()) as {
+        caller: AccountProfile;
+        sessionId?: string;
+        afterSeq?: number;
+      };
+
+      const gate = this.evaluateSignalingGate(
+        body.caller.accountId,
+        body.sessionId
+      );
+      if (!gate.allowed) {
+        return errorResponse(gate.status, gate.code, gate.message);
+      }
+
+      const afterSeq = Number(body.afterSeq ?? 0);
+      const rows = sql
+        .exec<SessionSignalRow>(
+          `SELECT * FROM session_signals
+           WHERE session_id = ?
+             AND target_account_id = ?
+             AND seq > ?
+           ORDER BY seq ASC`,
+          gate.session.sessionId,
+          body.caller.accountId,
+          afterSeq
+        )
+        .toArray();
+
+      const signals: WebRtcSignalEnvelope[] = rows.map((row) => ({
+        seq: row.seq,
+        signalId: row.signal_id,
+        sessionId: row.session_id,
+        senderAccountId: row.sender_account_id,
+        targetAccountId: row.target_account_id,
+        payload: JSON.parse(row.payload_json) as WebRtcSignalPayload,
+        createdAt: row.created_at,
+      }));
+
+      return Response.json({
+        session: gate.session,
+        signals,
+      });
     }
 
     return errorResponse(404, 'INVITE_NOT_FOUND', 'Unknown coordinator route.');

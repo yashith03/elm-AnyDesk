@@ -762,3 +762,159 @@ test('3. Invite flow edge cases: invalid codes, self-invites, offline owners, du
     'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
   );
 });
+
+test('4. Approved session WebRTC signaling relay (offer, answer, ICE, media-status) and non-signaling rejection', async () => {
+  const env = createTestEnv();
+  const testAuth = new TestDoubleAuthProvider({
+    'code-alice': {
+      provider: 'github',
+      providerSubject: 'sub-alice',
+      displayName: 'Alice Host',
+    },
+    'code-bob': {
+      provider: 'github',
+      providerSubject: 'sub-bob',
+      displayName: 'Bob Guest',
+    },
+    'code-charlie': {
+      provider: 'github',
+      providerSubject: 'sub-charlie',
+      displayName: 'Charlie Peer',
+    },
+  });
+
+  const worker = createApiWorker({
+    authAdapterFactory: () => testAuth,
+  });
+
+  const alice = await signInViaBrowserFlow(worker, env, 'code-alice');
+  const bob = await signInViaBrowserFlow(worker, env, 'code-bob');
+  const charlie = await signInViaBrowserFlow(worker, env, 'code-charlie');
+
+  const authHeaders = (token: string) => ({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  });
+
+  for (const peer of [alice, bob, charlie]) {
+    await worker.fetch!(
+      new Request('https://api.elm.local/presence/connect', {
+        method: 'POST',
+        headers: authHeaders(peer.token),
+      }),
+      env,
+      dummyCtx
+    );
+  }
+
+  const inviteRes = await worker.fetch!(
+    new Request('https://api.elm.local/invites', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({ friendCode: alice.account.friendCode }),
+    }),
+    env,
+    dummyCtx
+  );
+  const { invite } = (await inviteRes.json()) as { invite: InviteSummary };
+
+  const acceptRes = await worker.fetch!(
+    new Request(`https://api.elm.local/invites/${invite.inviteId}/respond`, {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        action: 'accept',
+        mediaSelection: {
+          screenVideo: false,
+          microphoneAudio: false,
+          deviceAudio: true,
+        },
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  const { session } = (await acceptRes.json()) as {
+    session: ApprovedSessionSummary;
+  };
+
+  // Alice sends a WebRTC SDP offer signal to Bob
+  const offerRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/signal', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        payload: {
+          type: 'offer',
+          sdp: 'v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\n',
+          activeTracks: [
+            {
+              source: 'deviceAudio',
+              kind: 'audio',
+              trackId: 'track-dev-1',
+              streamId: 'elm-stream-deviceAudio',
+              label: 'WASAPI Loopback Audio',
+            },
+          ],
+        },
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(offerRes.status, 200);
+
+  // Charlie cannot poll signals for Alice & Bob's session
+  const charliePollRes = await worker.fetch!(
+    new Request(
+      `https://api.elm.local/sessions/signals?sessionId=${session.sessionId}&afterSeq=0`,
+      {
+        headers: authHeaders(charlie.token),
+      }
+    ),
+    env,
+    dummyCtx
+  );
+  assert.equal(charliePollRes.status, 403);
+
+  // Bob polls and receives Alice's offer signal
+  const bobPollRes = await worker.fetch!(
+    new Request(
+      `https://api.elm.local/sessions/signals?sessionId=${session.sessionId}&afterSeq=0`,
+      {
+        headers: authHeaders(bob.token),
+      }
+    ),
+    env,
+    dummyCtx
+  );
+  assert.equal(bobPollRes.status, 200);
+  const bobSignals = (await bobPollRes.json()) as {
+    signals: Array<{ seq: number; payload: { type: string } }>;
+  };
+  assert.equal(bobSignals.signals.length, 1);
+  assert.equal(bobSignals.signals[0].payload.type, 'offer');
+
+  // Worker rejects non-signaling payloads (media streaming or chat payloads are never handled by Worker)
+  const invalidPayloadRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/signal', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        payload: {
+          type: 'chat-message',
+          text: 'should not go through worker',
+        },
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(invalidPayloadRes.status, 400);
+  assert.equal(
+    ((await invalidPayloadRes.json()) as { error: string }).error,
+    'INVALID_SIGNAL_PAYLOAD'
+  );
+});

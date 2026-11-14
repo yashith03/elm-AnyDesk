@@ -13,12 +13,15 @@ import {
   DEFAULT_HOST_MEDIA_SELECTION,
   PROTOCOL_VERSION,
   type HostMediaSelection,
+  type MediaSourceKind,
+  type WebRtcSignalPayload,
 } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
   DesktopWindowRole,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
+  VolatileSessionUiState,
 } from '../shared/bridge';
 import { DesktopAuthAndInviteController } from './auth-invite-client';
 import { Win11TaskbarDwmController } from './win11-dwm';
@@ -31,6 +34,42 @@ let authInviteController: DesktopAuthAndInviteController | null = null;
 const wasapiManager = new WasapiLoopbackManager();
 
 let explicitlySelectedSourceId: string | null = null;
+
+/**
+ * In-memory volatile session and chat UI state shared between the Main Window
+ * and Separate Chat Window. Never written to disk, D1, SQLite, or localStorage,
+ * and wiped immediately when a session disconnects or the app closes.
+ */
+let volatileUiState: VolatileSessionUiState = {
+  session: null,
+  currentAccount: null,
+  connectionState: 'new',
+  dataChannelState: 'closed',
+  messagePreviewsEnabled: false,
+  messages: [],
+  hostMediaState: null,
+};
+
+function resetVolatileUiState(): void {
+  volatileUiState = {
+    session: null,
+    currentAccount: volatileUiState.currentAccount,
+    connectionState: 'closed',
+    dataChannelState: 'closed',
+    messagePreviewsEnabled: false,
+    messages: [],
+    hostMediaState: null,
+  };
+  broadcastVolatileUiState();
+}
+
+function broadcastVolatileUiState(): void {
+  for (const win of [mainWindow, chatWindow]) {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('elm:volatile-ui-updated', volatileUiState);
+    }
+  }
+}
 
 if (process.argv.includes('--run-prototype-suite')) {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -115,11 +154,11 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   }
 
   const win = new BrowserWindow({
-    width: 420,
-    height: 580,
-    minWidth: 340,
-    minHeight: 420,
-    title: 'Elm-AnyDesk — Private 1:1 Session Chat (Scaffold)',
+    width: 480,
+    height: 660,
+    minWidth: 380,
+    minHeight: 480,
+    title: 'Elm-AnyDesk — Private 1:1 Session Chat (Volatile DataChannel)',
     autoHideMenuBar: true,
     backgroundColor: '#0f172a',
     webPreferences: createSecureWebPreferences(),
@@ -210,7 +249,7 @@ function registerIpcHandlers(): void {
       platform: process.platform,
       windowRole: role,
       phase:
-        'Phase 2 — Sign-In, Permanent Friend Codes, Presence & Invite Flow',
+        'Phase 3 — WebRTC Media (A -> B) & Separate DataChannel Chat Window',
       defaultMediaSelection: DEFAULT_HOST_MEDIA_SELECTION,
       initialSessionState: 'idle',
       securityPosture: {
@@ -252,6 +291,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('elm:auth-sign-out', () => {
+    resetVolatileUiState();
     return getAuthController().signOut();
   });
 
@@ -260,6 +300,9 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('elm:presence-set-online', (_event, online: boolean) => {
+    if (!online) {
+      resetVolatileUiState();
+    }
     return getAuthController().setPresenceOnline(Boolean(online));
   });
 
@@ -282,8 +325,83 @@ function registerIpcHandlers(): void {
   );
 
   ipcMain.handle('elm:sessions-disconnect', (_event, sessionId?: string) => {
+    wasapiManager.stopCapture();
+    resetVolatileUiState();
     return getAuthController().disconnectActiveSession(sessionId);
   });
+
+  // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
+  ipcMain.handle(
+    'elm:sessions-send-signal',
+    (
+      _event,
+      params: {
+        sessionId: string;
+        senderAccountId?: string;
+        payload: WebRtcSignalPayload;
+      }
+    ) => {
+      return getAuthController().sendSessionSignal(params);
+    }
+  );
+
+  ipcMain.handle(
+    'elm:sessions-poll-signals',
+    (
+      _event,
+      params: {
+        sessionId: string;
+        receiverAccountId?: string;
+        afterSeq: number;
+      }
+    ) => {
+      return getAuthController().pollSessionSignals(params);
+    }
+  );
+
+  ipcMain.handle('elm:volatile-ui-get', (): VolatileSessionUiState => {
+    return volatileUiState;
+  });
+
+  ipcMain.handle(
+    'elm:volatile-ui-sync',
+    (
+      _event,
+      patch: Partial<VolatileSessionUiState>
+    ): VolatileSessionUiState => {
+      volatileUiState = {
+        ...volatileUiState,
+        ...patch,
+      };
+      broadcastVolatileUiState();
+      return volatileUiState;
+    }
+  );
+
+  ipcMain.handle(
+    'elm:chat-window-outbound-send',
+    (
+      _event,
+      params: { text: string; senderOverride?: 'host' | 'guest' }
+    ): { queued: boolean } => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('elm:chat-window-outbound-event', params);
+        return { queued: true };
+      }
+      return { queued: false };
+    }
+  );
+
+  ipcMain.handle(
+    'elm:chat-window-stop-sharing',
+    (_event, target: MediaSourceKind | 'all'): { requested: boolean } => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('elm:host-stop-sharing-event', target);
+        return { requested: true };
+      }
+      return { requested: false };
+    }
+  );
 
   // Taskbar & DWM Telemetry + Prototype Controls
   ipcMain.handle(
@@ -446,56 +564,93 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
     await sleep(250);
     const restoredState = taskbarDwmController.getTelemetry();
 
-    const mediaSuiteResult = await win.webContents.executeJavaScript(
+    const mediaSuiteJson = await win.webContents.executeJavaScript(
       `
       (async () => {
-        const withTimeout = (promise, ms, label) =>
-          Promise.race([
-            promise,
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms)
-            ),
-          ]);
+        try {
+          const withTimeout = (promise, ms, label) =>
+            Promise.race([
+              promise,
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms)
+              ),
+            ]);
 
-        const results = {};
+          const results = {};
 
-        // Desktop Auth, Permanent Friend Code & Invite UI Bridge Check
-        const aliceLogin = await window.elmDesktop.signInWithTestDouble('alice');
-        const aliceSecondLogin = await window.elmDesktop.signInWithTestDouble('alice');
-        const bobLogin = await window.elmDesktop.signInWithTestDouble('bob');
-        const inviteRes = await window.elmDesktop.sendFriendCodeInvite(
-          aliceLogin.data.account.friendCode
-        );
-        await window.elmDesktop.switchActivePersona('alice');
-        const acceptRes = await window.elmDesktop.respondToInvite({
-          inviteId: inviteRes.data.invite.inviteId,
-          action: 'accept',
-          mediaSelection: {
-            screenVideo: true,
-            microphoneAudio: false,
-            deviceAudio: false,
-          },
-        });
-        await window.elmDesktop.disconnectActiveSession(
-          acceptRes.data.session.sessionId
-        );
+          // Wait up to 2s for module bundle to attach window.runElmWebRtcVerificationMatrix
+          for (let i = 0; i < 40; i++) {
+            if (typeof window.runElmWebRtcVerificationMatrix === 'function') break;
+            await new Promise((r) => setTimeout(r, 50));
+          }
 
-        results.phase2AuthInviteBridge = {
-          friendCodeReused:
-            aliceLogin.data.account.friendCode ===
-            aliceSecondLogin.data.account.friendCode,
-          aliceFriendCode: aliceLogin.data.account.friendCode,
-          bobFriendCode: bobLogin.data.account.friendCode,
-          inviteStatusAfterAccept: acceptRes.data.invite.status,
-          approvedSessionHostId: acceptRes.data.session.hostAccountId,
-          approvedSessionGuestId: acceptRes.data.session.guestAccountId,
-        };
+          // Desktop Auth, Permanent Friend Code & Invite UI Bridge Check
+          const aliceLogin = await window.elmDesktop.signInWithTestDouble('alice');
+          const aliceSecondLogin = await window.elmDesktop.signInWithTestDouble('alice');
+          const bobLogin = await window.elmDesktop.signInWithTestDouble('bob');
+          const inviteRes = await window.elmDesktop.sendFriendCodeInvite(
+            aliceLogin.data.account.friendCode
+          );
+          await window.elmDesktop.switchActivePersona('alice');
+          const acceptRes = await window.elmDesktop.respondToInvite({
+            inviteId: inviteRes.data.invite.inviteId,
+            action: 'accept',
+            mediaSelection: {
+              screenVideo: true,
+              microphoneAudio: false,
+              deviceAudio: false,
+            },
+          });
+          await window.elmDesktop.disconnectActiveSession(
+            acceptRes.data.session.sessionId
+          );
 
-        return results;
+          results.phase2AuthInviteBridge = {
+            friendCodeReused:
+              aliceLogin.data.account.friendCode ===
+              aliceSecondLogin.data.account.friendCode,
+            aliceFriendCode: aliceLogin.data.account.friendCode,
+            bobFriendCode: bobLogin.data.account.friendCode,
+            inviteStatusAfterAccept: acceptRes.data.invite.status,
+            approvedSessionHostId: acceptRes.data.session.hostAccountId,
+            approvedSessionGuestId: acceptRes.data.session.guestAccountId,
+          };
+
+          // Phase 3: Separate Chat Window & 5-Combination WebRTC Media + DataChannel Verification Matrix
+          const volatileBefore = await window.elmDesktop.getVolatileSessionUiState();
+
+          if (typeof window.runElmWebRtcVerificationMatrix === 'function') {
+            results.phase3WebRtcMatrix = await withTimeout(
+              window.runElmWebRtcVerificationMatrix(),
+              35000,
+              'runElmWebRtcVerificationMatrix'
+            );
+          } else {
+            results.phase3WebRtcMatrixError = 'runElmWebRtcVerificationMatrix not found on window';
+          }
+
+          const volatileAfterDisconnect =
+            await window.elmDesktop.getVolatileSessionUiState();
+
+          results.phase3SeparateChatWindow = {
+            messagePreviewsDisabledByDefault:
+              volatileBefore.messagePreviewsEnabled === false,
+            volatileMessagesAfterDisconnectCount:
+              volatileAfterDisconnect.messages.length,
+          };
+
+          return JSON.stringify(results);
+        } catch (err) {
+          return JSON.stringify({
+            innerError: err instanceof Error ? err.message : String(err),
+            innerStack: err instanceof Error ? err.stack : undefined,
+          });
+        }
       })();
     `,
       true
     );
+    const mediaSuiteResult = JSON.parse(String(mediaSuiteJson));
 
     const report = {
       timestamp: new Date().toISOString(),

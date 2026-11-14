@@ -14,6 +14,8 @@ import {
   type InviteSummary,
   type PresenceStateSnapshot,
   type ProtocolErrorCode,
+  type WebRtcSignalEnvelope,
+  type WebRtcSignalPayload,
 } from '@elm/protocol';
 import type { ApiActionResult } from '../shared/bridge';
 
@@ -75,6 +77,8 @@ export class DesktopAuthAndInviteController {
   private readonly onlineAccounts = new Set<string>();
   private readonly invites = new Map<string, InMemoryInvite>();
   private readonly activeSessions = new Map<string, ApprovedSessionSummary>();
+  private readonly sessionSignals = new Map<string, WebRtcSignalEnvelope[]>();
+  private signalSequence = 0;
   private readonly tokenToAccountId = new Map<string, string>();
 
   constructor(apiBaseUrl?: string) {
@@ -518,6 +522,7 @@ export class DesktopAuthAndInviteController {
     const active = this.getActiveSessionForAccount(accountId);
     if (active) {
       this.activeSessions.delete(active.sessionId);
+      this.sessionSignals.delete(active.sessionId);
     }
   }
 
@@ -857,6 +862,7 @@ export class DesktopAuthAndInviteController {
     }
 
     this.activeSessions.delete(active.sessionId);
+    this.sessionSignals.delete(active.sessionId);
 
     return {
       ok: true,
@@ -864,6 +870,158 @@ export class DesktopAuthAndInviteController {
       data: {
         disconnected: true,
         snapshot: this.buildSnapshot(caller),
+      },
+    };
+  }
+
+  public sendSessionSignal(params: {
+    sessionId: string;
+    senderAccountId?: string;
+    payload: WebRtcSignalPayload;
+  }): ApiActionResult<{
+    admitted: boolean;
+    session: ApprovedSessionSummary;
+    envelope: WebRtcSignalEnvelope;
+  }> {
+    const current = this.getCurrentAccount();
+    const senderId = params.senderAccountId || current?.accountId;
+    if (!senderId) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Not signed in.',
+      };
+    }
+
+    const session = this.activeSessions.get(params.sessionId);
+    if (!session) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+        errorMessage:
+          'No signaling is admitted before an invite is explicitly accepted by the intended owner.',
+      };
+    }
+
+    if (
+      session.hostAccountId !== senderId &&
+      session.guestAccountId !== senderId
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+        errorMessage:
+          'Caller is not an approved participant of this 1:1 session. Knowing a Friend Code cannot join an approved session.',
+      };
+    }
+
+    const pType = params.payload?.type;
+    if (
+      pType !== 'offer' &&
+      pType !== 'answer' &&
+      pType !== 'ice-candidate' &&
+      pType !== 'media-status'
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        errorCode: 'INVALID_SIGNAL_PAYLOAD',
+        errorMessage:
+          'Coordinator only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status), never media frames or chat payloads.',
+      };
+    }
+
+    const targetAccountId =
+      senderId === session.hostAccountId
+        ? session.guestAccountId
+        : session.hostAccountId;
+
+    this.signalSequence += 1;
+    const envelope: WebRtcSignalEnvelope = {
+      seq: this.signalSequence,
+      signalId: crypto.randomUUID(),
+      sessionId: session.sessionId,
+      senderAccountId: senderId,
+      targetAccountId,
+      payload: params.payload,
+      createdAt: new Date().toISOString(),
+    };
+
+    let list = this.sessionSignals.get(session.sessionId);
+    if (!list) {
+      list = [];
+      this.sessionSignals.set(session.sessionId, list);
+    }
+    list.push(envelope);
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        admitted: true,
+        session,
+        envelope,
+      },
+    };
+  }
+
+  public pollSessionSignals(params: {
+    sessionId: string;
+    receiverAccountId?: string;
+    afterSeq: number;
+  }): ApiActionResult<{
+    session: ApprovedSessionSummary;
+    signals: readonly WebRtcSignalEnvelope[];
+  }> {
+    const current = this.getCurrentAccount();
+    const receiverId = params.receiverAccountId || current?.accountId;
+    if (!receiverId) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Not signed in.',
+      };
+    }
+
+    const session = this.activeSessions.get(params.sessionId);
+    if (!session) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+        errorMessage:
+          'No signaling is admitted before an invite is explicitly accepted.',
+      };
+    }
+
+    if (
+      session.hostAccountId !== receiverId &&
+      session.guestAccountId !== receiverId
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+        errorMessage:
+          'Caller is not an approved participant of this 1:1 session.',
+      };
+    }
+
+    const list = this.sessionSignals.get(session.sessionId) ?? [];
+    const signals = list.filter(
+      (s) => s.targetAccountId === receiverId && s.seq > params.afterSeq
+    );
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        session,
+        signals,
       },
     };
   }

@@ -149,7 +149,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
       if (request.method === 'GET' && url.pathname === '/health') {
         const payload: ApiHealthResponse = {
           status: 'ok',
-          phase: 'phase-2-auth-invites-presence',
+          phase: 'phase-3-webrtc-media-and-datachannel-chat',
           protocolVersion: PROTOCOL_VERSION,
           timestamp: new Date().toISOString(),
         };
@@ -442,6 +442,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
           sessionId?: string;
           friendCode?: string;
           signalType?: string;
+          payload?: unknown;
         };
         const res = await coordinator.fetch(
           new Request(
@@ -454,6 +455,28 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
                 sessionId: body.sessionId,
                 friendCode: body.friendCode,
                 signalType: body.signalType,
+                payload: body.payload,
+              }),
+            }
+          )
+        );
+        return withCors(res);
+      }
+
+      // 13. Poll WebRTC Signals for Approved Participant: GET /sessions/signals
+      if (request.method === 'GET' && url.pathname === '/sessions/signals') {
+        const sessionId = url.searchParams.get('sessionId') || undefined;
+        const afterSeq = Number(url.searchParams.get('afterSeq') || '0');
+        const res = await coordinator.fetch(
+          new Request(
+            'https://coordinator.internal/internal/sessions/signals',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                caller: account,
+                sessionId,
+                afterSeq,
               }),
             }
           )
@@ -465,7 +488,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
         Response.json(
           {
             error: 'Not Found',
-            message: 'Elm-AnyDesk API Phase 2.',
+            message: 'Elm-AnyDesk API Phase 3.',
           },
           { status: 404 }
         )
