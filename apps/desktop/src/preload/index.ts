@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type {
   HostMediaSelection,
   MediaSourceKind,
+  SessionTerminationReason,
   WebRtcSignalPayload,
 } from '@elm/protocol';
 import type {
@@ -32,8 +33,14 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.invoke('elm:auth-switch-persona', personaKey),
   signOut: () => ipcRenderer.invoke('elm:auth-sign-out'),
   getPresenceSnapshot: () => ipcRenderer.invoke('elm:presence-get-snapshot'),
-  setPresenceOnline: (online: boolean) =>
-    ipcRenderer.invoke('elm:presence-set-online', online),
+  setPresenceOnline: (
+    online: boolean,
+    options?: {
+      personaKey?: string;
+      reason?: SessionTerminationReason;
+      subReason?: string;
+    }
+  ) => ipcRenderer.invoke('elm:presence-set-online', online, options),
   sendFriendCodeInvite: (friendCode: string) =>
     ipcRenderer.invoke('elm:invites-send', friendCode),
   respondToInvite: (params: {
@@ -41,8 +48,28 @@ const bridge: ElmDesktopBridge = Object.freeze({
     action: 'accept' | 'decline';
     mediaSelection?: HostMediaSelection;
   }) => ipcRenderer.invoke('elm:invites-respond', params),
-  disconnectActiveSession: (sessionId?: string) =>
-    ipcRenderer.invoke('elm:sessions-disconnect', sessionId),
+  disconnectActiveSession: (
+    sessionIdOrOptions?:
+      | string
+      | {
+          sessionId?: string;
+          reason?: SessionTerminationReason;
+          subReason?: string;
+          callerAccountId?: string;
+          detectionTimeMs?: number;
+        }
+  ) => ipcRenderer.invoke('elm:sessions-disconnect', sessionIdOrOptions),
+  recordSessionHeartbeat: (params: {
+    sessionId: string;
+    callerAccountId?: string;
+    timestampMs?: number;
+  }) => ipcRenderer.invoke('elm:sessions-heartbeat', params),
+  checkSessionLiveness: (params: {
+    sessionId: string;
+    callerAccountId?: string;
+    nowMs?: number;
+    livenessTimeoutMs?: number;
+  }) => ipcRenderer.invoke('elm:sessions-check-liveness', params),
 
   // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
   sendSessionSignal: (params: {

@@ -4,6 +4,7 @@ import {
   clipboard,
   desktopCapturer,
   ipcMain,
+  powerMonitor,
   session,
 } from 'electron';
 import fs from 'node:fs';
@@ -14,6 +15,7 @@ import {
   PROTOCOL_VERSION,
   type HostMediaSelection,
   type MediaSourceKind,
+  type SessionTerminationReason,
   type WebRtcSignalPayload,
 } from '@elm/protocol';
 import type {
@@ -96,6 +98,7 @@ function createSecureWebPreferences() {
     nodeIntegration: false,
     webSecurity: true,
     spellcheck: false,
+    backgroundThrottling: false,
   } as const;
 }
 
@@ -134,6 +137,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
 
   win.on('closed', () => {
     wasapiManager.stopCapture();
+    resetVolatileUiState();
+    getAuthController().disconnectActiveSession({
+      reason: 'app_closed',
+      subReason: 'main_window_closed',
+    });
     mainWindow = null;
     taskbarDwmController = null;
     if (chatWindow && !chatWindow.isDestroyed()) {
@@ -249,7 +257,7 @@ function registerIpcHandlers(): void {
       platform: process.platform,
       windowRole: role,
       phase:
-        'Phase 3 — WebRTC Media (A -> B) & Separate DataChannel Chat Window',
+        'Phase 4 — Idempotent Session Teardown, Liveness Detection & Non-Resumable Sessions',
       defaultMediaSelection: DEFAULT_HOST_MEDIA_SELECTION,
       initialSessionState: 'idle',
       securityPosture: {
@@ -299,12 +307,24 @@ function registerIpcHandlers(): void {
     return getAuthController().getPresenceSnapshot();
   });
 
-  ipcMain.handle('elm:presence-set-online', (_event, online: boolean) => {
-    if (!online) {
-      resetVolatileUiState();
+  ipcMain.handle(
+    'elm:presence-set-online',
+    (
+      _event,
+      online: boolean,
+      options?: {
+        personaKey?: string;
+        reason?: SessionTerminationReason;
+        subReason?: string;
+      }
+    ) => {
+      if (!online) {
+        wasapiManager.stopCapture();
+        resetVolatileUiState();
+      }
+      return getAuthController().setPresenceOnline(Boolean(online), options);
     }
-    return getAuthController().setPresenceOnline(Boolean(online));
-  });
+  );
 
   ipcMain.handle('elm:invites-send', (_event, friendCode: string) => {
     return getAuthController().sendFriendCodeInvite(String(friendCode ?? ''));
@@ -324,11 +344,59 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle('elm:sessions-disconnect', (_event, sessionId?: string) => {
-    wasapiManager.stopCapture();
-    resetVolatileUiState();
-    return getAuthController().disconnectActiveSession(sessionId);
-  });
+  ipcMain.handle(
+    'elm:sessions-disconnect',
+    (
+      _event,
+      sessionIdOrOptions?:
+        | string
+        | {
+            sessionId?: string;
+            reason?: SessionTerminationReason;
+            subReason?: string;
+            callerAccountId?: string;
+            detectionTimeMs?: number;
+          }
+    ) => {
+      wasapiManager.stopCapture();
+      resetVolatileUiState();
+      return getAuthController().disconnectActiveSession(sessionIdOrOptions);
+    }
+  );
+
+  ipcMain.handle(
+    'elm:sessions-heartbeat',
+    (
+      _event,
+      params: {
+        sessionId: string;
+        callerAccountId?: string;
+        timestampMs?: number;
+      }
+    ) => {
+      return getAuthController().recordSessionHeartbeat(params);
+    }
+  );
+
+  ipcMain.handle(
+    'elm:sessions-check-liveness',
+    (
+      _event,
+      params: {
+        sessionId: string;
+        callerAccountId?: string;
+        nowMs?: number;
+        livenessTimeoutMs?: number;
+      }
+    ) => {
+      const res = getAuthController().checkSessionLiveness(params);
+      if (res.ok && res.data && !res.data.alive) {
+        wasapiManager.stopCapture();
+        resetVolatileUiState();
+      }
+      return res;
+    }
+  );
 
   // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
   ipcMain.handle(
@@ -539,6 +607,16 @@ app.whenReady().then(async () => {
 
   registerDisplayMediaHandler();
   registerIpcHandlers();
+
+  powerMonitor.on('suspend', () => {
+    wasapiManager.stopCapture();
+    resetVolatileUiState();
+    getAuthController().disconnectActiveSession({
+      reason: 'connection_lost',
+      subReason: 'os_sleep_suspend',
+    });
+  });
+
   mainWindow = await createMainWindow();
 
   if (process.argv.includes('--run-prototype-suite')) {
@@ -639,6 +717,18 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
               volatileAfterDisconnect.messages.length,
           };
 
+          // Phase 4: Unified Idempotent Session Teardown, Liveness Detection, Minimize/Restore During Sharing & Non-Resumable Recovery Suite
+          if (typeof window.runElmPhase4VerificationSuite === 'function') {
+            results.phase4TeardownAndLivenessSuite = await withTimeout(
+              window.runElmPhase4VerificationSuite(),
+              45000,
+              'runElmPhase4VerificationSuite'
+            );
+          } else {
+            results.phase4TeardownAndLivenessSuiteError =
+              'runElmPhase4VerificationSuite not found on window';
+          }
+
           return JSON.stringify(results);
         } catch (err) {
           return JSON.stringify({
@@ -716,6 +806,11 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
 
 app.on('before-quit', () => {
   wasapiManager.stopCapture();
+  resetVolatileUiState();
+  getAuthController().disconnectActiveSession({
+    reason: 'app_closed',
+    subReason: 'app_before_quit',
+  });
 });
 
 app.on('window-all-closed', () => {

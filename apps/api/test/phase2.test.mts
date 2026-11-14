@@ -746,8 +746,9 @@ test('3. Invite flow edge cases: invalid codes, self-invites, offline owners, du
   );
   assert.equal(disconnectRes.status, 200);
 
-  // After disconnect, signaling on the ended sessionId is blocked again
-  const postEndSignalRes = await worker.fetch!(
+  // After disconnect, stale signaling referencing the ended sessionId is rejected with SESSION_ALREADY_ENDED,
+  // and signaling without a sessionId while idle is rejected with SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE
+  const postEndStaleSignalRes = await worker.fetch!(
     new Request('https://api.elm.local/sessions/signal', {
       method: 'POST',
       headers: authHeaders(bob.token),
@@ -756,9 +757,24 @@ test('3. Invite flow edge cases: invalid codes, self-invites, offline owners, du
     env,
     dummyCtx
   );
-  assert.equal(postEndSignalRes.status, 403);
+  assert.equal(postEndStaleSignalRes.status, 409);
   assert.equal(
-    ((await postEndSignalRes.json()) as { error: string }).error,
+    ((await postEndStaleSignalRes.json()) as { error: string }).error,
+    'SESSION_ALREADY_ENDED'
+  );
+
+  const postEndIdleSignalRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/signal', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({}),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(postEndIdleSignalRes.status, 403);
+  assert.equal(
+    ((await postEndIdleSignalRes.json()) as { error: string }).error,
     'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
   );
 });
@@ -917,4 +933,319 @@ test('4. Approved session WebRTC signaling relay (offer, answer, ICE, media-stat
     ((await invalidPayloadRes.json()) as { error: string }).error,
     'INVALID_SIGNAL_PAYLOAD'
   );
+});
+
+test('5. Phase 4: Unified idempotent teardown, liveness check vs session duration, stale event rejection, and non-resumable network recovery', async () => {
+  const env = createTestEnv();
+  const testAuth = new TestDoubleAuthProvider({
+    'code-alice': {
+      provider: 'github',
+      providerSubject: 'sub-alice',
+      displayName: 'Alice Host',
+    },
+    'code-bob': {
+      provider: 'github',
+      providerSubject: 'sub-bob',
+      displayName: 'Bob Guest',
+    },
+  });
+
+  const worker = createApiWorker({
+    authAdapterFactory: () => testAuth,
+  });
+
+  const alice = await signInViaBrowserFlow(worker, env, 'code-alice');
+  const bob = await signInViaBrowserFlow(worker, env, 'code-bob');
+
+  const authHeaders = (token: string) => ({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  });
+
+  const connectBothOnline = async () => {
+    for (const peer of [alice, bob]) {
+      const res = await worker.fetch!(
+        new Request('https://api.elm.local/presence/connect', {
+          method: 'POST',
+          headers: authHeaders(peer.token),
+        }),
+        env,
+        dummyCtx
+      );
+      assert.equal(res.status, 200);
+    }
+  };
+
+  const createAndAcceptFreshSession = async (): Promise<ApprovedSessionSummary> => {
+    await connectBothOnline();
+    const invRes = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: authHeaders(bob.token),
+        body: JSON.stringify({ friendCode: alice.account.friendCode }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(invRes.status, 201);
+    const { invite } = (await invRes.json()) as { invite: InviteSummary };
+
+    const accRes = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${invite.inviteId}/respond`, {
+        method: 'POST',
+        headers: authHeaders(alice.token),
+        body: JSON.stringify({
+          action: 'accept',
+          mediaSelection: {
+            screenVideo: true,
+            microphoneAudio: false,
+            deviceAudio: true,
+          },
+        }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(accRes.status, 200);
+    const { session } = (await accRes.json()) as {
+      session: ApprovedSessionSummary;
+    };
+    return session;
+  };
+
+  // --- CASE 1 & 6: Disconnect from Host A + Duplicate teardown idempotency ---
+  const session1 = await createAndAcceptFreshSession();
+  const discA1 = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/disconnect', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        sessionId: session1.sessionId,
+        reason: 'user_top_bar_disconnect',
+        subReason: 'top_bar_host_a',
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(discA1.status, 200);
+  const discA1Body = (await discA1.json()) as {
+    disconnected: boolean;
+    alreadyEnded: boolean;
+    receipt: { duplicateCallCount: number; reason: string; subReason: string };
+  };
+  assert.equal(discA1Body.disconnected, true);
+  assert.equal(discA1Body.alreadyEnded, false);
+  assert.equal(discA1Body.receipt.duplicateCallCount, 0);
+  assert.equal(discA1Body.receipt.reason, 'user_top_bar_disconnect');
+
+  // Duplicate teardown from Alice and then from Bob on already-ended session1 succeeds idempotently
+  const discA2 = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/disconnect', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({ sessionId: session1.sessionId }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(discA2.status, 200);
+  const discA2Body = (await discA2.json()) as {
+    alreadyEnded: boolean;
+    receipt: { duplicateCallCount: number };
+  };
+  assert.equal(discA2Body.alreadyEnded, true);
+  assert.equal(discA2Body.receipt.duplicateCallCount, 1);
+
+  const discB3 = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/disconnect', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({ sessionId: session1.sessionId }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(discB3.status, 200);
+  const discB3Body = (await discB3.json()) as {
+    alreadyEnded: boolean;
+    receipt: { duplicateCallCount: number };
+  };
+  assert.equal(discB3Body.alreadyEnded, true);
+  assert.equal(discB3Body.receipt.duplicateCallCount, 2);
+
+  // --- CASE 2: Disconnect from Guest B ---
+  const session2 = await createAndAcceptFreshSession();
+  assert.notEqual(session2.sessionId, session1.sessionId);
+  const discB = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/disconnect', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({
+        sessionId: session2.sessionId,
+        reason: 'user_top_bar_disconnect',
+        subReason: 'top_bar_guest_b',
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(discB.status, 200);
+
+  // --- CASE 3: App close from A and B ---
+  const session3 = await createAndAcceptFreshSession();
+  const closeARes = await worker.fetch!(
+    new Request('https://api.elm.local/presence/disconnect', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        reason: 'app_closed',
+        subReason: 'app_close_host_a',
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(closeARes.status, 200);
+  const closeABody = (await closeARes.json()) as {
+    ok: boolean;
+    receipt: { sessionId: string; reason: string; subReason: string };
+  };
+  assert.equal(closeABody.receipt.sessionId, session3.sessionId);
+  assert.equal(closeABody.receipt.reason, 'app_closed');
+
+  // Reopen app (reconnect presence) -> old session3 must NOT restart
+  const reopenARes = await worker.fetch!(
+    new Request('https://api.elm.local/presence/connect', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+    }),
+    env,
+    dummyCtx
+  );
+  const reopenASnap = (await reopenARes.json()) as {
+    snapshot: PresenceStateSnapshot;
+  };
+  assert.equal(reopenASnap.snapshot.online, true);
+  assert.equal(reopenASnap.snapshot.activeSession, null);
+
+  // --- CASE 4: Force quit / abrupt loss detected via Liveness Check (and verifying liveness threshold is NOT a time limit) ---
+  const session4 = await createAndAcceptFreshSession();
+  const baseMs = Date.parse(session4.createdAt);
+
+  // Simulate session running for 60 seconds (20x a 3000ms liveness threshold) with regular heartbeats:
+  // Proves liveness threshold is NOT a time limit on a connected session!
+  for (const offsetSec of [10, 25, 45, 60]) {
+    const tickIso = new Date(baseMs + offsetSec * 1000).toISOString();
+    for (const peer of [alice, bob]) {
+      const hbRes = await worker.fetch!(
+        new Request('https://api.elm.local/sessions/heartbeat', {
+          method: 'POST',
+          headers: authHeaders(peer.token),
+          body: JSON.stringify({
+            sessionId: session4.sessionId,
+            timestampIso: tickIso,
+          }),
+        }),
+        env,
+        dummyCtx
+      );
+      assert.equal(hbRes.status, 200);
+    }
+
+    const checkAliveRes = await worker.fetch!(
+      new Request('https://api.elm.local/sessions/check-liveness', {
+        method: 'POST',
+        headers: authHeaders(alice.token),
+        body: JSON.stringify({
+          sessionId: session4.sessionId,
+          nowIso: new Date(baseMs + offsetSec * 1000 + 500).toISOString(),
+          livenessTimeoutMs: 3000,
+        }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(checkAliveRes.status, 200);
+    const aliveBody = (await checkAliveRes.json()) as {
+      alive: boolean;
+      sessionDurationMs: number;
+    };
+    assert.equal(aliveBody.alive, true);
+  }
+
+  // Now simulate Bob force-quitting at t=60s (no close event arrives; Alice keeps heartbeating at t=64s)
+  const t64Iso = new Date(baseMs + 64000).toISOString();
+  await worker.fetch!(
+    new Request('https://api.elm.local/sessions/heartbeat', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        sessionId: session4.sessionId,
+        timestampIso: t64Iso,
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+
+  const livenessDropRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/check-liveness', {
+      method: 'POST',
+      headers: authHeaders(alice.token),
+      body: JSON.stringify({
+        sessionId: session4.sessionId,
+        nowIso: t64Iso,
+        livenessTimeoutMs: 3000,
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(livenessDropRes.status, 200);
+  const dropBody = (await livenessDropRes.json()) as {
+    alive: boolean;
+    receipt: { reason: string; subReason: string; detectionTimeMs: number };
+  };
+  assert.equal(dropBody.alive, false);
+  assert.equal(dropBody.receipt.reason, 'connection_lost');
+  assert.equal(dropBody.receipt.subReason, 'liveness_timeout_guest_b');
+
+  // --- CASE 5: Stale session events (signal, poll, heartbeat) rejected with 409 SESSION_ALREADY_ENDED ---
+  const staleSignalRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/signal', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({
+        sessionId: session4.sessionId,
+        payload: { type: 'answer', sdp: 'v=0\r\n' },
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(staleSignalRes.status, 409);
+  assert.equal(
+    ((await staleSignalRes.json()) as { error: string }).error,
+    'SESSION_ALREADY_ENDED'
+  );
+
+  const staleHeartbeatRes = await worker.fetch!(
+    new Request('https://api.elm.local/sessions/heartbeat', {
+      method: 'POST',
+      headers: authHeaders(bob.token),
+      body: JSON.stringify({ sessionId: session4.sessionId }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(staleHeartbeatRes.status, 409);
+  assert.equal(
+    ((await staleHeartbeatRes.json()) as { error: string }).error,
+    'SESSION_ALREADY_ENDED'
+  );
+
+  // Fresh invite after network recovery creates a brand-new session
+  const session5 = await createAndAcceptFreshSession();
+  assert.notEqual(session5.sessionId, session4.sessionId);
 });

@@ -4,7 +4,17 @@
  * Electron desktop app and the Cloudflare Workers + D1 + SQLite Durable Objects backend.
  */
 
-export const PROTOCOL_VERSION = '0.3.0-phase3' as const;
+export const PROTOCOL_VERSION = '0.4.0-phase4' as const;
+
+/**
+ * Default liveness heartbeat configuration.
+ * A liveness threshold detects abrupt peer/network loss when a close event cannot arrive;
+ * it is NEVER a time limit on a healthy connected session.
+ */
+export const DEFAULT_LIVENESS_CONFIG = Object.freeze({
+  heartbeatIntervalMs: 1000,
+  livenessTimeoutMs: 3500,
+});
 
 /**
  * Free-tier STUN-only ICE server configuration for WebRTC peer connections.
@@ -143,8 +153,31 @@ export type ProtocolErrorCode =
   | 'NOT_INVITE_OWNER'
   | 'UNAUTHORIZED_SESSION_PARTICIPANT'
   | 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
+  | 'SESSION_ALREADY_ENDED'
   | 'INVALID_SIGNAL_PAYLOAD'
   | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2';
+
+/**
+ * Structured receipt produced by the unified idempotent session teardown path.
+ * Repeated teardown calls for the same sessionId return `alreadyEnded: true`
+ * and increment `duplicateCallCount` without throwing or repeating side effects.
+ */
+export interface SessionTeardownReceipt {
+  readonly sessionId: string;
+  readonly reason: SessionTerminationReason;
+  readonly subReason: string;
+  readonly initiatedByAccountId: string | null;
+  readonly terminatedAt: string;
+  readonly alreadyEnded: boolean;
+  readonly duplicateCallCount: number;
+  readonly hostTracksStoppedCount: number;
+  readonly peerConnectionsClosed: boolean;
+  readonly dataChannelsClosed: boolean;
+  readonly guestViewerCleared: boolean;
+  readonly permissionsInvalidated: boolean;
+  readonly signalingMembershipInvalidated: boolean;
+  readonly detectionTimeMs: number;
+}
 
 /**
  * Distinct media capture sources controlled strictly by Host A.
@@ -224,6 +257,11 @@ export type WebRtcSignalPayload =
           { readonly status: MediaSourceStatusKind; readonly message: string }
         >
       >;
+    }
+  | {
+      readonly type: 'teardown';
+      readonly reason: SessionTerminationReason;
+      readonly subReason?: string;
     };
 
 export interface WebRtcSignalEnvelope {
@@ -318,6 +356,8 @@ export type CoordinatorServerEvent =
       readonly type: 'session:ended';
       readonly sessionId: string;
       readonly reason: SessionTerminationReason;
+      readonly subReason?: string;
+      readonly receipt?: SessionTeardownReceipt;
     }
   | {
       readonly type: 'error';
@@ -330,7 +370,7 @@ export type CoordinatorServerEvent =
  */
 export interface ApiHealthResponse {
   readonly status: 'ok';
-  readonly phase: 'phase-3-webrtc-media-and-datachannel-chat';
+  readonly phase: 'phase-4-idempotent-teardown-and-liveness';
   readonly protocolVersion: typeof PROTOCOL_VERSION;
   readonly timestamp: string;
 }

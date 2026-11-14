@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import {
+  DEFAULT_LIVENESS_CONFIG,
   isValidFriendCode,
   normalizeFriendCode,
   sanitizeHostMediaSelection,
@@ -14,6 +15,8 @@ import {
   type InviteSummary,
   type PresenceStateSnapshot,
   type ProtocolErrorCode,
+  type SessionTeardownReceipt,
+  type SessionTerminationReason,
   type WebRtcSignalEnvelope,
   type WebRtcSignalPayload,
 } from '@elm/protocol';
@@ -77,6 +80,20 @@ export class DesktopAuthAndInviteController {
   private readonly onlineAccounts = new Set<string>();
   private readonly invites = new Map<string, InMemoryInvite>();
   private readonly activeSessions = new Map<string, ApprovedSessionSummary>();
+  private readonly terminatedSessions = new Map<
+    string,
+    {
+      session: ApprovedSessionSummary;
+      receipt: SessionTeardownReceipt;
+    }
+  >();
+  private readonly sessionHeartbeats = new Map<
+    string,
+    {
+      lastHostHeartbeatMs: number;
+      lastGuestHeartbeatMs: number;
+    }
+  >();
   private readonly sessionSignals = new Map<string, WebRtcSignalEnvelope[]>();
   private signalSequence = 0;
   private readonly tokenToAccountId = new Map<string, string>();
@@ -493,10 +510,180 @@ export class DesktopAuthAndInviteController {
     };
   }
 
+  private getAccountByPersona(personaKey: string): AccountProfile | null {
+    const identity = TEST_DOUBLE_PERSONAS[personaKey.trim().toLowerCase()];
+    if (!identity) return null;
+    const row = this.persisted.d1Accounts.find(
+      (a) =>
+        a.provider === identity.provider &&
+        a.provider_subject === identity.providerSubject
+    );
+    return row ? this.mapAccountRow(row) : null;
+  }
+
+  /**
+   * Unified idempotent session teardown path on the desktop coordinator.
+   * Called by:
+   * - Top-bar Disconnect (Host A or Guest B)
+   * - App close / quit (Host A or Guest B)
+   * - Detected connection loss / liveness timeout / sleep
+   * Ensures ended sessions are tombstoned in `terminatedSessions` so stale events
+   * are rejected with `SESSION_ALREADY_ENDED` and duplicate teardown calls return
+   * `alreadyEnded: true` idempotently.
+   */
+  public teardownSessionIdempotent(params: {
+    sessionId?: string;
+    callerAccountId?: string;
+    reason?: SessionTerminationReason;
+    subReason?: string;
+    detectionTimeMs?: number;
+  }):
+    | {
+        ok: true;
+        status: 200;
+        disconnected: true;
+        alreadyEnded: boolean;
+        receipt: SessionTeardownReceipt;
+      }
+    | {
+        ok: false;
+        status: number;
+        errorCode: ProtocolErrorCode;
+        errorMessage: string;
+      } {
+    const reason: SessionTerminationReason =
+      params.reason ?? 'user_top_bar_disconnect';
+    const subReason = params.subReason || reason;
+    const detectionTimeMs = Math.max(
+      1,
+      Math.round(params.detectionTimeMs ?? 1)
+    );
+
+    let targetSessionId = params.sessionId;
+    if (!targetSessionId && params.callerAccountId) {
+      const activeForCaller = this.getActiveSessionForAccount(
+        params.callerAccountId
+      );
+      if (activeForCaller) {
+        targetSessionId = activeForCaller.sessionId;
+      } else {
+        for (const [sid, entry] of this.terminatedSessions.entries()) {
+          if (
+            entry.session.hostAccountId === params.callerAccountId ||
+            entry.session.guestAccountId === params.callerAccountId
+          ) {
+            targetSessionId = sid;
+          }
+        }
+      }
+    }
+
+    if (!targetSessionId) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+        errorMessage: 'No active session found for caller.',
+      };
+    }
+
+    const active = this.activeSessions.get(targetSessionId);
+    if (active) {
+      if (
+        params.callerAccountId &&
+        active.hostAccountId !== params.callerAccountId &&
+        active.guestAccountId !== params.callerAccountId
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+          errorMessage: 'Caller is not a participant of this session.',
+        };
+      }
+
+      this.activeSessions.delete(active.sessionId);
+      this.sessionSignals.delete(active.sessionId);
+      this.sessionHeartbeats.delete(active.sessionId);
+
+      const receipt: SessionTeardownReceipt = {
+        sessionId: active.sessionId,
+        reason,
+        subReason,
+        initiatedByAccountId: params.callerAccountId ?? null,
+        terminatedAt: new Date().toISOString(),
+        alreadyEnded: false,
+        duplicateCallCount: 0,
+        hostTracksStoppedCount: 0,
+        peerConnectionsClosed: true,
+        dataChannelsClosed: true,
+        guestViewerCleared: true,
+        permissionsInvalidated: true,
+        signalingMembershipInvalidated: true,
+        detectionTimeMs,
+      };
+
+      this.terminatedSessions.set(active.sessionId, {
+        session: active,
+        receipt,
+      });
+
+      return {
+        ok: true,
+        status: 200,
+        disconnected: true,
+        alreadyEnded: false,
+        receipt,
+      };
+    }
+
+    const existingTerminated = this.terminatedSessions.get(targetSessionId);
+    if (existingTerminated) {
+      if (
+        params.callerAccountId &&
+        existingTerminated.session.hostAccountId !== params.callerAccountId &&
+        existingTerminated.session.guestAccountId !== params.callerAccountId
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+          errorMessage: 'Caller was not a participant of this session.',
+        };
+      }
+
+      const updatedReceipt: SessionTeardownReceipt = {
+        ...existingTerminated.receipt,
+        alreadyEnded: true,
+        duplicateCallCount: existingTerminated.receipt.duplicateCallCount + 1,
+      };
+      existingTerminated.receipt = updatedReceipt;
+
+      return {
+        ok: true,
+        status: 200,
+        disconnected: true,
+        alreadyEnded: true,
+        receipt: updatedReceipt,
+      };
+    }
+
+    return {
+      ok: false,
+      status: 403,
+      errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+      errorMessage: 'No active session found for caller.',
+    };
+  }
+
   public signOut(): { signedOut: boolean } {
     const current = this.getCurrentAccount();
     if (current) {
-      this.setAccountOfflineInternal(current.accountId);
+      this.setAccountOfflineInternal(
+        current.accountId,
+        'app_closed',
+        'user_signed_out'
+      );
     }
     this.persisted.activeToken = null;
     this.persisted.activePersonaKey = null;
@@ -504,7 +691,11 @@ export class DesktopAuthAndInviteController {
     return { signedOut: true };
   }
 
-  private setAccountOfflineInternal(accountId: string): void {
+  private setAccountOfflineInternal(
+    accountId: string,
+    reason: SessionTerminationReason = 'connection_lost',
+    subReason: string = 'peer_offline'
+  ): SessionTeardownReceipt | null {
     this.onlineAccounts.delete(accountId);
     const now = new Date().toISOString();
 
@@ -521,9 +712,15 @@ export class DesktopAuthAndInviteController {
 
     const active = this.getActiveSessionForAccount(accountId);
     if (active) {
-      this.activeSessions.delete(active.sessionId);
-      this.sessionSignals.delete(active.sessionId);
+      const res = this.teardownSessionIdempotent({
+        sessionId: active.sessionId,
+        callerAccountId: accountId,
+        reason,
+        subReason,
+      });
+      return res.ok ? res.receipt : null;
     }
+    return null;
   }
 
   public getPresenceSnapshot(): ApiActionResult<{
@@ -548,10 +745,21 @@ export class DesktopAuthAndInviteController {
   }
 
   public setPresenceOnline(
-    online: boolean
-  ): ApiActionResult<{ snapshot: PresenceStateSnapshot }> {
-    const account = this.getCurrentAccount();
-    if (!account) {
+    online: boolean,
+    options?: {
+      personaKey?: string;
+      reason?: SessionTerminationReason;
+      subReason?: string;
+    }
+  ): ApiActionResult<{
+    snapshot: PresenceStateSnapshot;
+    receipt?: SessionTeardownReceipt | null;
+  }> {
+    const targetAccount = options?.personaKey
+      ? this.getAccountByPersona(options.personaKey)
+      : this.getCurrentAccount();
+
+    if (!targetAccount) {
       return {
         ok: false,
         status: 401,
@@ -560,17 +768,25 @@ export class DesktopAuthAndInviteController {
       };
     }
 
+    let receipt: SessionTeardownReceipt | null = null;
     if (online) {
-      this.onlineAccounts.add(account.accountId);
+      // Restoring internet or reopening the app reconnects presence,
+      // but NEVER restarts or restores an ended session.
+      this.onlineAccounts.add(targetAccount.accountId);
     } else {
-      this.setAccountOfflineInternal(account.accountId);
+      receipt = this.setAccountOfflineInternal(
+        targetAccount.accountId,
+        options?.reason ?? 'connection_lost',
+        options?.subReason ?? options?.reason ?? 'connection_lost'
+      );
     }
 
     return {
       ok: true,
       status: 200,
       data: {
-        snapshot: this.buildSnapshot(account),
+        snapshot: this.buildSnapshot(targetAccount),
+        receipt,
       },
     };
   }
@@ -826,6 +1042,11 @@ export class DesktopAuthAndInviteController {
     };
 
     this.activeSessions.set(approvedSession.sessionId, approvedSession);
+    const nowMs = Date.now();
+    this.sessionHeartbeats.set(approvedSession.sessionId, {
+      lastHostHeartbeatMs: nowMs,
+      lastGuestHeartbeatMs: nowMs,
+    });
 
     return {
       ok: true,
@@ -839,10 +1060,29 @@ export class DesktopAuthAndInviteController {
   }
 
   public disconnectActiveSession(
-    sessionId?: string
-  ): ApiActionResult<{ disconnected: boolean; snapshot: PresenceStateSnapshot }> {
-    const caller = this.getCurrentAccount();
-    if (!caller) {
+    sessionIdOrOptions?:
+      | string
+      | {
+          sessionId?: string;
+          reason?: SessionTerminationReason;
+          subReason?: string;
+          callerAccountId?: string;
+          detectionTimeMs?: number;
+        }
+  ): ApiActionResult<{
+    disconnected: boolean;
+    alreadyEnded: boolean;
+    receipt: SessionTeardownReceipt;
+    snapshot: PresenceStateSnapshot;
+  }> {
+    const current = this.getCurrentAccount();
+    const opts =
+      typeof sessionIdOrOptions === 'string'
+        ? { sessionId: sessionIdOrOptions }
+        : sessionIdOrOptions ?? {};
+
+    const callerAccountId = opts.callerAccountId || current?.accountId;
+    if (!callerAccountId) {
       return {
         ok: false,
         status: 401,
@@ -851,25 +1091,234 @@ export class DesktopAuthAndInviteController {
       };
     }
 
-    const active = this.getActiveSessionForAccount(caller.accountId);
-    if (!active || (sessionId && active.sessionId !== sessionId)) {
+    const result = this.teardownSessionIdempotent({
+      sessionId: opts.sessionId,
+      callerAccountId,
+      reason: opts.reason ?? 'user_top_bar_disconnect',
+      subReason: opts.subReason,
+      detectionTimeMs: opts.detectionTimeMs,
+    });
+
+    if (!result.ok) {
       return {
         ok: false,
-        status: 403,
-        errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
-        errorMessage: 'No active session found for caller.',
+        status: result.status,
+        errorCode: result.errorCode,
+        errorMessage: result.errorMessage,
       };
     }
 
-    this.activeSessions.delete(active.sessionId);
-    this.sessionSignals.delete(active.sessionId);
+    const snapshotAccount =
+      current ??
+      this.persisted.d1Accounts
+        .map((r) => this.mapAccountRow(r))
+        .find((a) => a.accountId === callerAccountId)!;
 
     return {
       ok: true,
       status: 200,
       data: {
         disconnected: true,
-        snapshot: this.buildSnapshot(caller),
+        alreadyEnded: result.alreadyEnded,
+        receipt: result.receipt,
+        snapshot: this.buildSnapshot(snapshotAccount),
+      },
+    };
+  }
+
+  public recordSessionHeartbeat(params: {
+    sessionId: string;
+    callerAccountId?: string;
+    timestampMs?: number;
+  }): ApiActionResult<{
+    ok: boolean;
+    sessionId: string;
+    heartbeatAtMs: number;
+  }> {
+    const current = this.getCurrentAccount();
+    const callerId = params.callerAccountId || current?.accountId;
+    if (!callerId) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Not signed in.',
+      };
+    }
+
+    const session = this.activeSessions.get(params.sessionId);
+    if (!session) {
+      const terminated = this.terminatedSessions.get(params.sessionId);
+      if (terminated) {
+        return {
+          ok: false,
+          status: 409,
+          errorCode: 'SESSION_ALREADY_ENDED',
+          errorMessage: `Stale session heartbeat rejected: session ${params.sessionId} has already ended (${terminated.receipt.reason}) and can never be resumed.`,
+        };
+      }
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+        errorMessage: 'No active session found for heartbeat.',
+      };
+    }
+
+    if (
+      session.hostAccountId !== callerId &&
+      session.guestAccountId !== callerId
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+        errorMessage: 'Caller is not an approved participant of this session.',
+      };
+    }
+
+    const nowMs = params.timestampMs ?? Date.now();
+    const hb = this.sessionHeartbeats.get(session.sessionId) ?? {
+      lastHostHeartbeatMs: nowMs,
+      lastGuestHeartbeatMs: nowMs,
+    };
+
+    if (callerId === session.hostAccountId) {
+      hb.lastHostHeartbeatMs = nowMs;
+    } else {
+      hb.lastGuestHeartbeatMs = nowMs;
+    }
+    this.sessionHeartbeats.set(session.sessionId, hb);
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        sessionId: session.sessionId,
+        heartbeatAtMs: nowMs,
+      },
+    };
+  }
+
+  public checkSessionLiveness(params: {
+    sessionId: string;
+    callerAccountId?: string;
+    nowMs?: number;
+    livenessTimeoutMs?: number;
+  }): ApiActionResult<{
+    alive: boolean;
+    alreadyEnded: boolean;
+    sessionId: string;
+    hostHeartbeatAgeMs: number;
+    guestHeartbeatAgeMs: number;
+    livenessTimeoutMs: number;
+    sessionDurationMs: number;
+    receipt?: SessionTeardownReceipt;
+  }> {
+    const current = this.getCurrentAccount();
+    const callerId = params.callerAccountId || current?.accountId;
+    if (!callerId) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Not signed in.',
+      };
+    }
+
+    const session = this.activeSessions.get(params.sessionId);
+    if (!session) {
+      const terminated = this.terminatedSessions.get(params.sessionId);
+      if (terminated) {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            alive: false,
+            alreadyEnded: true,
+            sessionId: params.sessionId,
+            hostHeartbeatAgeMs: 0,
+            guestHeartbeatAgeMs: 0,
+            livenessTimeoutMs:
+              params.livenessTimeoutMs ??
+              DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs,
+            sessionDurationMs: 0,
+            receipt: terminated.receipt,
+          },
+        };
+      }
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+        errorMessage: 'Session not found.',
+      };
+    }
+
+    const nowMs = params.nowMs ?? Date.now();
+    const timeoutMs =
+      params.livenessTimeoutMs ?? DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs;
+    const hb = this.sessionHeartbeats.get(session.sessionId) ?? {
+      lastHostHeartbeatMs: Date.parse(session.createdAt),
+      lastGuestHeartbeatMs: Date.parse(session.createdAt),
+    };
+
+    const hostAgeMs = Math.max(0, nowMs - hb.lastHostHeartbeatMs);
+    const guestAgeMs = Math.max(0, nowMs - hb.lastGuestHeartbeatMs);
+    const sessionDurationMs = Math.max(
+      0,
+      nowMs - Date.parse(session.createdAt)
+    );
+
+    const hostExpired =
+      hostAgeMs > timeoutMs || !this.onlineAccounts.has(session.hostAccountId);
+    const guestExpired =
+      guestAgeMs > timeoutMs || !this.onlineAccounts.has(session.guestAccountId);
+
+    if (hostExpired || guestExpired) {
+      const subReason =
+        hostExpired && guestExpired
+          ? 'liveness_timeout_both_peers'
+          : hostExpired
+          ? 'liveness_timeout_host_a'
+          : 'liveness_timeout_guest_b';
+
+      const teardown = this.teardownSessionIdempotent({
+        sessionId: session.sessionId,
+        callerAccountId: callerId,
+        reason: 'connection_lost',
+        subReason,
+        detectionTimeMs: Math.max(1, Math.max(hostAgeMs, guestAgeMs)),
+      });
+
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          alive: false,
+          alreadyEnded: teardown.ok ? teardown.alreadyEnded : false,
+          sessionId: session.sessionId,
+          hostHeartbeatAgeMs: hostAgeMs,
+          guestHeartbeatAgeMs: guestAgeMs,
+          livenessTimeoutMs: timeoutMs,
+          sessionDurationMs,
+          receipt: teardown.ok ? teardown.receipt : undefined,
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        alive: true,
+        alreadyEnded: false,
+        sessionId: session.sessionId,
+        hostHeartbeatAgeMs: hostAgeMs,
+        guestHeartbeatAgeMs: guestAgeMs,
+        livenessTimeoutMs: timeoutMs,
+        sessionDurationMs,
       },
     };
   }
@@ -896,6 +1345,27 @@ export class DesktopAuthAndInviteController {
 
     const session = this.activeSessions.get(params.sessionId);
     if (!session) {
+      const terminated = this.terminatedSessions.get(params.sessionId);
+      if (terminated) {
+        if (
+          terminated.session.hostAccountId !== senderId &&
+          terminated.session.guestAccountId !== senderId
+        ) {
+          return {
+            ok: false,
+            status: 403,
+            errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+            errorMessage:
+              'Caller is not an approved participant of this 1:1 session.',
+          };
+        }
+        return {
+          ok: false,
+          status: 409,
+          errorCode: 'SESSION_ALREADY_ENDED',
+          errorMessage: `Stale session event rejected: session ${params.sessionId} has already ended (${terminated.receipt.reason}) and can never be resumed. Send a fresh invite and accept again.`,
+        };
+      }
       return {
         ok: false,
         status: 403,
@@ -923,14 +1393,15 @@ export class DesktopAuthAndInviteController {
       pType !== 'offer' &&
       pType !== 'answer' &&
       pType !== 'ice-candidate' &&
-      pType !== 'media-status'
+      pType !== 'media-status' &&
+      pType !== 'teardown'
     ) {
       return {
         ok: false,
         status: 400,
         errorCode: 'INVALID_SIGNAL_PAYLOAD',
         errorMessage:
-          'Coordinator only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status), never media frames or chat payloads.',
+          'Coordinator only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status, teardown), never media frames or chat payloads.',
       };
     }
 
@@ -989,6 +1460,27 @@ export class DesktopAuthAndInviteController {
 
     const session = this.activeSessions.get(params.sessionId);
     if (!session) {
+      const terminated = this.terminatedSessions.get(params.sessionId);
+      if (terminated) {
+        if (
+          terminated.session.hostAccountId !== receiverId &&
+          terminated.session.guestAccountId !== receiverId
+        ) {
+          return {
+            ok: false,
+            status: 403,
+            errorCode: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+            errorMessage:
+              'Caller is not an approved participant of this 1:1 session.',
+          };
+        }
+        return {
+          ok: false,
+          status: 409,
+          errorCode: 'SESSION_ALREADY_ENDED',
+          errorMessage: `Stale session poll rejected: session ${params.sessionId} has already ended (${terminated.receipt.reason}) and can never be resumed.`,
+        };
+      }
       return {
         ok: false,
         status: 403,

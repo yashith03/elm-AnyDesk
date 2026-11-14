@@ -1,4 +1,5 @@
 import {
+  DEFAULT_LIVENESS_CONFIG,
   sanitizeHostMediaSelection,
   type AccountProfile,
   type ApprovedSessionSummary,
@@ -8,6 +9,7 @@ import {
   type InviteSummary,
   type PresenceStateSnapshot,
   type ProtocolErrorCode,
+  type SessionTeardownReceipt,
   type SessionTerminationReason,
   type WebRtcSignalEnvelope,
   type WebRtcSignalPayload,
@@ -37,6 +39,21 @@ interface ActiveSessionRow extends Record<string, SqlStorageValue> {
   guest_display_name: string;
   host_media_selection_json: string;
   created_at: string;
+  last_host_heartbeat_at: string;
+  last_guest_heartbeat_at: string;
+}
+
+interface TerminatedSessionRow extends Record<string, SqlStorageValue> {
+  session_id: string;
+  invite_id: string;
+  host_account_id: string;
+  guest_account_id: string;
+  reason: string;
+  sub_reason: string;
+  initiated_by_account_id: string | null;
+  terminated_at: string;
+  duplicate_call_count: number;
+  detection_time_ms: number;
 }
 
 interface SessionSignalRow extends Record<string, SqlStorageValue> {
@@ -156,7 +173,22 @@ export class SignalingCoordinator implements DurableObject {
         guest_friend_code TEXT NOT NULL,
         guest_display_name TEXT NOT NULL,
         host_media_selection_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        last_host_heartbeat_at TEXT NOT NULL,
+        last_guest_heartbeat_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS terminated_sessions (
+        session_id TEXT PRIMARY KEY,
+        invite_id TEXT NOT NULL,
+        host_account_id TEXT NOT NULL,
+        guest_account_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        sub_reason TEXT NOT NULL,
+        initiated_by_account_id TEXT,
+        terminated_at TEXT NOT NULL,
+        duplicate_call_count INTEGER NOT NULL DEFAULT 0,
+        detection_time_ms INTEGER NOT NULL DEFAULT 1
       );
 
       CREATE TABLE IF NOT EXISTS session_signals (
@@ -272,10 +304,255 @@ export class SignalingCoordinator implements DurableObject {
     );
   }
 
+  private mapTerminatedReceipt(
+    row: TerminatedSessionRow,
+    alreadyEnded: boolean
+  ): SessionTeardownReceipt {
+    return {
+      sessionId: row.session_id,
+      reason: row.reason as SessionTerminationReason,
+      subReason: row.sub_reason,
+      initiatedByAccountId: row.initiated_by_account_id,
+      terminatedAt: row.terminated_at,
+      alreadyEnded,
+      duplicateCallCount: row.duplicate_call_count,
+      hostTracksStoppedCount: 0,
+      peerConnectionsClosed: true,
+      dataChannelsClosed: true,
+      guestViewerCleared: true,
+      permissionsInvalidated: true,
+      signalingMembershipInvalidated: true,
+      detectionTimeMs: row.detection_time_ms,
+    };
+  }
+
+  /**
+   * Unified idempotent session teardown path in SignalingCoordinator.
+   * Called on:
+   * - User A or User B top-bar Disconnect ('user_top_bar_disconnect')
+   * - App close / quit ('app_closed')
+   * - Detected connection loss / liveness timeout / sleep ('connection_lost')
+   * Invalidates session permissions and signaling membership, records a tombstone
+   * in `terminated_sessions` so stale events are rejected with `SESSION_ALREADY_ENDED`,
+   * and guarantees duplicate teardown calls succeed idempotently.
+   */
+  private teardownSessionIdempotent(params: {
+    sessionId?: string;
+    callerAccountId?: string;
+    reason: SessionTerminationReason;
+    subReason?: string;
+    detectionTimeMs?: number;
+  }):
+    | {
+        ok: true;
+        status: 200;
+        disconnected: true;
+        alreadyEnded: boolean;
+        sessionId: string;
+        receipt: SessionTeardownReceipt;
+      }
+    | {
+        ok: false;
+        status: number;
+        code: ProtocolErrorCode;
+        message: string;
+      } {
+    this.ensureSchema();
+    const sql = this.state.storage.sql;
+
+    let targetSessionId = params.sessionId;
+    if (!targetSessionId && params.callerAccountId) {
+      const activeForCaller = this.getActiveSessionForAccount(
+        params.callerAccountId
+      );
+      if (activeForCaller) {
+        targetSessionId = activeForCaller.sessionId;
+      } else {
+        const lastTerminated = sql
+          .exec<TerminatedSessionRow>(
+            `SELECT * FROM terminated_sessions
+             WHERE host_account_id = ? OR guest_account_id = ?
+             ORDER BY rowid DESC
+             LIMIT 1`,
+            params.callerAccountId,
+            params.callerAccountId
+          )
+          .toArray();
+        if (lastTerminated.length > 0) {
+          targetSessionId = lastTerminated[0].session_id;
+        }
+      }
+    }
+
+    if (!targetSessionId) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+        message: 'No matching active or recently ended session found for caller.',
+      };
+    }
+
+    // 1. Check if session is currently active
+    const activeRows = sql
+      .exec<ActiveSessionRow>(
+        `SELECT * FROM active_sessions WHERE session_id = ? LIMIT 1`,
+        targetSessionId
+      )
+      .toArray();
+
+    if (activeRows.length > 0) {
+      const active = activeRows[0];
+      if (
+        params.callerAccountId &&
+        active.host_account_id !== params.callerAccountId &&
+        active.guest_account_id !== params.callerAccountId
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+          message: 'Caller is not an approved participant of this 1:1 session.',
+        };
+      }
+
+      const now = new Date().toISOString();
+      const subReason = params.subReason || params.reason;
+      const detectionTimeMs = Math.max(1, Math.round(params.detectionTimeMs ?? 1));
+
+      sql.exec(
+        `DELETE FROM active_sessions WHERE session_id = ?`,
+        active.session_id
+      );
+      sql.exec(
+        `DELETE FROM session_signals WHERE session_id = ?`,
+        active.session_id
+      );
+
+      sql.exec(
+        `INSERT INTO terminated_sessions (
+          session_id,
+          invite_id,
+          host_account_id,
+          guest_account_id,
+          reason,
+          sub_reason,
+          initiated_by_account_id,
+          terminated_at,
+          duplicate_call_count,
+          detection_time_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          duplicate_call_count = terminated_sessions.duplicate_call_count + 1`,
+        active.session_id,
+        active.invite_id,
+        active.host_account_id,
+        active.guest_account_id,
+        params.reason,
+        subReason,
+        params.callerAccountId ?? null,
+        now,
+        detectionTimeMs
+      );
+
+      const termRow: TerminatedSessionRow = {
+        session_id: active.session_id,
+        invite_id: active.invite_id,
+        host_account_id: active.host_account_id,
+        guest_account_id: active.guest_account_id,
+        reason: params.reason,
+        sub_reason: subReason,
+        initiated_by_account_id: params.callerAccountId ?? null,
+        terminated_at: now,
+        duplicate_call_count: 0,
+        detection_time_ms: detectionTimeMs,
+      };
+      const receipt = this.mapTerminatedReceipt(termRow, false);
+
+      this.sendEventToAccount(active.host_account_id, {
+        type: 'session:ended',
+        sessionId: active.session_id,
+        reason: params.reason,
+        subReason,
+        receipt,
+      });
+      this.sendEventToAccount(active.guest_account_id, {
+        type: 'session:ended',
+        sessionId: active.session_id,
+        reason: params.reason,
+        subReason,
+        receipt,
+      });
+
+      return {
+        ok: true,
+        status: 200,
+        disconnected: true,
+        alreadyEnded: false,
+        sessionId: active.session_id,
+        receipt,
+      };
+    }
+
+    // 2. Check if session was already terminated (idempotent duplicate teardown)
+    const termRows = sql
+      .exec<TerminatedSessionRow>(
+        `SELECT * FROM terminated_sessions WHERE session_id = ? LIMIT 1`,
+        targetSessionId
+      )
+      .toArray();
+
+    if (termRows.length > 0) {
+      const term = termRows[0];
+      if (
+        params.callerAccountId &&
+        term.host_account_id !== params.callerAccountId &&
+        term.guest_account_id !== params.callerAccountId
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+          message: 'Caller was not a participant of this session.',
+        };
+      }
+
+      const nextCount = Number(term.duplicate_call_count ?? 0) + 1;
+      sql.exec(
+        `UPDATE terminated_sessions SET duplicate_call_count = ? WHERE session_id = ?`,
+        nextCount,
+        term.session_id
+      );
+
+      const updatedRow: TerminatedSessionRow = {
+        ...term,
+        duplicate_call_count: nextCount,
+      };
+      const receipt = this.mapTerminatedReceipt(updatedRow, true);
+
+      return {
+        ok: true,
+        status: 200,
+        disconnected: true,
+        alreadyEnded: true,
+        sessionId: term.session_id,
+        receipt,
+      };
+    }
+
+    return {
+      ok: false,
+      status: 403,
+      code: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+      message: 'No matching active session found for caller.',
+    };
+  }
+
   private markAccountOffline(
     accountId: string,
-    reason: SessionTerminationReason = 'connection_lost'
-  ): void {
+    reason: SessionTerminationReason = 'connection_lost',
+    subReason: string = 'peer_offline'
+  ): SessionTeardownReceipt | null {
     this.ensureSchema();
     const sql = this.state.storage.sql;
     const now = new Date().toISOString();
@@ -316,28 +593,18 @@ export class SignalingCoordinator implements DurableObject {
       });
     }
 
-    // End any active session involving this account (ended sessions never resume)
+    // End any active session involving this account via the single idempotent teardown path
     const activeSession = this.getActiveSessionForAccount(accountId);
     if (activeSession) {
-      sql.exec(
-        `DELETE FROM active_sessions WHERE session_id = ?`,
-        activeSession.sessionId
-      );
-      sql.exec(
-        `DELETE FROM session_signals WHERE session_id = ?`,
-        activeSession.sessionId
-      );
-      this.sendEventToAccount(activeSession.hostAccountId, {
-        type: 'session:ended',
+      const res = this.teardownSessionIdempotent({
         sessionId: activeSession.sessionId,
+        callerAccountId: accountId,
         reason,
+        subReason,
       });
-      this.sendEventToAccount(activeSession.guestAccountId, {
-        type: 'session:ended',
-        sessionId: activeSession.sessionId,
-        reason,
-      });
+      return res.ok ? res.receipt : null;
     }
+    return null;
   }
 
   private recordAndDeliverSignal(
@@ -534,6 +801,35 @@ export class SignalingCoordinator implements DurableObject {
         .toArray();
 
       if (rows.length === 0) {
+        const terminatedRows = this.state.storage.sql
+          .exec<TerminatedSessionRow>(
+            `SELECT * FROM terminated_sessions WHERE session_id = ? LIMIT 1`,
+            sessionId
+          )
+          .toArray();
+
+        if (terminatedRows.length > 0) {
+          const term = terminatedRows[0];
+          if (
+            term.host_account_id !== callerAccountId &&
+            term.guest_account_id !== callerAccountId
+          ) {
+            return {
+              allowed: false,
+              status: 403,
+              code: 'UNAUTHORIZED_SESSION_PARTICIPANT',
+              message:
+                'Caller is not an approved participant of this 1:1 session. Knowing a Friend Code cannot join an approved session.',
+            };
+          }
+          return {
+            allowed: false,
+            status: 409,
+            code: 'SESSION_ALREADY_ENDED',
+            message: `Stale session event rejected: session ${sessionId} has already ended (${term.reason}) and can never be resumed. Send a fresh invite and accept again.`,
+          };
+        }
+
         return {
           allowed: false,
           status: 403,
@@ -613,12 +909,14 @@ export class SignalingCoordinator implements DurableObject {
       const body = (await request.json()) as {
         accountId: string;
         reason?: SessionTerminationReason;
+        subReason?: string;
       };
-      this.markAccountOffline(
+      const receipt = this.markAccountOffline(
         body.accountId,
-        body.reason ?? 'user_top_bar_disconnect'
+        body.reason ?? 'user_top_bar_disconnect',
+        body.subReason ?? body.reason ?? 'user_top_bar_disconnect'
       );
-      return Response.json({ ok: true });
+      return Response.json({ ok: true, receipt });
     }
 
     // Get Presence & Session State Snapshot
@@ -909,8 +1207,10 @@ export class SignalingCoordinator implements DurableObject {
           guest_friend_code,
           guest_display_name,
           host_media_selection_json,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at,
+          last_host_heartbeat_at,
+          last_guest_heartbeat_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         sessionId,
         inviteRow.invite_id,
         inviteRow.target_account_id,
@@ -920,6 +1220,8 @@ export class SignalingCoordinator implements DurableObject {
         inviteRow.requester_friend_code,
         inviteRow.requester_display_name,
         JSON.stringify(mediaSelection),
+        now,
+        now,
         now
       );
 
@@ -1003,7 +1305,7 @@ export class SignalingCoordinator implements DurableObject {
       });
     }
 
-    // Disconnect Active Session (Ends session for both participants; never resumable)
+    // Disconnect Active Session (Single idempotent teardown path; ends session for both participants; never resumable)
     if (
       request.method === 'POST' &&
       url.pathname === '/internal/sessions/disconnect'
@@ -1011,45 +1313,210 @@ export class SignalingCoordinator implements DurableObject {
       const body = (await request.json()) as {
         caller: AccountProfile;
         sessionId?: string;
+        reason?: SessionTerminationReason;
+        subReason?: string;
+        detectionTimeMs?: number;
       };
 
-      const activeSession = this.getActiveSessionForAccount(
-        body.caller.accountId
+      const result = this.teardownSessionIdempotent({
+        sessionId: body.sessionId,
+        callerAccountId: body.caller.accountId,
+        reason: body.reason ?? 'user_top_bar_disconnect',
+        subReason: body.subReason,
+        detectionTimeMs: body.detectionTimeMs,
+      });
+
+      if (!result.ok) {
+        return errorResponse(result.status, result.code, result.message);
+      }
+
+      return Response.json({
+        disconnected: true,
+        alreadyEnded: result.alreadyEnded,
+        sessionId: result.sessionId,
+        receipt: result.receipt,
+      });
+    }
+
+    // Liveness Heartbeat from Approved Session Participant
+    // Note: Liveness threshold is NOT a time limit on a connected session;
+    // sessions stay connected indefinitely as long as heartbeats arrive.
+    if (
+      request.method === 'POST' &&
+      url.pathname === '/internal/sessions/heartbeat'
+    ) {
+      const body = (await request.json()) as {
+        caller: AccountProfile;
+        sessionId?: string;
+        timestampIso?: string;
+      };
+
+      const gate = this.evaluateSignalingGate(
+        body.caller.accountId,
+        body.sessionId
       );
+      if (!gate.allowed) {
+        return errorResponse(gate.status, gate.code, gate.message);
+      }
+
+      const nowIso = body.timestampIso || new Date().toISOString();
+      const isHost = body.caller.accountId === gate.session.hostAccountId;
+
+      if (isHost) {
+        sql.exec(
+          `UPDATE active_sessions SET last_host_heartbeat_at = ? WHERE session_id = ?`,
+          nowIso,
+          gate.session.sessionId
+        );
+      } else {
+        sql.exec(
+          `UPDATE active_sessions SET last_guest_heartbeat_at = ? WHERE session_id = ?`,
+          nowIso,
+          gate.session.sessionId
+        );
+      }
+
+      return Response.json({
+        ok: true,
+        sessionId: gate.session.sessionId,
+        role: isHost ? 'host' : 'guest',
+        heartbeatAt: nowIso,
+      });
+    }
+
+    // Liveness Check: Detects abrupt connection loss (force quit, internet drop, sleep)
+    // when a close event cannot arrive, and invokes the unified idempotent teardown path.
+    if (
+      request.method === 'POST' &&
+      url.pathname === '/internal/sessions/check-liveness'
+    ) {
+      const body = (await request.json()) as {
+        caller: AccountProfile;
+        sessionId?: string;
+        nowIso?: string;
+        livenessTimeoutMs?: number;
+      };
+
+      const targetSessionId =
+        body.sessionId ||
+        this.getActiveSessionForAccount(body.caller.accountId)?.sessionId;
+
+      if (!targetSessionId) {
+        return errorResponse(
+          403,
+          'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+          'No active session found to check liveness.'
+        );
+      }
+
+      const activeRows = sql
+        .exec<ActiveSessionRow>(
+          `SELECT * FROM active_sessions WHERE session_id = ? LIMIT 1`,
+          targetSessionId
+        )
+        .toArray();
+
+      if (activeRows.length === 0) {
+        const termRows = sql
+          .exec<TerminatedSessionRow>(
+            `SELECT * FROM terminated_sessions WHERE session_id = ? LIMIT 1`,
+            targetSessionId
+          )
+          .toArray();
+        if (termRows.length > 0) {
+          const term = termRows[0];
+          if (
+            term.host_account_id !== body.caller.accountId &&
+            term.guest_account_id !== body.caller.accountId
+          ) {
+            return errorResponse(
+              403,
+              'UNAUTHORIZED_SESSION_PARTICIPANT',
+              'Caller is not a participant of this session.'
+            );
+          }
+          return Response.json({
+            alive: false,
+            alreadyEnded: true,
+            sessionId: term.session_id,
+            receipt: this.mapTerminatedReceipt(term, true),
+          });
+        }
+
+        return errorResponse(
+          403,
+          'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+          'Session not found.'
+        );
+      }
+
+      const active = activeRows[0];
       if (
-        !activeSession ||
-        (body.sessionId && activeSession.sessionId !== body.sessionId)
+        active.host_account_id !== body.caller.accountId &&
+        active.guest_account_id !== body.caller.accountId
       ) {
         return errorResponse(
           403,
           'UNAUTHORIZED_SESSION_PARTICIPANT',
-          'No matching active session found for caller.'
+          'Caller is not an approved participant of this 1:1 session.'
         );
       }
 
-      sql.exec(
-        `DELETE FROM active_sessions WHERE session_id = ?`,
-        activeSession.sessionId
+      const nowMs = body.nowIso ? Date.parse(body.nowIso) : Date.now();
+      const timeoutMs =
+        body.livenessTimeoutMs ?? DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs;
+      const hostAgeMs = Math.max(
+        0,
+        nowMs - Date.parse(active.last_host_heartbeat_at)
       );
-      sql.exec(
-        `DELETE FROM session_signals WHERE session_id = ?`,
-        activeSession.sessionId
+      const guestAgeMs = Math.max(
+        0,
+        nowMs - Date.parse(active.last_guest_heartbeat_at)
+      );
+      const sessionDurationMs = Math.max(
+        0,
+        nowMs - Date.parse(active.created_at)
       );
 
-      this.sendEventToAccount(activeSession.hostAccountId, {
-        type: 'session:ended',
-        sessionId: activeSession.sessionId,
-        reason: 'user_top_bar_disconnect',
-      });
-      this.sendEventToAccount(activeSession.guestAccountId, {
-        type: 'session:ended',
-        sessionId: activeSession.sessionId,
-        reason: 'user_top_bar_disconnect',
-      });
+      const hostExpired = hostAgeMs > timeoutMs;
+      const guestExpired = guestAgeMs > timeoutMs;
+
+      if (hostExpired || guestExpired) {
+        const subReason =
+          hostExpired && guestExpired
+            ? 'liveness_timeout_both_peers'
+            : hostExpired
+            ? 'liveness_timeout_host_a'
+            : 'liveness_timeout_guest_b';
+        const teardown = this.teardownSessionIdempotent({
+          sessionId: active.session_id,
+          callerAccountId: body.caller.accountId,
+          reason: 'connection_lost',
+          subReason,
+          detectionTimeMs: Math.max(hostAgeMs, guestAgeMs),
+        });
+        if (!teardown.ok) {
+          return errorResponse(teardown.status, teardown.code, teardown.message);
+        }
+        return Response.json({
+          alive: false,
+          alreadyEnded: teardown.alreadyEnded,
+          sessionId: active.session_id,
+          hostHeartbeatAgeMs: hostAgeMs,
+          guestHeartbeatAgeMs: guestAgeMs,
+          livenessTimeoutMs: timeoutMs,
+          sessionDurationMs,
+          receipt: teardown.receipt,
+        });
+      }
 
       return Response.json({
-        disconnected: true,
-        sessionId: activeSession.sessionId,
+        alive: true,
+        sessionId: active.session_id,
+        hostHeartbeatAgeMs: hostAgeMs,
+        guestHeartbeatAgeMs: guestAgeMs,
+        livenessTimeoutMs: timeoutMs,
+        sessionDurationMs,
       });
     }
 
@@ -1085,12 +1552,13 @@ export class SignalingCoordinator implements DurableObject {
           pType !== 'offer' &&
           pType !== 'answer' &&
           pType !== 'ice-candidate' &&
-          pType !== 'media-status'
+          pType !== 'media-status' &&
+          pType !== 'teardown'
         ) {
           return errorResponse(
             400,
             'INVALID_SIGNAL_PAYLOAD',
-            'Worker only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status), never media frames or chat payloads.'
+            'Worker only accepts WebRTC signaling payloads (offer, answer, ice-candidate, media-status, teardown), never media frames or chat payloads.'
           );
         }
 

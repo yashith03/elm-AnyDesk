@@ -149,7 +149,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
       if (request.method === 'GET' && url.pathname === '/health') {
         const payload: ApiHealthResponse = {
           status: 'ok',
-          phase: 'phase-3-webrtc-media-and-datachannel-chat',
+          phase: 'phase-4-idempotent-teardown-and-liveness',
           protocolVersion: PROTOCOL_VERSION,
           timestamp: new Date().toISOString(),
         };
@@ -305,13 +305,21 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
 
       // 7. Presence Disconnect: POST /presence/disconnect
       if (request.method === 'POST' && url.pathname === '/presence/disconnect') {
+        const body = (await request.json().catch(() => ({}))) as {
+          reason?: string;
+          subReason?: string;
+        };
         const res = await coordinator.fetch(
           new Request(
             'https://coordinator.internal/internal/presence/disconnect',
             {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ accountId: account.accountId }),
+              body: JSON.stringify({
+                accountId: account.accountId,
+                reason: body.reason,
+                subReason: body.subReason,
+              }),
             }
           )
         );
@@ -411,10 +419,13 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
         return withCors(res);
       }
 
-      // 11. Disconnect Active Session: POST /sessions/disconnect
+      // 11. Disconnect Active Session (Unified Idempotent Teardown): POST /sessions/disconnect
       if (request.method === 'POST' && url.pathname === '/sessions/disconnect') {
         const body = (await request.json().catch(() => ({}))) as {
           sessionId?: string;
+          reason?: string;
+          subReason?: string;
+          detectionTimeMs?: number;
         };
         const res = await coordinator.fetch(
           new Request(
@@ -425,6 +436,60 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
               body: JSON.stringify({
                 caller: account,
                 sessionId: body.sessionId,
+                reason: body.reason,
+                subReason: body.subReason,
+                detectionTimeMs: body.detectionTimeMs,
+              }),
+            }
+          )
+        );
+        return withCors(res);
+      }
+
+      // 11b. Session Liveness Heartbeat: POST /sessions/heartbeat
+      if (request.method === 'POST' && url.pathname === '/sessions/heartbeat') {
+        const body = (await request.json().catch(() => ({}))) as {
+          sessionId?: string;
+          timestampIso?: string;
+        };
+        const res = await coordinator.fetch(
+          new Request(
+            'https://coordinator.internal/internal/sessions/heartbeat',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                caller: account,
+                sessionId: body.sessionId,
+                timestampIso: body.timestampIso,
+              }),
+            }
+          )
+        );
+        return withCors(res);
+      }
+
+      // 11c. Session Liveness Check: POST /sessions/check-liveness
+      if (
+        request.method === 'POST' &&
+        url.pathname === '/sessions/check-liveness'
+      ) {
+        const body = (await request.json().catch(() => ({}))) as {
+          sessionId?: string;
+          nowIso?: string;
+          livenessTimeoutMs?: number;
+        };
+        const res = await coordinator.fetch(
+          new Request(
+            'https://coordinator.internal/internal/sessions/check-liveness',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                caller: account,
+                sessionId: body.sessionId,
+                nowIso: body.nowIso,
+                livenessTimeoutMs: body.livenessTimeoutMs,
               }),
             }
           )

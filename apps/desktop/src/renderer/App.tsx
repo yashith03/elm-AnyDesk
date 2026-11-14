@@ -15,6 +15,8 @@ import type {
 import {
   ApprovedWebRtcSessionController,
   runAllWebRtcSessionVerificationMatrix,
+  runPhase4LifecycleAndTeardownVerificationSuite,
+  type Phase4VerificationSuiteReport,
   type SessionCombinationVerificationReport,
   type WebRtcSessionSnapshot,
 } from './webrtc-session';
@@ -74,6 +76,23 @@ export function App(): React.ReactElement {
     SessionCombinationVerificationReport
   > | null>(null);
   const [runningMatrix, setRunningMatrix] = useState<boolean>(false);
+
+  // Phase 4 Teardown & Liveness Verification Matrix state
+  const [phase4Report, setPhase4Report] =
+    useState<Phase4VerificationSuiteReport | null>(null);
+  const [runningPhase4, setRunningPhase4] = useState<boolean>(false);
+
+  const clearGuestMediaElements = () => {
+    if (guestVideoRef.current) {
+      guestVideoRef.current.srcObject = null;
+    }
+    if (guestMicAudioRef.current) {
+      guestMicAudioRef.current.srcObject = null;
+    }
+    if (guestDeviceAudioRef.current) {
+      guestDeviceAudioRef.current.srcObject = null;
+    }
+  };
 
   // Prototype drawer state
   const [showPrototypeDrawer, setShowPrototypeDrawer] =
@@ -159,13 +178,16 @@ export function App(): React.ReactElement {
       (nextSnap) => {
         setWebrtcSnap(nextSnap);
         void window.elmDesktop.syncVolatileSessionUiState({
-          session: currentSession,
+          session: nextSnap.teardownReceipt ? null : currentSession,
           currentAccount: account,
           connectionState: nextSnap.connectionState,
           dataChannelState: nextSnap.dataChannelState,
           messages: nextSnap.messages,
           hostMediaState: nextSnap.hostMediaState,
         });
+      },
+      {
+        onGuestViewerCleared: clearGuestMediaElements,
       }
     );
 
@@ -388,20 +410,37 @@ export function App(): React.ReactElement {
 
   const handleDisconnectSession = async () => {
     clearAlerts();
+    const targetSessionId =
+      snapshot?.activeSession?.sessionId ??
+      volatileChatState?.session?.sessionId;
+
     if (webrtcControllerRef.current) {
-      webrtcControllerRef.current.destroy();
+      await webrtcControllerRef.current.executeIdempotentTeardown(
+        'user_top_bar_disconnect',
+        {
+          subReason:
+            account?.accountId ===
+            webrtcControllerRef.current.session.guestAccountId
+              ? 'top_bar_guest_b'
+              : 'top_bar_host_a',
+          initiatedByAccountId: account?.accountId ?? null,
+        }
+      );
       webrtcControllerRef.current = null;
     }
+    clearGuestMediaElements();
     setWebrtcSnap(null);
-    const res = await window.elmDesktop.disconnectActiveSession(
-      snapshot?.activeSession?.sessionId ??
-        volatileChatState?.session?.sessionId
-    );
+    const res = await window.elmDesktop.disconnectActiveSession({
+      sessionId: targetSessionId,
+      reason: 'user_top_bar_disconnect',
+      subReason: 'user_top_bar_disconnect',
+      callerAccountId: account?.accountId,
+    });
     if (res.ok && res.data) {
       setSnapshot(res.data.snapshot);
     }
     setStatusMessage(
-      'Session ended for both participants and volatile chat wiped. Ended sessions never resume; connecting again requires a fresh invite and fresh acceptance.'
+      'Session ended via unified idempotent teardown path: A\'s tracks stopped, peer connections & DataChannels closed, B\'s viewer cleared, and session permissions invalidated. Send a fresh invite to connect again.'
     );
   };
 
@@ -473,6 +512,24 @@ export function App(): React.ReactElement {
       setErrorMessage(err instanceof Error ? err.message : String(err));
     } finally {
       setRunningMatrix(false);
+    }
+  };
+
+  const handleRunPhase4Suite = async () => {
+    clearAlerts();
+    setRunningPhase4(true);
+    try {
+      const report = await runPhase4LifecycleAndTeardownVerificationSuite();
+      setPhase4Report(report);
+      setStatusMessage(
+        `Completed Phase 4 Idempotent Teardown & Liveness Verification Matrix (allPassed=${String(
+          report.allPassed
+        )}).`
+      );
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunningPhase4(false);
     }
   };
 
@@ -1417,6 +1474,140 @@ export function App(): React.ReactElement {
                 </ul>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      {/* PHASE 4 IDEMPOTENT TEARDOWN, LIVENESS & NON-RESUMABLE SESSION VERIFICATION SUITE */}
+      <section className="card card-full">
+        <div className="subcard-header">
+          <div>
+            <h2>
+              Phase 4 — Unified Idempotent Teardown, Liveness Check & Non-Resumable
+              Sessions Suite
+            </h2>
+            <p className="muted">
+              Verifies Disconnect from A &amp; B, App Close from A &amp; B,
+              Force Quit liveness detection (and that liveness threshold is not
+              a session time limit), Internet Loss &amp; Recovery on A, B, and
+              both sides, Sleep/Wake, Duplicate Teardown Idempotency, and
+              Minimize/Restore during active sharing.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="primary-btn"
+            disabled={runningPhase4}
+            onClick={handleRunPhase4Suite}
+          >
+            {runningPhase4
+              ? 'Running Phase 4 Suite...'
+              : 'Run Phase 4 Teardown & Liveness Suite'}
+          </button>
+        </div>
+
+        {phase4Report && (
+          <div className="telemetry-grid">
+            {[
+              phase4Report.disconnectFromHostA,
+              phase4Report.disconnectFromGuestB,
+              phase4Report.appCloseFromHostA,
+              phase4Report.appCloseFromGuestB,
+              phase4Report.forceQuitAbruptLoss,
+              phase4Report.internetLossAndRecoveryHostA,
+              phase4Report.internetLossAndRecoveryGuestB,
+              phase4Report.internetLossAndRecoveryBothSides,
+              phase4Report.sleepAndWake,
+              phase4Report.duplicateTeardownIdempotency,
+            ].map((sc) => (
+              <div key={sc.scenario} className="subcard">
+                <h3>
+                  {sc.scenario} ({sc.passed ? 'PASS' : 'FAIL'})
+                </h3>
+                <ul className="feature-list">
+                  <li>
+                    Reason: <code>{sc.reason}</code> (
+                    <code>{sc.subReason}</code>) | Detection:{' '}
+                    <code>{sc.detectionTimeMs}ms</code>
+                  </li>
+                  <li>
+                    Tracks Stopped: <code>{sc.hostTracksStoppedCount}</code> |
+                    Viewer Cleared: <code>{String(sc.guestViewerCleared)}</code>{' '}
+                    | PCs Closed:{' '}
+                    <code>{String(sc.peerConnectionsClosed)}</code>
+                  </li>
+                  {sc.staleEventRejectedWithCode && (
+                    <li>
+                      Stale Event Rejected:{' '}
+                      <code>{sc.staleEventRejectedWithCode}</code> | Fresh
+                      Session:{' '}
+                      <code>
+                        {String(
+                          sc.newSessionIdAfterFreshInvite !== sc.oldSessionId
+                        )}
+                      </code>
+                    </li>
+                  )}
+                  {sc.duplicateCallCount !== undefined && (
+                    <li>
+                      Duplicate Teardown Calls Handled Idempotently:{' '}
+                      <code>{sc.duplicateCallCount}</code>
+                    </li>
+                  )}
+                </ul>
+              </div>
+            ))}
+            <div className="subcard">
+              <h3>
+                {phase4Report.minimizeAndRestoreDuringSharing.scenario} (
+                {phase4Report.minimizeAndRestoreDuringSharing.passed
+                  ? 'PASS'
+                  : 'FAIL'}
+                )
+              </h3>
+              <ul className="feature-list">
+                <li>
+                  Minimized Duration:{' '}
+                  <code>
+                    {
+                      phase4Report.minimizeAndRestoreDuringSharing
+                        .minimizedDurationMs
+                    }
+                    ms
+                  </code>{' '}
+                  (Liveness Threshold:{' '}
+                  <code>
+                    {
+                      phase4Report.minimizeAndRestoreDuringSharing
+                        .livenessTimeoutMs
+                    }
+                    ms
+                  </code>
+                  )
+                </li>
+                <li>
+                  Stayed Connected While Minimized:{' '}
+                  <code>
+                    {String(
+                      phase4Report.minimizeAndRestoreDuringSharing
+                        .stayedConnectedWhileMinimized
+                    )}
+                  </code>{' '}
+                  | Video/Audio Tracks:{' '}
+                  <code>
+                    {
+                      phase4Report.minimizeAndRestoreDuringSharing
+                        .guestVideoTracksWhileMinimized
+                    }
+                    /
+                    {
+                      phase4Report.minimizeAndRestoreDuringSharing
+                        .guestAudioTracksWhileMinimized
+                    }
+                  </code>
+                </li>
+              </ul>
+            </div>
           </div>
         )}
       </section>

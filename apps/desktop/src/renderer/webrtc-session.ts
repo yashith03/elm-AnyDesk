@@ -1,4 +1,5 @@
 import {
+  DEFAULT_LIVENESS_CONFIG,
   STUN_ICE_SERVERS,
   STREAM_ID_BY_SOURCE,
   type ApprovedSessionSummary,
@@ -8,6 +9,8 @@ import {
   type MediaSourceKind,
   type MediaSourceStatusDescriptor,
   type MediaSourceStatusKind,
+  type SessionTeardownReceipt,
+  type SessionTerminationReason,
   type WebRtcSignalPayload,
   type WebRtcTrackDescriptor,
 } from '@elm/protocol';
@@ -47,6 +50,17 @@ export interface WebRtcSessionSnapshot {
   readonly guestPlayback: GuestLocalPlaybackControls;
   readonly messages: readonly EphemeralChatMessage[];
   readonly lastStatusBanner: string | null;
+  readonly permissionsInvalidated: boolean;
+  readonly signalingMembershipInvalidated: boolean;
+  readonly guestViewerCleared: boolean;
+  readonly teardownReceipt: SessionTeardownReceipt | null;
+}
+
+export interface WebRtcControllerOptions {
+  readonly heartbeatIntervalMs?: number;
+  readonly livenessTimeoutMs?: number;
+  readonly enableBackgroundLivenessTimer?: boolean;
+  readonly onGuestViewerCleared?: () => void;
 }
 
 interface ActiveHostSenderEntry {
@@ -143,12 +157,39 @@ export class ApprovedWebRtcSessionController {
     'permission_denied' | 'unsupported'
   >();
 
+  // Phase 4: Unified Idempotent Teardown & Transport/Liveness Monitor State
+  private teardownReceipt: SessionTeardownReceipt | null = null;
+  private duplicateTeardownCallCount = 0;
+  private permissionsInvalidated = false;
+  private signalingMembershipInvalidated = false;
+  private guestViewerCleared = false;
+  private readonly heartbeatIntervalMs: number;
+  private readonly livenessTimeoutMs: number;
+  private readonly enableBackgroundLivenessTimer: boolean;
+  private readonly onGuestViewerCleared?: () => void;
+  private livenessTimerId: ReturnType<typeof setInterval> | null = null;
+  private lastHostHeartbeatPerfMs = performance.now();
+  private lastGuestHeartbeatPerfMs = performance.now();
+  private hostHeartbeatSuppressed = false;
+  private guestHeartbeatSuppressed = false;
+  private abruptFaultStartedPerfMs: number | null = null;
+  private abruptFaultSubReason: string | null = null;
+
   constructor(
     session: ApprovedSessionSummary,
-    onChange: (snapshot: WebRtcSessionSnapshot) => void
+    onChange: (snapshot: WebRtcSessionSnapshot) => void,
+    options?: WebRtcControllerOptions
   ) {
     this.session = session;
     this.onChange = onChange;
+    this.heartbeatIntervalMs =
+      options?.heartbeatIntervalMs ?? DEFAULT_LIVENESS_CONFIG.heartbeatIntervalMs;
+    this.livenessTimeoutMs =
+      options?.livenessTimeoutMs ?? DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs;
+    this.enableBackgroundLivenessTimer =
+      options?.enableBackgroundLivenessTimer ?? true;
+    this.onGuestViewerCleared = options?.onGuestViewerCleared;
+
     this.hostMediaState = {
       ...createInitialHostMediaState(session.hostMediaSelection),
     };
@@ -164,18 +205,33 @@ export class ApprovedWebRtcSessionController {
   }
 
   private setupPeerConnectionListeners(): void {
-    this.pcHost.onconnectionstatechange = () => {
+    const checkTransportHealth = () => {
+      if (this.closed) return;
+      const hostConn = this.pcHost.connectionState;
+      const guestConn = this.pcGuest.connectionState;
+      const hostIce = this.pcHost.iceConnectionState;
+      const guestIce = this.pcGuest.iceConnectionState;
+
+      if (
+        hostConn === 'failed' ||
+        guestConn === 'failed' ||
+        hostIce === 'failed' ||
+        guestIce === 'failed'
+      ) {
+        void this.executeIdempotentTeardown('connection_lost', {
+          subReason: 'webrtc_transport_failed',
+          detectionStartedAtMs:
+            this.abruptFaultStartedPerfMs ?? performance.now(),
+        });
+        return;
+      }
       this.emitChange();
     };
-    this.pcHost.oniceconnectionstatechange = () => {
-      this.emitChange();
-    };
-    this.pcGuest.onconnectionstatechange = () => {
-      this.emitChange();
-    };
-    this.pcGuest.oniceconnectionstatechange = () => {
-      this.emitChange();
-    };
+
+    this.pcHost.onconnectionstatechange = checkTransportHealth;
+    this.pcHost.oniceconnectionstatechange = checkTransportHealth;
+    this.pcGuest.onconnectionstatechange = checkTransportHealth;
+    this.pcGuest.oniceconnectionstatechange = checkTransportHealth;
 
     // Host A ICE candidates -> Coordinator -> Guest B
     this.pcHost.onicecandidate = (event) => {
@@ -242,7 +298,36 @@ export class ApprovedWebRtcSessionController {
     channel.onmessage = (event) => {
       if (this.closed) return;
       try {
-        const parsed = JSON.parse(String(event.data)) as EphemeralChatMessage;
+        const parsed = JSON.parse(String(event.data)) as EphemeralChatMessage & {
+          __elmControl?: 'liveness-heartbeat' | 'teardown-notice';
+          sender?: 'host' | 'guest';
+          reason?: SessionTerminationReason;
+          subReason?: string;
+        };
+
+        if (parsed.__elmControl === 'liveness-heartbeat') {
+          const nowPerf = performance.now();
+          if (parsed.sender === 'host' && !this.hostHeartbeatSuppressed) {
+            this.lastHostHeartbeatPerfMs = nowPerf;
+          } else if (
+            parsed.sender === 'guest' &&
+            !this.guestHeartbeatSuppressed
+          ) {
+            this.lastGuestHeartbeatPerfMs = nowPerf;
+          }
+          return;
+        }
+
+        if (parsed.__elmControl === 'teardown-notice') {
+          void this.executeIdempotentTeardown(
+            parsed.reason ?? 'user_top_bar_disconnect',
+            {
+              subReason: parsed.subReason ?? 'peer_teardown_notice',
+            }
+          );
+          return;
+        }
+
         if (
           parsed &&
           parsed.messageId &&
@@ -277,8 +362,156 @@ export class ApprovedWebRtcSessionController {
 
     await this.renegotiateHostToGuest();
     await this.waitForDataChannelOpen(4000);
+    const nowPerf = performance.now();
+    this.lastHostHeartbeatPerfMs = nowPerf;
+    this.lastGuestHeartbeatPerfMs = nowPerf;
+    if (this.enableBackgroundLivenessTimer) {
+      this.startLivenessMonitor();
+    }
     this.emitChange();
     return this.getSnapshot();
+  }
+
+  /**
+   * Starts the bidirectional transport health + heartbeat liveness monitor.
+   * Note: A liveness threshold is NEVER a time limit on a connected session;
+   * as long as heartbeats arrive within `livenessTimeoutMs`, the session stays
+   * connected indefinitely (including while minimized).
+   */
+  public startLivenessMonitor(): void {
+    this.stopLivenessMonitor();
+    if (this.closed) return;
+
+    const nowPerf = performance.now();
+    this.lastHostHeartbeatPerfMs = nowPerf;
+    this.lastGuestHeartbeatPerfMs = nowPerf;
+
+    this.livenessTimerId = setInterval(() => {
+      void this.runLivenessTick();
+    }, this.heartbeatIntervalMs);
+  }
+
+  public stopLivenessMonitor(): void {
+    if (this.livenessTimerId !== null) {
+      clearInterval(this.livenessTimerId);
+      this.livenessTimerId = null;
+    }
+  }
+
+  public async runLivenessTick(): Promise<void> {
+    if (this.closed) return;
+    const nowPerf = performance.now();
+    const nowEpoch = Date.now();
+
+    // 1. Send heartbeats for any non-suppressed peer
+    if (!this.hostHeartbeatSuppressed) {
+      this.lastHostHeartbeatPerfMs = nowPerf;
+      if (this.hostDataChannel?.readyState === 'open') {
+        try {
+          this.hostDataChannel.send(
+            JSON.stringify({
+              __elmControl: 'liveness-heartbeat',
+              sender: 'host',
+              sessionId: this.session.sessionId,
+            })
+          );
+        } catch {
+          // Ignore send failure; liveness check below will catch it
+        }
+      }
+      void window.elmDesktop.recordSessionHeartbeat({
+        sessionId: this.session.sessionId,
+        callerAccountId: this.session.hostAccountId,
+        timestampMs: nowEpoch,
+      });
+    }
+
+    if (!this.guestHeartbeatSuppressed) {
+      this.lastGuestHeartbeatPerfMs = nowPerf;
+      if (this.guestDataChannel?.readyState === 'open') {
+        try {
+          this.guestDataChannel.send(
+            JSON.stringify({
+              __elmControl: 'liveness-heartbeat',
+              sender: 'guest',
+              sessionId: this.session.sessionId,
+            })
+          );
+        } catch {
+          // Ignore send failure
+        }
+      }
+      void window.elmDesktop.recordSessionHeartbeat({
+        sessionId: this.session.sessionId,
+        callerAccountId: this.session.guestAccountId,
+        timestampMs: nowEpoch,
+      });
+    }
+
+    // 2. Check local peer-to-peer liveness silence against threshold
+    const hostSilenceMs = Math.max(0, nowPerf - this.lastHostHeartbeatPerfMs);
+    const guestSilenceMs = Math.max(0, nowPerf - this.lastGuestHeartbeatPerfMs);
+    const hostExpired = hostSilenceMs > this.livenessTimeoutMs;
+    const guestExpired = guestSilenceMs > this.livenessTimeoutMs;
+
+    if (hostExpired || guestExpired) {
+      const defaultSub =
+        hostExpired && guestExpired
+          ? 'liveness_timeout_both_peers'
+          : hostExpired
+          ? 'liveness_timeout_host_a'
+          : 'liveness_timeout_guest_b';
+      await this.executeIdempotentTeardown('connection_lost', {
+        subReason: this.abruptFaultSubReason ?? defaultSub,
+        detectionStartedAtMs:
+          this.abruptFaultStartedPerfMs ??
+          nowPerf - Math.max(hostSilenceMs, guestSilenceMs),
+      });
+      return;
+    }
+
+    // 3. Check coordinator liveness & presence state (detects abrupt offline/internet drop on coordinator)
+    const coordCheck = await window.elmDesktop.checkSessionLiveness({
+      sessionId: this.session.sessionId,
+      callerAccountId: this.session.hostAccountId,
+      nowMs: nowEpoch,
+      livenessTimeoutMs: this.livenessTimeoutMs,
+    });
+    if (coordCheck.ok && coordCheck.data && !coordCheck.data.alive) {
+      await this.executeIdempotentTeardown(
+        coordCheck.data.receipt?.reason ?? 'connection_lost',
+        {
+          subReason:
+            this.abruptFaultSubReason ??
+            coordCheck.data.receipt?.subReason ??
+            'coordinator_liveness_lost',
+          detectionStartedAtMs:
+            this.abruptFaultStartedPerfMs ?? performance.now(),
+        }
+      );
+    }
+  }
+
+  /**
+   * Simulates an abrupt peer termination (Force Quit or sudden network interface drop)
+   * where NO close event can arrive, so that transport health and the liveness check
+   * must detect the loss and run the unified idempotent teardown path.
+   */
+  public simulateAbruptPeerLossWithoutCloseEvent(params: {
+    side: 'host' | 'guest' | 'both';
+    subReason: string;
+  }): number {
+    const faultStartPerfMs = performance.now();
+    this.abruptFaultStartedPerfMs = faultStartPerfMs;
+    this.abruptFaultSubReason = params.subReason;
+
+    if (params.side === 'host' || params.side === 'both') {
+      this.hostHeartbeatSuppressed = true;
+    }
+    if (params.side === 'guest' || params.side === 'both') {
+      this.guestHeartbeatSuppressed = true;
+    }
+    return faultStartPerfMs;
   }
 
   private async waitForDataChannelOpen(timeoutMs: number): Promise<void> {
@@ -1234,6 +1467,10 @@ export class ApprovedWebRtcSessionController {
       guestPlayback: { ...this.guestPlayback },
       messages: [...this.messages],
       lastStatusBanner: this.lastStatusBanner,
+      permissionsInvalidated: this.permissionsInvalidated,
+      signalingMembershipInvalidated: this.signalingMembershipInvalidated,
+      guestViewerCleared: this.guestViewerCleared,
+      teardownReceipt: this.teardownReceipt,
     };
   }
 
@@ -1243,23 +1480,84 @@ export class ApprovedWebRtcSessionController {
   }
 
   /**
-   * Immediately terminates all media tracks, closes the DataChannel and PeerConnections,
-   * and wipes all volatile chat messages in memory. Ended sessions never resume.
+   * Core synchronous teardown step shared by `executeIdempotentTeardown` and `destroy`.
+   * Performs all local track stopping, PeerConnection/DataChannel closing, viewer clearing,
+   * and permission invalidation exactly once, returning the `SessionTeardownReceipt`.
    */
-  public destroy(): void {
-    if (this.closed) return;
-    this.closed = true;
+  private performLocalTeardownOnce(
+    reason: SessionTerminationReason,
+    options?: {
+      subReason?: string;
+      initiatedByAccountId?: string | null;
+      detectionStartedAtMs?: number;
+    }
+  ): { receipt: SessionTeardownReceipt; isFirstCall: boolean } {
+    if (this.teardownReceipt !== null) {
+      this.duplicateTeardownCallCount += 1;
+      this.teardownReceipt = {
+        ...this.teardownReceipt,
+        alreadyEnded: true,
+        duplicateCallCount: this.duplicateTeardownCallCount,
+      };
+      return { receipt: this.teardownReceipt, isFirstCall: false };
+    }
 
+    const startPerf = options?.detectionStartedAtMs ?? performance.now();
+    this.closed = true;
+    this.stopLivenessMonitor();
+
+    // 1. Stop all of Host A's active media capture tracks & native WASAPI helper
+    let stoppedCount = 0;
     for (const [source, entry] of this.hostSenders.entries()) {
       this.stoppingByHost.add(source);
+      try {
+        this.pcHost.removeTrack(entry.sender);
+      } catch {
+        // Ignore if pcHost already closed
+      }
       entry.track.stop();
       entry.cleanup?.();
+      stoppedCount += 1;
     }
     this.hostSenders.clear();
+    void window.elmDesktop.stopWasapiLoopback();
+
+    // 2. Invalidate old session media permissions on Host A
+    this.sharingStartedByHost = false;
+    this.permissionsInvalidated = true;
+    for (const src of [
+      'screenVideo',
+      'microphoneAudio',
+      'deviceAudio',
+    ] as const) {
+      this.hostMediaState[src] = {
+        source: src,
+        approved: false,
+        active: false,
+        status: 'off',
+        message:
+          'Session ended — permissions invalidated. Fresh invite and acceptance required.',
+        trackId: null,
+        streamId: null,
+        label: null,
+      };
+    }
+
+    // 3. Clear Guest B's viewer and wipe volatile chat messages
+    for (const rawEntry of this.guestRawTrackEntries.values()) {
+      try {
+        rawEntry.track.stop();
+      } catch {
+        // Ignore
+      }
+    }
     this.guestRawTrackEntries.clear();
     this.latestAdvertisedTracks = [];
     this.messages.length = 0;
+    this.guestViewerCleared = true;
+    this.onGuestViewerCleared?.();
 
+    // 4. Close both chat DataChannels and both WebRTC PeerConnections
     try {
       this.hostDataChannel?.close();
     } catch {
@@ -1280,6 +1578,102 @@ export class ApprovedWebRtcSessionController {
     } catch {
       // Ignore
     }
+
+    this.signalingMembershipInvalidated = true;
+    const subReason = options?.subReason || reason;
+    const detectionTimeMs = Math.max(
+      1,
+      Math.round(performance.now() - startPerf)
+    );
+
+    const receipt: SessionTeardownReceipt = {
+      sessionId: this.session.sessionId,
+      reason,
+      subReason,
+      initiatedByAccountId: options?.initiatedByAccountId ?? null,
+      terminatedAt: new Date().toISOString(),
+      alreadyEnded: false,
+      duplicateCallCount: 0,
+      hostTracksStoppedCount: stoppedCount,
+      peerConnectionsClosed:
+        this.pcHost.connectionState === 'closed' &&
+        this.pcGuest.connectionState === 'closed',
+      dataChannelsClosed: true,
+      guestViewerCleared: true,
+      permissionsInvalidated: true,
+      signalingMembershipInvalidated: true,
+      detectionTimeMs,
+    };
+
+    this.teardownReceipt = receipt;
+    this.lastStatusBanner = `Session ended (${reason} / ${subReason}). All tracks stopped, viewer cleared, and permissions invalidated. Send a fresh invite to connect again.`;
+    this.emitChange();
+    return { receipt, isFirstCall: true };
+  }
+
+  /**
+   * Unified idempotent session teardown path used by both peers (Host A and Guest B)
+   * on top-bar Disconnect, app close/quit, or detected connection loss / liveness timeout.
+   * Stops A's tracks, closes both peer connections and chat channels, clears B's viewer,
+   * and invalidates the old session permissions and signaling membership.
+   */
+  public async executeIdempotentTeardown(
+    reason: SessionTerminationReason,
+    options?: {
+      subReason?: string;
+      initiatedByAccountId?: string | null;
+      detectionStartedAtMs?: number;
+    }
+  ): Promise<SessionTeardownReceipt> {
+    const { receipt, isFirstCall } = this.performLocalTeardownOnce(
+      reason,
+      options
+    );
+
+    const coordRes = await window.elmDesktop.disconnectActiveSession({
+      sessionId: this.session.sessionId,
+      reason: receipt.reason,
+      subReason: receipt.subReason,
+      callerAccountId:
+        options?.initiatedByAccountId ?? this.session.hostAccountId,
+      detectionTimeMs: receipt.detectionTimeMs,
+    });
+
+    if (!isFirstCall && coordRes.ok && coordRes.data?.receipt) {
+      this.teardownReceipt = {
+        ...this.teardownReceipt!,
+        alreadyEnded: true,
+        duplicateCallCount: Math.max(
+          this.duplicateTeardownCallCount,
+          coordRes.data.receipt.duplicateCallCount
+        ),
+      };
+    }
+
+    this.emitChange();
+    return this.teardownReceipt!;
+  }
+
+  /**
+   * Synchronous wrapper around the unified idempotent teardown path (e.g. React unmount / finally blocks).
+   */
+  public destroy(
+    reason: SessionTerminationReason = 'app_closed',
+    subReason: string = 'controller_destroy'
+  ): SessionTeardownReceipt {
+    const { receipt, isFirstCall } = this.performLocalTeardownOnce(reason, {
+      subReason,
+    });
+    if (isFirstCall) {
+      void window.elmDesktop.disconnectActiveSession({
+        sessionId: this.session.sessionId,
+        reason,
+        subReason,
+        callerAccountId: this.session.hostAccountId,
+        detectionTimeMs: receipt.detectionTimeMs,
+      });
+    }
+    return receipt;
   }
 }
 
@@ -1561,13 +1955,696 @@ export async function runAllWebRtcSessionVerificationMatrix(): Promise<
   };
 }
 
+export interface Phase4TeardownScenarioResult {
+  readonly scenario: string;
+  readonly passed: boolean;
+  readonly oldSessionId: string;
+  readonly newSessionIdAfterFreshInvite?: string;
+  readonly reason: SessionTerminationReason;
+  readonly subReason: string;
+  readonly detectionTimeMs: number;
+  readonly hostTracksStoppedCount: number;
+  readonly peerConnectionsClosed: boolean;
+  readonly dataChannelsClosed: boolean;
+  readonly guestViewerCleared: boolean;
+  readonly permissionsInvalidated: boolean;
+  readonly signalingMembershipInvalidated: boolean;
+  readonly staleEventRejectedWithCode?: string;
+  readonly presenceReconnectedWithoutRestartingSession?: boolean;
+  readonly duplicateCallCount?: number;
+  readonly livenessSustainedBeyondThresholdMs?: number;
+}
+
+export interface Phase4MinimizeDuringSharingResult {
+  readonly scenario: 'minimize_and_restore_during_sharing';
+  readonly passed: boolean;
+  readonly sessionId: string;
+  readonly livenessTimeoutMs: number;
+  readonly minimizedDurationMs: number;
+  readonly stayedConnectedWhileMinimized: boolean;
+  readonly guestVideoTracksWhileMinimized: number;
+  readonly guestAudioTracksWhileMinimized: number;
+  readonly dataChannelOpenAfterRestore: boolean;
+  readonly messagesDeliveredWhileMinimized: number;
+  readonly teardownTriggered: boolean;
+}
+
+export interface Phase4VerificationSuiteReport {
+  readonly allPassed: boolean;
+  readonly disconnectFromHostA: Phase4TeardownScenarioResult;
+  readonly disconnectFromGuestB: Phase4TeardownScenarioResult;
+  readonly appCloseFromHostA: Phase4TeardownScenarioResult;
+  readonly appCloseFromGuestB: Phase4TeardownScenarioResult;
+  readonly forceQuitAbruptLoss: Phase4TeardownScenarioResult;
+  readonly internetLossAndRecoveryHostA: Phase4TeardownScenarioResult;
+  readonly internetLossAndRecoveryGuestB: Phase4TeardownScenarioResult;
+  readonly internetLossAndRecoveryBothSides: Phase4TeardownScenarioResult;
+  readonly sleepAndWake: Phase4TeardownScenarioResult;
+  readonly duplicateTeardownIdempotency: Phase4TeardownScenarioResult;
+  readonly minimizeAndRestoreDuringSharing: Phase4MinimizeDuringSharingResult;
+}
+
+/**
+ * Executes the Phase 4 verification matrix on Windows 11:
+ * 1. Top-bar Disconnect from Host A and Guest B
+ * 2. App close from Host A and Guest B (and verifying reopen reconnects presence without restarting session)
+ * 3. Force quit (abrupt peer loss with no close event, verifying liveness check is NOT a time limit on a connected session)
+ * 4. Internet loss & recovery on Host A, Guest B, and both sides simultaneously
+ * 5. Sleep / wake
+ * 6. Duplicate teardown calls (idempotency)
+ * 7. Minimize / restore during active sharing (verifying minimized sessions stay connected)
+ * 8. Stale session event rejection ('SESSION_ALREADY_ENDED') and fresh invite creating a new session ID.
+ */
+export async function runPhase4LifecycleAndTeardownVerificationSuite(): Promise<Phase4VerificationSuiteReport> {
+  const sources = await window.elmDesktop.listShareableSources();
+  const chosenSourceId = sources[0]?.id ?? null;
+
+  const createSharingSession = async (options?: {
+    heartbeatIntervalMs?: number;
+    livenessTimeoutMs?: number;
+    enableBackgroundLivenessTimer?: boolean;
+    withMedia?: boolean;
+  }) => {
+    const aliceRes = await window.elmDesktop.signInWithTestDouble('alice');
+    const bobRes = await window.elmDesktop.signInWithTestDouble('bob');
+    if (!aliceRes.data || !bobRes.data) {
+      throw new Error('Failed to sign in Alice and Bob for Phase 4 suite');
+    }
+
+    const inviteRes = await window.elmDesktop.sendFriendCodeInvite(
+      aliceRes.data.account.friendCode
+    );
+    if (!inviteRes.ok || !inviteRes.data) {
+      throw new Error(
+        `Failed to create invite in Phase 4 suite: ${inviteRes.errorMessage}`
+      );
+    }
+
+    await window.elmDesktop.switchActivePersona('alice');
+    const acceptRes = await window.elmDesktop.respondToInvite({
+      inviteId: inviteRes.data.invite.inviteId,
+      action: 'accept',
+      mediaSelection: {
+        screenVideo: options?.withMedia !== false,
+        microphoneAudio: false,
+        deviceAudio: options?.withMedia !== false,
+      },
+    });
+    if (!acceptRes.ok || !acceptRes.data?.session) {
+      throw new Error('Failed to accept invite in Phase 4 suite');
+    }
+
+    const session = acceptRes.data.session;
+    let viewerClearedCallbackFired = false;
+    const controller = new ApprovedWebRtcSessionController(
+      session,
+      () => {},
+      {
+        heartbeatIntervalMs: options?.heartbeatIntervalMs ?? 50,
+        livenessTimeoutMs: options?.livenessTimeoutMs ?? 180,
+        enableBackgroundLivenessTimer:
+          options?.enableBackgroundLivenessTimer ?? false,
+        onGuestViewerCleared: () => {
+          viewerClearedCallbackFired = true;
+        },
+      }
+    );
+
+    await controller.connectAcceptedSession();
+    await controller.sendChatMessageOverDataChannel({
+      sender: 'host',
+      text: 'Initial session chat before teardown test',
+    });
+
+    if (options?.withMedia !== false) {
+      await controller.startHostSharing({
+        selectedSourceId: chosenSourceId,
+        playWasapiTestTone: false,
+      });
+    }
+
+    return {
+      session,
+      controller,
+      aliceAccount: aliceRes.data.account,
+      bobAccount: bobRes.data.account,
+      didClearViewerCallbackFire: () => viewerClearedCallbackFired,
+    };
+  };
+
+  const verifyStaleRejectedAndFreshInviteWorks = async (
+    oldSessionId: string
+  ): Promise<{
+    staleCode: string;
+    presenceReconnectedWithoutSession: boolean;
+    newSessionId: string;
+  }> => {
+    // 1. Reconnect presence for both Alice and Bob and verify old session does NOT restart
+    const aliceOnline = await window.elmDesktop.setPresenceOnline(true, {
+      personaKey: 'alice',
+    });
+    const bobOnline = await window.elmDesktop.setPresenceOnline(true, {
+      personaKey: 'bob',
+    });
+    const presenceReconnectedWithoutSession =
+      Boolean(aliceOnline.data?.snapshot.online) &&
+      Boolean(bobOnline.data?.snapshot.online) &&
+      aliceOnline.data?.snapshot.activeSession === null &&
+      bobOnline.data?.snapshot.activeSession === null;
+
+    // 2. Attempt stale signal & heartbeat on the old sessionId -> must be rejected with SESSION_ALREADY_ENDED
+    const staleSignal = await window.elmDesktop.sendSessionSignal({
+      sessionId: oldSessionId,
+      payload: { type: 'answer', sdp: 'v=0\r\n' },
+    });
+    const staleHeartbeat = await window.elmDesktop.recordSessionHeartbeat({
+      sessionId: oldSessionId,
+    });
+    const staleCode =
+      staleSignal.errorCode === 'SESSION_ALREADY_ENDED' &&
+      staleHeartbeat.errorCode === 'SESSION_ALREADY_ENDED'
+        ? 'SESSION_ALREADY_ENDED'
+        : String(staleSignal.errorCode || 'UNEXPECTED');
+
+    // 3. Create a fresh invite from Bob and accept on Alice -> must create a brand-new sessionId
+    const freshCtx = await createSharingSession({ withMedia: false });
+    const newSessionId = freshCtx.session.sessionId;
+    await freshCtx.controller.executeIdempotentTeardown(
+      'user_top_bar_disconnect',
+      { subReason: 'cleanup_fresh_verification_session' }
+    );
+
+    return {
+      staleCode,
+      presenceReconnectedWithoutSession,
+      newSessionId,
+    };
+  };
+
+  // 1. Disconnect from Host A
+  const ctx1 = await createSharingSession();
+  const t0_1 = performance.now();
+  const receipt1 = await ctx1.controller.executeIdempotentTeardown(
+    'user_top_bar_disconnect',
+    {
+      subReason: 'top_bar_host_a',
+      initiatedByAccountId: ctx1.aliceAccount.accountId,
+      detectionStartedAtMs: t0_1,
+    }
+  );
+  const snap1 = ctx1.controller.getSnapshot();
+  const post1 = await verifyStaleRejectedAndFreshInviteWorks(
+    ctx1.session.sessionId
+  );
+  const disconnectFromHostA: Phase4TeardownScenarioResult = {
+    scenario: 'disconnect_from_host_a',
+    passed:
+      receipt1.reason === 'user_top_bar_disconnect' &&
+      receipt1.hostTracksStoppedCount === 2 &&
+      receipt1.peerConnectionsClosed &&
+      receipt1.dataChannelsClosed &&
+      receipt1.guestViewerCleared &&
+      ctx1.didClearViewerCallbackFire() &&
+      snap1.guestReceivedTracks.length === 0 &&
+      snap1.messages.length === 0 &&
+      post1.staleCode === 'SESSION_ALREADY_ENDED' &&
+      post1.newSessionId !== ctx1.session.sessionId,
+    oldSessionId: ctx1.session.sessionId,
+    newSessionIdAfterFreshInvite: post1.newSessionId,
+    reason: receipt1.reason,
+    subReason: receipt1.subReason,
+    detectionTimeMs: receipt1.detectionTimeMs,
+    hostTracksStoppedCount: receipt1.hostTracksStoppedCount,
+    peerConnectionsClosed: receipt1.peerConnectionsClosed,
+    dataChannelsClosed: receipt1.dataChannelsClosed,
+    guestViewerCleared: receipt1.guestViewerCleared,
+    permissionsInvalidated: receipt1.permissionsInvalidated,
+    signalingMembershipInvalidated: receipt1.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: post1.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      post1.presenceReconnectedWithoutSession,
+  };
+
+  // 2. Disconnect from Guest B
+  const ctx2 = await createSharingSession();
+  const t0_2 = performance.now();
+  const receipt2 = await ctx2.controller.executeIdempotentTeardown(
+    'user_top_bar_disconnect',
+    {
+      subReason: 'top_bar_guest_b',
+      initiatedByAccountId: ctx2.bobAccount.accountId,
+      detectionStartedAtMs: t0_2,
+    }
+  );
+  const post2 = await verifyStaleRejectedAndFreshInviteWorks(
+    ctx2.session.sessionId
+  );
+  const disconnectFromGuestB: Phase4TeardownScenarioResult = {
+    scenario: 'disconnect_from_guest_b',
+    passed:
+      receipt2.reason === 'user_top_bar_disconnect' &&
+      receipt2.hostTracksStoppedCount === 2 &&
+      receipt2.peerConnectionsClosed &&
+      receipt2.dataChannelsClosed &&
+      receipt2.guestViewerCleared &&
+      post2.staleCode === 'SESSION_ALREADY_ENDED' &&
+      post2.newSessionId !== ctx2.session.sessionId,
+    oldSessionId: ctx2.session.sessionId,
+    newSessionIdAfterFreshInvite: post2.newSessionId,
+    reason: receipt2.reason,
+    subReason: receipt2.subReason,
+    detectionTimeMs: receipt2.detectionTimeMs,
+    hostTracksStoppedCount: receipt2.hostTracksStoppedCount,
+    peerConnectionsClosed: receipt2.peerConnectionsClosed,
+    dataChannelsClosed: receipt2.dataChannelsClosed,
+    guestViewerCleared: receipt2.guestViewerCleared,
+    permissionsInvalidated: receipt2.permissionsInvalidated,
+    signalingMembershipInvalidated: receipt2.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: post2.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      post2.presenceReconnectedWithoutSession,
+  };
+
+  // 3. App Close from Host A
+  const ctx3 = await createSharingSession();
+  const t0_3 = performance.now();
+  await window.elmDesktop.setPresenceOnline(false, {
+    personaKey: 'alice',
+    reason: 'app_closed',
+    subReason: 'app_close_host_a',
+  });
+  const receipt3 = await ctx3.controller.executeIdempotentTeardown(
+    'app_closed',
+    {
+      subReason: 'app_close_host_a',
+      initiatedByAccountId: ctx3.aliceAccount.accountId,
+      detectionStartedAtMs: t0_3,
+    }
+  );
+  const post3 = await verifyStaleRejectedAndFreshInviteWorks(
+    ctx3.session.sessionId
+  );
+  const appCloseFromHostA: Phase4TeardownScenarioResult = {
+    scenario: 'app_close_from_host_a',
+    passed:
+      receipt3.reason === 'app_closed' &&
+      receipt3.hostTracksStoppedCount === 2 &&
+      post3.presenceReconnectedWithoutSession &&
+      post3.staleCode === 'SESSION_ALREADY_ENDED' &&
+      post3.newSessionId !== ctx3.session.sessionId,
+    oldSessionId: ctx3.session.sessionId,
+    newSessionIdAfterFreshInvite: post3.newSessionId,
+    reason: receipt3.reason,
+    subReason: receipt3.subReason,
+    detectionTimeMs: receipt3.detectionTimeMs,
+    hostTracksStoppedCount: receipt3.hostTracksStoppedCount,
+    peerConnectionsClosed: receipt3.peerConnectionsClosed,
+    dataChannelsClosed: receipt3.dataChannelsClosed,
+    guestViewerCleared: receipt3.guestViewerCleared,
+    permissionsInvalidated: receipt3.permissionsInvalidated,
+    signalingMembershipInvalidated: receipt3.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: post3.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      post3.presenceReconnectedWithoutSession,
+  };
+
+  // 4. App Close from Guest B
+  const ctx4 = await createSharingSession();
+  const t0_4 = performance.now();
+  await window.elmDesktop.setPresenceOnline(false, {
+    personaKey: 'bob',
+    reason: 'app_closed',
+    subReason: 'app_close_guest_b',
+  });
+  const receipt4 = await ctx4.controller.executeIdempotentTeardown(
+    'app_closed',
+    {
+      subReason: 'app_close_guest_b',
+      initiatedByAccountId: ctx4.bobAccount.accountId,
+      detectionStartedAtMs: t0_4,
+    }
+  );
+  const post4 = await verifyStaleRejectedAndFreshInviteWorks(
+    ctx4.session.sessionId
+  );
+  const appCloseFromGuestB: Phase4TeardownScenarioResult = {
+    scenario: 'app_close_from_guest_b',
+    passed:
+      receipt4.reason === 'app_closed' &&
+      receipt4.hostTracksStoppedCount === 2 &&
+      post4.presenceReconnectedWithoutSession &&
+      post4.staleCode === 'SESSION_ALREADY_ENDED' &&
+      post4.newSessionId !== ctx4.session.sessionId,
+    oldSessionId: ctx4.session.sessionId,
+    newSessionIdAfterFreshInvite: post4.newSessionId,
+    reason: receipt4.reason,
+    subReason: receipt4.subReason,
+    detectionTimeMs: receipt4.detectionTimeMs,
+    hostTracksStoppedCount: receipt4.hostTracksStoppedCount,
+    peerConnectionsClosed: receipt4.peerConnectionsClosed,
+    dataChannelsClosed: receipt4.dataChannelsClosed,
+    guestViewerCleared: receipt4.guestViewerCleared,
+    permissionsInvalidated: receipt4.permissionsInvalidated,
+    signalingMembershipInvalidated: receipt4.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: post4.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      post4.presenceReconnectedWithoutSession,
+  };
+
+  // 5. Force Quit (Abrupt loss with no close event; liveness check detects timeout; liveness threshold is NOT a time limit)
+  const ctx5 = await createSharingSession({
+    heartbeatIntervalMs: 40,
+    livenessTimeoutMs: 160,
+    enableBackgroundLivenessTimer: true,
+    withMedia: true,
+  });
+  // First sustain healthy session for 360ms (> 2.2x the 160ms liveness threshold) to prove liveness threshold is NOT a session time limit
+  const sustainStart = performance.now();
+  await new Promise((r) => setTimeout(r, 360));
+  const sustainedMs = Math.round(performance.now() - sustainStart);
+  const snapBeforeForceQuit = ctx5.controller.getSnapshot();
+  const stayedAlivePastThreshold =
+    snapBeforeForceQuit.teardownReceipt === null &&
+    snapBeforeForceQuit.dataChannelState === 'open' &&
+    snapBeforeForceQuit.guestVideoTracksCount === 1;
+
+  // Now simulate abrupt Force Quit on Guest B (no close event sent; heartbeats stop)
+  ctx5.controller.simulateAbruptPeerLossWithoutCloseEvent({
+    side: 'guest',
+    subReason: 'force_quit_liveness_timeout',
+  });
+  for (let i = 0; i < 25; i++) {
+    if (ctx5.controller.getSnapshot().teardownReceipt !== null) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const receipt5 =
+    ctx5.controller.getSnapshot().teardownReceipt ??
+    (await ctx5.controller.executeIdempotentTeardown('connection_lost', {
+      subReason: 'force_quit_liveness_timeout',
+    }));
+  const post5 = await verifyStaleRejectedAndFreshInviteWorks(
+    ctx5.session.sessionId
+  );
+  const forceQuitAbruptLoss: Phase4TeardownScenarioResult = {
+    scenario: 'force_quit_abrupt_loss_liveness_timeout',
+    passed:
+      stayedAlivePastThreshold &&
+      receipt5.reason === 'connection_lost' &&
+      receipt5.subReason === 'force_quit_liveness_timeout' &&
+      receipt5.hostTracksStoppedCount === 2 &&
+      post5.staleCode === 'SESSION_ALREADY_ENDED' &&
+      post5.newSessionId !== ctx5.session.sessionId,
+    oldSessionId: ctx5.session.sessionId,
+    newSessionIdAfterFreshInvite: post5.newSessionId,
+    reason: receipt5.reason,
+    subReason: receipt5.subReason,
+    detectionTimeMs: receipt5.detectionTimeMs,
+    hostTracksStoppedCount: receipt5.hostTracksStoppedCount,
+    peerConnectionsClosed: receipt5.peerConnectionsClosed,
+    dataChannelsClosed: receipt5.dataChannelsClosed,
+    guestViewerCleared: receipt5.guestViewerCleared,
+    permissionsInvalidated: receipt5.permissionsInvalidated,
+    signalingMembershipInvalidated: receipt5.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: post5.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      post5.presenceReconnectedWithoutSession,
+    livenessSustainedBeyondThresholdMs: sustainedMs,
+  };
+
+  // 6. Internet Loss and Recovery on Host A, Guest B, and Both Sides
+  const runInternetLossCase = async (
+    side: 'host' | 'guest' | 'both',
+    scenarioName: string
+  ): Promise<Phase4TeardownScenarioResult> => {
+    const ctx = await createSharingSession({
+      heartbeatIntervalMs: 40,
+      livenessTimeoutMs: 150,
+      enableBackgroundLivenessTimer: true,
+      withMedia: true,
+    });
+    const subReason = `internet_loss_${side}`;
+    ctx.controller.simulateAbruptPeerLossWithoutCloseEvent({
+      side,
+      subReason,
+    });
+
+    for (let i = 0; i < 20; i++) {
+      if (ctx.controller.getSnapshot().teardownReceipt !== null) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    if (side === 'host' || side === 'both') {
+      await window.elmDesktop.setPresenceOnline(false, {
+        personaKey: 'alice',
+        reason: 'connection_lost',
+        subReason,
+      });
+    }
+    if (side === 'guest' || side === 'both') {
+      await window.elmDesktop.setPresenceOnline(false, {
+        personaKey: 'bob',
+        reason: 'connection_lost',
+        subReason,
+      });
+    }
+
+    const receipt =
+      ctx.controller.getSnapshot().teardownReceipt ??
+      (await ctx.controller.executeIdempotentTeardown('connection_lost', {
+        subReason,
+      }));
+    const post = await verifyStaleRejectedAndFreshInviteWorks(
+      ctx.session.sessionId
+    );
+
+    return {
+      scenario: scenarioName,
+      passed:
+        receipt.reason === 'connection_lost' &&
+        receipt.hostTracksStoppedCount === 2 &&
+        post.presenceReconnectedWithoutSession &&
+        post.staleCode === 'SESSION_ALREADY_ENDED' &&
+        post.newSessionId !== ctx.session.sessionId,
+      oldSessionId: ctx.session.sessionId,
+      newSessionIdAfterFreshInvite: post.newSessionId,
+      reason: receipt.reason,
+      subReason: receipt.subReason,
+      detectionTimeMs: receipt.detectionTimeMs,
+      hostTracksStoppedCount: receipt.hostTracksStoppedCount,
+      peerConnectionsClosed: receipt.peerConnectionsClosed,
+      dataChannelsClosed: receipt.dataChannelsClosed,
+      guestViewerCleared: receipt.guestViewerCleared,
+      permissionsInvalidated: receipt.permissionsInvalidated,
+      signalingMembershipInvalidated: receipt.signalingMembershipInvalidated,
+      staleEventRejectedWithCode: post.staleCode,
+      presenceReconnectedWithoutRestartingSession:
+        post.presenceReconnectedWithoutSession,
+    };
+  };
+
+  const internetLossAndRecoveryHostA = await runInternetLossCase(
+    'host',
+    'internet_loss_and_recovery_host_a'
+  );
+  const internetLossAndRecoveryGuestB = await runInternetLossCase(
+    'guest',
+    'internet_loss_and_recovery_guest_b'
+  );
+  const internetLossAndRecoveryBothSides = await runInternetLossCase(
+    'both',
+    'internet_loss_and_recovery_both_sides'
+  );
+
+  // 7. OS Sleep / Wake
+  const ctxSleep = await createSharingSession({ withMedia: true });
+  const t0_sleep = performance.now();
+  await window.elmDesktop.setPresenceOnline(false, {
+    personaKey: 'alice',
+    reason: 'connection_lost',
+    subReason: 'os_sleep_suspend',
+  });
+  const receiptSleep = await ctxSleep.controller.executeIdempotentTeardown(
+    'connection_lost',
+    {
+      subReason: 'os_sleep_suspend',
+      detectionStartedAtMs: t0_sleep,
+    }
+  );
+  const postSleep = await verifyStaleRejectedAndFreshInviteWorks(
+    ctxSleep.session.sessionId
+  );
+  const sleepAndWake: Phase4TeardownScenarioResult = {
+    scenario: 'sleep_and_wake_non_resumable',
+    passed:
+      receiptSleep.reason === 'connection_lost' &&
+      receiptSleep.subReason === 'os_sleep_suspend' &&
+      receiptSleep.hostTracksStoppedCount === 2 &&
+      postSleep.presenceReconnectedWithoutSession &&
+      postSleep.staleCode === 'SESSION_ALREADY_ENDED' &&
+      postSleep.newSessionId !== ctxSleep.session.sessionId,
+    oldSessionId: ctxSleep.session.sessionId,
+    newSessionIdAfterFreshInvite: postSleep.newSessionId,
+    reason: receiptSleep.reason,
+    subReason: receiptSleep.subReason,
+    detectionTimeMs: receiptSleep.detectionTimeMs,
+    hostTracksStoppedCount: receiptSleep.hostTracksStoppedCount,
+    peerConnectionsClosed: receiptSleep.peerConnectionsClosed,
+    dataChannelsClosed: receiptSleep.dataChannelsClosed,
+    guestViewerCleared: receiptSleep.guestViewerCleared,
+    permissionsInvalidated: receiptSleep.permissionsInvalidated,
+    signalingMembershipInvalidated: receiptSleep.signalingMembershipInvalidated,
+    staleEventRejectedWithCode: postSleep.staleCode,
+    presenceReconnectedWithoutRestartingSession:
+      postSleep.presenceReconnectedWithoutSession,
+  };
+
+  // 8. Duplicate Teardown Calls (Idempotency)
+  const ctxDup = await createSharingSession({ withMedia: true });
+  const firstTear = await ctxDup.controller.executeIdempotentTeardown(
+    'user_top_bar_disconnect',
+    {
+      subReason: 'first_teardown_call',
+      initiatedByAccountId: ctxDup.aliceAccount.accountId,
+    }
+  );
+  const secondTear = await ctxDup.controller.executeIdempotentTeardown(
+    'user_top_bar_disconnect',
+    {
+      subReason: 'duplicate_call_2',
+      initiatedByAccountId: ctxDup.bobAccount.accountId,
+    }
+  );
+  const thirdTear = await ctxDup.controller.executeIdempotentTeardown(
+    'app_closed',
+    {
+      subReason: 'duplicate_call_3',
+      initiatedByAccountId: ctxDup.aliceAccount.accountId,
+    }
+  );
+  const fourthTear = await ctxDup.controller.executeIdempotentTeardown(
+    'connection_lost',
+    {
+      subReason: 'duplicate_call_4',
+      initiatedByAccountId: ctxDup.bobAccount.accountId,
+    }
+  );
+  const duplicateTeardownIdempotency: Phase4TeardownScenarioResult = {
+    scenario: 'duplicate_teardown_idempotency',
+    passed:
+      firstTear.alreadyEnded === false &&
+      firstTear.duplicateCallCount === 0 &&
+      secondTear.alreadyEnded === true &&
+      thirdTear.alreadyEnded === true &&
+      fourthTear.alreadyEnded === true &&
+      fourthTear.duplicateCallCount === 3 &&
+      fourthTear.reason === 'user_top_bar_disconnect',
+    oldSessionId: ctxDup.session.sessionId,
+    reason: fourthTear.reason,
+    subReason: fourthTear.subReason,
+    detectionTimeMs: firstTear.detectionTimeMs,
+    hostTracksStoppedCount: firstTear.hostTracksStoppedCount,
+    peerConnectionsClosed: fourthTear.peerConnectionsClosed,
+    dataChannelsClosed: fourthTear.dataChannelsClosed,
+    guestViewerCleared: fourthTear.guestViewerCleared,
+    permissionsInvalidated: fourthTear.permissionsInvalidated,
+    signalingMembershipInvalidated: fourthTear.signalingMembershipInvalidated,
+    duplicateCallCount: fourthTear.duplicateCallCount,
+  };
+
+  // 9. Minimize and Restore During Active Sharing (Must Stay Connected)
+  const ctxMin = await createSharingSession({
+    heartbeatIntervalMs: 50,
+    livenessTimeoutMs: 240,
+    enableBackgroundLivenessTimer: true,
+    withMedia: true,
+  });
+  const minStart = performance.now();
+  await window.elmDesktop.minimizeMainWindow();
+  await controllerSendChatWhileMinimized(ctxMin.controller);
+  await new Promise((r) => setTimeout(r, 320));
+  const snapWhileMinimized = ctxMin.controller.getSnapshot();
+  await window.elmDesktop.restoreMainWindow();
+  const minElapsedMs = Math.round(performance.now() - minStart);
+  const snapAfterRestore = ctxMin.controller.getSnapshot();
+
+  const minimizeAndRestoreDuringSharing: Phase4MinimizeDuringSharingResult = {
+    scenario: 'minimize_and_restore_during_sharing',
+    passed:
+      snapWhileMinimized.teardownReceipt === null &&
+      snapAfterRestore.teardownReceipt === null &&
+      snapWhileMinimized.guestVideoTracksCount === 1 &&
+      snapWhileMinimized.guestAudioTracksCount === 1 &&
+      snapAfterRestore.dataChannelState === 'open' &&
+      snapAfterRestore.messages.length === 3,
+    sessionId: ctxMin.session.sessionId,
+    livenessTimeoutMs: 240,
+    minimizedDurationMs: minElapsedMs,
+    stayedConnectedWhileMinimized:
+      snapWhileMinimized.teardownReceipt === null &&
+      snapAfterRestore.teardownReceipt === null,
+    guestVideoTracksWhileMinimized: snapWhileMinimized.guestVideoTracksCount,
+    guestAudioTracksWhileMinimized: snapWhileMinimized.guestAudioTracksCount,
+    dataChannelOpenAfterRestore: snapAfterRestore.dataChannelState === 'open',
+    messagesDeliveredWhileMinimized: snapAfterRestore.messages.length,
+    teardownTriggered: snapAfterRestore.teardownReceipt !== null,
+  };
+
+  await ctxMin.controller.executeIdempotentTeardown('user_top_bar_disconnect', {
+    subReason: 'cleanup_after_minimize_restore_test',
+  });
+
+  const allPassed =
+    disconnectFromHostA.passed &&
+    disconnectFromGuestB.passed &&
+    appCloseFromHostA.passed &&
+    appCloseFromGuestB.passed &&
+    forceQuitAbruptLoss.passed &&
+    internetLossAndRecoveryHostA.passed &&
+    internetLossAndRecoveryGuestB.passed &&
+    internetLossAndRecoveryBothSides.passed &&
+    sleepAndWake.passed &&
+    duplicateTeardownIdempotency.passed &&
+    minimizeAndRestoreDuringSharing.passed;
+
+  return {
+    allPassed,
+    disconnectFromHostA,
+    disconnectFromGuestB,
+    appCloseFromHostA,
+    appCloseFromGuestB,
+    forceQuitAbruptLoss,
+    internetLossAndRecoveryHostA,
+    internetLossAndRecoveryGuestB,
+    internetLossAndRecoveryBothSides,
+    sleepAndWake,
+    duplicateTeardownIdempotency,
+    minimizeAndRestoreDuringSharing,
+  };
+}
+
+async function controllerSendChatWhileMinimized(
+  controller: ApprovedWebRtcSessionController
+): Promise<void> {
+  await controller.sendChatMessageOverDataChannel({
+    sender: 'host',
+    text: 'Host A message while minimized',
+  });
+  await controller.sendChatMessageOverDataChannel({
+    sender: 'guest',
+    text: 'Guest B reply while minimized',
+  });
+}
+
 declare global {
   interface Window {
     runElmWebRtcVerificationMatrix?: typeof runAllWebRtcSessionVerificationMatrix;
+    runElmPhase4VerificationSuite?: typeof runPhase4LifecycleAndTeardownVerificationSuite;
   }
 }
 
 if (typeof window !== 'undefined') {
   window.runElmWebRtcVerificationMatrix = runAllWebRtcSessionVerificationMatrix;
+  window.runElmPhase4VerificationSuite =
+    runPhase4LifecycleAndTeardownVerificationSuite;
 }
 

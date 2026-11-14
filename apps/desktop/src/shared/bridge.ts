@@ -10,6 +10,8 @@ import type {
   PresenceStateSnapshot,
   ProtocolErrorCode,
   SessionLifecycleState,
+  SessionTeardownReceipt,
+  SessionTerminationReason,
   WebRtcSignalEnvelope,
   WebRtcSignalPayload,
 } from '@elm/protocol';
@@ -34,7 +36,7 @@ export interface DesktopRuntimeMetadata {
   readonly protocolVersion: string;
   readonly platform: string;
   readonly windowRole: DesktopWindowRole;
-  readonly phase: 'Phase 3 — WebRTC Media (A -> B) & Separate DataChannel Chat Window';
+  readonly phase: 'Phase 4 — Idempotent Session Teardown, Liveness Detection & Non-Resumable Sessions';
   readonly defaultMediaSelection: HostMediaSelection;
   readonly initialSessionState: SessionLifecycleState;
   readonly securityPosture: DesktopSecurityPosture;
@@ -152,8 +154,18 @@ export interface ElmDesktopBridge {
   getPresenceSnapshot: () => Promise<
     ApiActionResult<{ snapshot: PresenceStateSnapshot }>
   >;
-  setPresenceOnline: (online: boolean) => Promise<
-    ApiActionResult<{ snapshot: PresenceStateSnapshot }>
+  setPresenceOnline: (
+    online: boolean,
+    options?: {
+      personaKey?: string;
+      reason?: SessionTerminationReason;
+      subReason?: string;
+    }
+  ) => Promise<
+    ApiActionResult<{
+      snapshot: PresenceStateSnapshot;
+      receipt?: SessionTeardownReceipt | null;
+    }>
   >;
   sendFriendCodeInvite: (friendCode: string) => Promise<
     ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
@@ -169,8 +181,51 @@ export interface ElmDesktopBridge {
       snapshot: PresenceStateSnapshot;
     }>
   >;
-  disconnectActiveSession: (sessionId?: string) => Promise<
-    ApiActionResult<{ disconnected: boolean; snapshot: PresenceStateSnapshot }>
+  disconnectActiveSession: (
+    sessionIdOrOptions?:
+      | string
+      | {
+          sessionId?: string;
+          reason?: SessionTerminationReason;
+          subReason?: string;
+          callerAccountId?: string;
+          detectionTimeMs?: number;
+        }
+  ) => Promise<
+    ApiActionResult<{
+      disconnected: boolean;
+      alreadyEnded: boolean;
+      receipt: SessionTeardownReceipt;
+      snapshot: PresenceStateSnapshot;
+    }>
+  >;
+  recordSessionHeartbeat: (params: {
+    sessionId: string;
+    callerAccountId?: string;
+    timestampMs?: number;
+  }) => Promise<
+    ApiActionResult<{
+      ok: boolean;
+      sessionId: string;
+      heartbeatAtMs: number;
+    }>
+  >;
+  checkSessionLiveness: (params: {
+    sessionId: string;
+    callerAccountId?: string;
+    nowMs?: number;
+    livenessTimeoutMs?: number;
+  }) => Promise<
+    ApiActionResult<{
+      alive: boolean;
+      alreadyEnded: boolean;
+      sessionId: string;
+      hostHeartbeatAgeMs: number;
+      guestHeartbeatAgeMs: number;
+      livenessTimeoutMs: number;
+      sessionDurationMs: number;
+      receipt?: SessionTeardownReceipt;
+    }>
   >;
 
   // Phase 3: Approved Session WebRTC Signaling & Separate Chat Window Sync
