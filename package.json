@@ -1,6 +1,6 @@
 {
   "name": "elm-anydesk",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Consent-based 1:1 screen sharing, optional audio, and private chat for Windows 11",
   "workspaces": [
@@ -8,12 +8,16 @@
     "apps/*"
   ],
   "scripts": {
+    "lint": "node scripts/lint-policy.mjs && npm run typecheck",
     "typecheck": "npm run build --workspace=@elm/protocol && npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspace=@elm/protocol && npm run build --workspace=@elm/api && npm run build --workspace=@elm/desktop",
+    "build:installer": "npm run build --workspace=@elm/protocol && npm run build --workspace=@elm/desktop && npm run build:installer --workspace=@elm/desktop",
     "test": "npm run build --workspace=@elm/protocol && npm run test --workspaces --if-present",
     "dev:desktop": "npm run dev --workspace=@elm/desktop",
     "start:desktop": "npm run start --workspace=@elm/desktop",
-    "dev:api": "npm run dev --workspace=@elm/api"
+    "dev:api": "npm run dev --workspace=@elm/api",
+    "deploy:api:staging": "npm run deploy:staging --workspace=@elm/api",
+    "rollback:api:staging": "npm run rollback:staging --workspace=@elm/api"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

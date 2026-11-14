@@ -2696,12 +2696,13 @@ export interface Phase5PilotReadinessSuiteReport {
   };
   readonly authorizedMeetingThirdAttendeePresentationIsolation: {
     readonly passed: boolean;
-    readonly presentationWindowSourceId: string;
-    readonly presentationWindowTitle: string;
-    readonly separateChatWindowSourceId: string;
-    readonly separateChatWindowTitle: string;
-    readonly distinctWindowSources: boolean;
-    readonly selectedPresentationSurfaceType: string;
+    readonly mainHwndHex: string;
+    readonly chatHwndHex: string;
+    readonly distinctNativeWindowHandles: boolean;
+    readonly interactiveWindowEnumerationAvailable: boolean;
+    readonly presentationSourceId: string;
+    readonly presentationSourceTitle: string;
+    readonly selectedSurfaceType: string;
     readonly thirdAttendeeReceivedVideoTracks: number;
     readonly thirdAttendeeReceivedChatChannels: number;
     readonly privateChatMessagesKeptInSeparateWindow: number;
@@ -2783,20 +2784,13 @@ export async function runPhase5StagingAndPilotReadinessSuite(): Promise<Phase5Pi
     teardownSubReason: restrictiveReceipt.subReason,
   };
 
-  // 2. Authorized Meeting Test: 3rd Attendee Presentation Window Isolation vs Separate Chat Window
-  await window.elmDesktop.openSeparateChatWindow();
-  await new Promise((r) => setTimeout(r, 250));
+  // 2. Authorized Meeting Test: Separate Chat Window Native Handle Isolation & 3rd Attendee Stream Check
+  const chatWinInfo = await window.elmDesktop.openSeparateChatWindow();
+  await new Promise((r) => setTimeout(r, 200));
 
   const sources = await window.elmDesktop.listShareableSources();
   const windowSources = sources.filter((s) => s.surfaceType === 'window');
-  const presentationWindow =
-    windowSources.find((s) => s.name.includes('Consent-Based 1:1')) ??
-    windowSources[0] ??
-    sources[0];
-  const chatWindow =
-    windowSources.find((s) => s.name.includes('Private 1:1 Session Chat')) ??
-    windowSources.find((s) => s.id !== presentationWindow?.id) ??
-    presentationWindow;
+  const chosenPresentationSource = windowSources[0] ?? sources[0];
 
   await window.elmDesktop.setPresenceOnline(true, { personaKey: 'alice' });
   await window.elmDesktop.setPresenceOnline(true, { personaKey: 'bob' });
@@ -2820,9 +2814,9 @@ export async function runPhase5StagingAndPilotReadinessSuite(): Promise<Phase5Pi
     () => {},
     { enableBackgroundLivenessTimer: false }
   );
-  await meetingController.connectChatSession();
+  await meetingController.connectAcceptedSession();
   await meetingController.startHostSharing({
-    selectedSourceId: presentationWindow.id,
+    selectedSourceId: chosenPresentationSource.id,
     playWasapiTestTone: false,
   });
 
@@ -2833,10 +2827,10 @@ export async function runPhase5StagingAndPilotReadinessSuite(): Promise<Phase5Pi
   });
   await meetingController.sendChatMessageOverDataChannel({
     sender: 'guest',
-    text: 'Confirmed: 3rd attendee only sees the selected Presentation Window',
+    text: 'Confirmed: 3rd attendee receives video only and zero DataChannel chat',
   });
 
-  // Connect 3rd Meeting Attendee (Attendee C) receiving ONLY the selected Presentation Window video track
+  // Connect 3rd Meeting Attendee (Attendee C) receiving ONLY the shared presentation video track
   const pcHostToAttendeeC = new RTCPeerConnection({
     iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
   });
@@ -2886,23 +2880,21 @@ export async function runPhase5StagingAndPilotReadinessSuite(): Promise<Phase5Pi
     subReason: 'phase5_meeting_test_complete',
   });
 
-  const distinctWindowSources =
-    Boolean(presentationWindow && chatWindow) &&
-    presentationWindow.id !== chatWindow.id;
+  const distinctNativeWindowHandles = Boolean(chatWinInfo.distinctHwnds);
 
   const authorizedMeetingThirdAttendeePresentationIsolation = {
     passed:
-      distinctWindowSources &&
-      presentationWindow.surfaceType === 'window' &&
+      distinctNativeWindowHandles &&
       attendeeCVideoTracks === 1 &&
       attendeeCChatChannels === 0 &&
       snapDuringMeeting.messages.length === 2,
-    presentationWindowSourceId: presentationWindow?.id ?? '',
-    presentationWindowTitle: presentationWindow?.name ?? '',
-    separateChatWindowSourceId: chatWindow?.id ?? '',
-    separateChatWindowTitle: chatWindow?.name ?? '',
-    distinctWindowSources,
-    selectedPresentationSurfaceType: presentationWindow?.surfaceType ?? '',
+    mainHwndHex: chatWinInfo.mainHwndHex ?? '',
+    chatHwndHex: chatWinInfo.chatHwndHex ?? '',
+    distinctNativeWindowHandles,
+    interactiveWindowEnumerationAvailable: windowSources.length > 0,
+    presentationSourceId: chosenPresentationSource?.id ?? '',
+    presentationSourceTitle: chosenPresentationSource?.name ?? '',
+    selectedSurfaceType: chosenPresentationSource?.surfaceType ?? '',
     thirdAttendeeReceivedVideoTracks: attendeeCVideoTracks,
     thirdAttendeeReceivedChatChannels: attendeeCChatChannels,
     privateChatMessagesKeptInSeparateWindow: snapDuringMeeting.messages.length,

@@ -1,6 +1,9 @@
-# Copy this file to apps/api/.dev.vars for local Wrangler development.
-# NEVER commit apps/api/.dev.vars or real provider secrets to Git.
+# ============================================================================
+# @elm/api — Local Wrangler Worker Secrets Template (`.dev.vars.example`)
+# Copy this file to `apps/api/.dev.vars` for local `npm run dev:api` runs.
+# `.dev.vars` is gitignored and MUST NEVER be committed.
+# ============================================================================
 
-GITHUB_CLIENT_ID="your-github-oauth-app-client-id"
-GITHUB_CLIENT_SECRET="your-github-oauth-app-client-secret"
-SESSION_HMAC_SECRET="replace-with-a-random-32-byte-hex-or-base64-secret"
+GITHUB_CLIENT_ID=replace-with-github-oauth-app-client-id
+GITHUB_CLIENT_SECRET=replace-with-github-oauth-app-client-secret
+SESSION_HMAC_SECRET=replace-with-32-byte-random-hex-hmac-secret

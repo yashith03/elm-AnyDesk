@@ -149,7 +149,8 @@ function buildPilotDownloadManifest(env: Env): PilotDownloadManifest {
       env.INSTALLER_DOWNLOAD_URL?.trim() ||
       '/releases/Elm-AnyDesk-Setup-0.5.0-x64.exe',
     installerSha256:
-      env.INSTALLER_SHA256?.trim() || 'SEE_RELEASE_MANIFEST_SHA256',
+      env.INSTALLER_SHA256?.trim() ||
+      '8e10060b69b58a97543036de78a7ef74772d66595f8409221730cac7516b7553',
     autoUpgradeEnabled: false,
     stunOnlyPilot: true,
     turnEnabled: false,

@@ -8,7 +8,7 @@
     "INSTALLER_VERSION": "0.5.0-phase5",
     "INSTALLER_FILENAME": "Elm-AnyDesk-Setup-0.5.0-x64.exe",
     "INSTALLER_DOWNLOAD_URL": "/releases/Elm-AnyDesk-Setup-0.5.0-x64.exe",
-    "INSTALLER_SHA256": "SEE_RELEASE_MANIFEST_SHA256",
+    "INSTALLER_SHA256": "8e10060b69b58a97543036de78a7ef74772d66595f8409221730cac7516b7553",
     "PILOT_STUN_ONLY": "true",
     "AUTO_UPDATE_ENABLED": "false"
   },
@@ -42,7 +42,7 @@
         "INSTALLER_VERSION": "0.5.0-phase5",
         "INSTALLER_FILENAME": "Elm-AnyDesk-Setup-0.5.0-x64.exe",
         "INSTALLER_DOWNLOAD_URL": "https://elm-anydesk-api-staging.workers.dev/download",
-        "INSTALLER_SHA256": "SEE_RELEASE_MANIFEST_SHA256",
+        "INSTALLER_SHA256": "8e10060b69b58a97543036de78a7ef74772d66595f8409221730cac7516b7553",
         "PILOT_STUN_ONLY": "true",
         "AUTO_UPDATE_ENABLED": "false"
       },

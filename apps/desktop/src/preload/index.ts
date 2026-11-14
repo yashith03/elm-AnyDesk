@@ -18,7 +18,7 @@ import type {
 const bridge: ElmDesktopBridge = Object.freeze({
   getRuntimeMetadata: (): Promise<DesktopRuntimeMetadata> =>
     ipcRenderer.invoke('elm:get-runtime-metadata'),
-  openSeparateChatWindow: (): Promise<{ opened: boolean }> =>
+  openSeparateChatWindow: () =>
     ipcRenderer.invoke('elm:open-separate-chat-window'),
   copyTextToClipboard: (text: string): Promise<{ copied: boolean }> =>
     ipcRenderer.invoke('elm:copy-text-to-clipboard', text),

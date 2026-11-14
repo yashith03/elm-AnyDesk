@@ -1,14 +1,16 @@
 {
   "name": "@elm/desktop",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "main": "dist/main/index.cjs",
   "scripts": {
+    "lint": "npm run typecheck",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "build:node": "node scripts/build-electron.mjs",
     "build:renderer": "vite build",
     "build": "npm run build:node && npm run build:renderer",
+    "build:installer": "npm run build && node scripts/build-installer.mjs",
     "dev": "npm run build && electron .",
     "start": "electron ."
   },

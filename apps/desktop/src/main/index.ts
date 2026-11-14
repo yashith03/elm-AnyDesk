@@ -272,8 +272,21 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('elm:open-separate-chat-window', async () => {
-    await createOrFocusChatWindow();
-    return { opened: true };
+    const cWin = await createOrFocusChatWindow();
+    const mainHwndHex =
+      mainWindow && !mainWindow.isDestroyed()
+        ? `0x${mainWindow.getNativeWindowHandle().toString('hex')}`
+        : '';
+    const chatHwndHex = !cWin.isDestroyed()
+      ? `0x${cWin.getNativeWindowHandle().toString('hex')}`
+      : '';
+    return {
+      opened: true,
+      mainHwndHex,
+      chatHwndHex,
+      distinctHwnds:
+        Boolean(mainHwndHex && chatHwndHex) && mainHwndHex !== chatHwndHex,
+    };
   });
 
   ipcMain.handle('elm:copy-text-to-clipboard', (_event, text: string) => {

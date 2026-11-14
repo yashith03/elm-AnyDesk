@@ -134,7 +134,12 @@ export interface VolatileSessionUiState {
  */
 export interface ElmDesktopBridge {
   getRuntimeMetadata: () => Promise<DesktopRuntimeMetadata>;
-  openSeparateChatWindow: () => Promise<{ opened: boolean }>;
+  openSeparateChatWindow: () => Promise<{
+    opened: boolean;
+    mainHwndHex?: string;
+    chatHwndHex?: string;
+    distinctHwnds?: boolean;
+  }>;
   copyTextToClipboard: (text: string) => Promise<{ copied: boolean }>;
 
   // Phase 2: Authentication, Friend Codes, Presence & Invites
