@@ -179,3 +179,127 @@ export async function findAccountById(
 
   return row ? mapRowToProfile(row) : null;
 }
+
+interface DeviceCredentialRow {
+  device_id: string;
+  secret_hash: string;
+  account_id: string;
+  created_at: string;
+}
+
+async function hashDeviceSecret(secret: string): Promise<string> {
+  const bytes = new TextEncoder().encode(secret);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export async function ensureDeviceCredentialsSchema(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS device_credentials (
+        device_id TEXT PRIMARY KEY,
+        secret_hash TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`
+    )
+    .run();
+}
+
+/**
+ * Idempotent anonymous device registration backed by the single `accounts` registry.
+ * - Protects the installation via a SHA-256 hash of `deviceSecret`.
+ * - Assigns a unique `ELM-XXXX-XXXX` device code with `UNIQUE(friend_code)` collision retry.
+ * - Retrying registration with the same `(deviceId, deviceSecret)` returns the exact same code.
+ */
+export async function registerAnonymousDevice(
+  db: D1Database,
+  params: { deviceId: string; deviceSecret: string },
+  codeGenerator: () => string = () => generateRandomFriendCode()
+): Promise<
+  | { account: AccountProfile; alreadyRegistered: boolean }
+  | { error: 'INVALID_DEVICE_CREDENTIAL' | 'DEVICE_SECRET_MISMATCH' }
+> {
+  const deviceId = params.deviceId.trim();
+  const deviceSecret = params.deviceSecret.trim();
+  if (deviceId.length < 16 || deviceSecret.length < 32) {
+    return { error: 'INVALID_DEVICE_CREDENTIAL' };
+  }
+
+  await ensureAccountsSchema(db);
+  await ensureDeviceCredentialsSchema(db);
+
+  const secretHash = await hashDeviceSecret(deviceSecret);
+  const existingCred = await db
+    .prepare(
+      `SELECT device_id, secret_hash, account_id, created_at
+       FROM device_credentials
+       WHERE device_id = ?1`
+    )
+    .bind(deviceId)
+    .first<DeviceCredentialRow>();
+
+  if (existingCred) {
+    if (!timingSafeEqualHex(existingCred.secret_hash, secretHash)) {
+      return { error: 'DEVICE_SECRET_MISMATCH' };
+    }
+    const account = await ensureAccountWithPermanentFriendCode(
+      db,
+      {
+        provider: 'device',
+        providerSubject: deviceId,
+        displayName: 'Elm Device',
+      },
+      codeGenerator
+    );
+    return { account, alreadyRegistered: true };
+  }
+
+  const account = await ensureAccountWithPermanentFriendCode(
+    db,
+    {
+      provider: 'device',
+      providerSubject: deviceId,
+      displayName: 'Elm Device',
+    },
+    codeGenerator
+  );
+
+  const now = new Date().toISOString();
+  try {
+    await db
+      .prepare(
+        `INSERT INTO device_credentials (device_id, secret_hash, account_id, created_at)
+         VALUES (?1, ?2, ?3, ?4)`
+      )
+      .bind(deviceId, secretHash, account.accountId, now)
+      .run();
+  } catch {
+    // Handle concurrent first-time registration race idempotently
+    const raced = await db
+      .prepare(
+        `SELECT device_id, secret_hash, account_id, created_at
+         FROM device_credentials
+         WHERE device_id = ?1`
+      )
+      .bind(deviceId)
+      .first<DeviceCredentialRow>();
+    if (!raced || !timingSafeEqualHex(raced.secret_hash, secretHash)) {
+      return { error: 'DEVICE_SECRET_MISMATCH' };
+    }
+    return { account, alreadyRegistered: true };
+  }
+
+  return { account, alreadyRegistered: false };
+}

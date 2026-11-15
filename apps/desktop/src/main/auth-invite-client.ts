@@ -2,6 +2,7 @@ import { app, safeStorage, shell } from 'electron';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_LIVENESS_CONFIG,
@@ -9,10 +10,13 @@ import {
   normalizeFriendCode,
   sanitizeHostMediaSelection,
   type AccountProfile,
+  type AnonymousDeviceRegistrationResponse,
   type ApprovedSessionSummary,
+  type DeviceRegistrationStatus,
   type HostMediaSelection,
   type InviteStatus,
   type InviteSummary,
+  type LocalDeviceProfile,
   type PresenceStateSnapshot,
   type ProtocolErrorCode,
   type SessionTeardownReceipt,
@@ -20,12 +24,19 @@ import {
   type WebRtcSignalEnvelope,
   type WebRtcSignalPayload,
 } from '@elm/protocol';
-import type { ApiActionResult } from '../shared/bridge';
+import type { ApiActionResult, DeviceSetupState } from '../shared/bridge';
 
 interface PersistedDesktopState {
   activeToken: string | null;
   activePersonaKey: string | null;
   tokensByPersona: Record<string, string>;
+  localProfile: LocalDeviceProfile | null;
+  deviceCredential: {
+    deviceId: string;
+    deviceSecret: string;
+  } | null;
+  registeredAccount: AccountProfile | null;
+  registeredToken: string | null;
   d1Accounts: Array<{
     account_id: string;
     provider: string;
@@ -71,6 +82,8 @@ const TEST_DOUBLE_PERSONAS: Record<
   },
 };
 
+declare const __ELM_DEFAULT_API_BASE_URL__: string | undefined;
+
 export class DesktopAuthAndInviteController {
   public readonly apiBaseUrl: string;
   private readonly stateFilePath: string;
@@ -97,11 +110,19 @@ export class DesktopAuthAndInviteController {
   private readonly sessionSignals = new Map<string, WebRtcSignalEnvelope[]>();
   private signalSequence = 0;
   private readonly tokenToAccountId = new Map<string, string>();
+  private registrationStatus: DeviceRegistrationStatus = 'unregistered';
+  private registrationMessage: string | null = null;
 
   constructor(apiBaseUrl?: string) {
+    const buildTimeDefaultApiBaseUrl =
+      typeof __ELM_DEFAULT_API_BASE_URL__ === 'string' &&
+      __ELM_DEFAULT_API_BASE_URL__.trim().length > 0
+        ? __ELM_DEFAULT_API_BASE_URL__.trim()
+        : '';
     this.apiBaseUrl =
       apiBaseUrl ||
       process.env.ELM_API_BASE_URL ||
+      buildTimeDefaultApiBaseUrl ||
       'http://127.0.0.1:8787';
     this.stateFilePath = path.join(
       app.getPath('userData'),
@@ -134,6 +155,10 @@ export class DesktopAuthAndInviteController {
           activeToken,
           activePersonaKey: parsed.activePersonaKey ?? null,
           tokensByPersona: parsed.tokensByPersona ?? {},
+          localProfile: parsed.localProfile ?? null,
+          deviceCredential: parsed.deviceCredential ?? null,
+          registeredAccount: parsed.registeredAccount ?? null,
+          registeredToken: parsed.registeredToken ?? null,
           d1Accounts: Array.isArray(parsed.d1Accounts)
             ? parsed.d1Accounts
             : [],
@@ -147,6 +172,10 @@ export class DesktopAuthAndInviteController {
       activeToken: null,
       activePersonaKey: null,
       tokensByPersona: {},
+      localProfile: null,
+      deviceCredential: null,
+      registeredAccount: null,
+      registeredToken: null,
       d1Accounts: [],
     };
   }
@@ -159,6 +188,10 @@ export class DesktopAuthAndInviteController {
       const payloadToSave: Record<string, unknown> = {
         activePersonaKey: this.persisted.activePersonaKey,
         tokensByPersona: this.persisted.tokensByPersona,
+        localProfile: this.persisted.localProfile,
+        deviceCredential: this.persisted.deviceCredential,
+        registeredAccount: this.persisted.registeredAccount,
+        registeredToken: this.persisted.registeredToken,
         d1Accounts: this.persisted.d1Accounts,
       };
 
@@ -197,6 +230,13 @@ export class DesktopAuthAndInviteController {
       if (acct) {
         this.tokenToAccountId.set(token, acct.account_id);
       }
+    }
+    if (this.persisted.registeredAccount && this.persisted.registeredToken) {
+      this.tokenToAccountId.set(
+        this.persisted.registeredToken,
+        this.persisted.registeredAccount.accountId
+      );
+      this.registrationStatus = 'registered';
     }
   }
 
@@ -485,6 +525,316 @@ export class DesktopAuthAndInviteController {
     return this.signInWithTestDouble(personaKey);
   }
 
+  private ensureDeviceCredential(): { deviceId: string; deviceSecret: string } {
+    if (!this.persisted.deviceCredential) {
+      this.persisted.deviceCredential = {
+        deviceId: crypto.randomUUID(),
+        deviceSecret: crypto.randomBytes(32).toString('hex'),
+      };
+      this.savePersistedState();
+    }
+    return this.persisted.deviceCredential;
+  }
+
+  private isRemoteDeviceMode(): boolean {
+    return (
+      Boolean(this.persisted.registeredAccount) &&
+      this.persisted.activePersonaKey === null
+    );
+  }
+
+  private async fetchRemoteApi<T>(
+    pathname: string,
+    init?: RequestInit,
+    retriedAuth = false
+  ): Promise<ApiActionResult<T>> {
+    if (!this.persisted.registeredToken) {
+      await this.registerDeviceWithBackend();
+    }
+    const token = this.persisted.registeredToken;
+    if (!token) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage:
+          this.registrationMessage ||
+          'Device is not registered with the Elm registry.',
+      };
+    }
+
+    try {
+      const response = await fetch(`${this.apiBaseUrl}${pathname}`, {
+        ...init,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          ...(init?.headers ?? {}),
+        },
+      });
+
+      if (response.status === 401 && !retriedAuth) {
+        await this.registerDeviceWithBackend();
+        if (this.persisted.registeredToken) {
+          return this.fetchRemoteApi<T>(pathname, init, true);
+        }
+      }
+
+      const payload = (await response.json().catch(() => ({}))) as T & {
+        error?: string;
+        message?: string;
+      };
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          status: response.status,
+          errorCode: payload.error ?? `HTTP_${response.status}`,
+          errorMessage:
+            payload.message ??
+            `Request failed with status ${response.status}.`,
+        };
+      }
+
+      return {
+        ok: true,
+        status: response.status,
+        data: payload,
+      };
+    } catch {
+      return {
+        ok: false,
+        status: 503,
+        errorCode: 'NETWORK_ERROR',
+        errorMessage:
+          'Could not reach the Elm signaling server. Check your internet connection.',
+      };
+    }
+  }
+
+  private buildDeviceSetupState(): DeviceSetupState {
+    return {
+      profileCompleted: Boolean(this.persisted.localProfile?.name),
+      localProfile: this.persisted.localProfile,
+      registrationStatus: this.registrationStatus,
+      registrationMessage: this.registrationMessage,
+      registeredAccount: this.persisted.registeredAccount,
+    };
+  }
+
+  private async registerDeviceWithBackend(): Promise<DeviceSetupState> {
+    const credential = this.ensureDeviceCredential();
+    this.registrationStatus = 'registering';
+    this.registrationMessage = 'Registering device with Elm registry...';
+
+    try {
+      const response = await fetch(`${this.apiBaseUrl}/devices/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: credential.deviceId,
+          deviceSecret: credential.deviceSecret,
+        }),
+      });
+
+      if (!response.ok) {
+        const errPayload = (await response.json().catch(() => ({}))) as {
+          message?: string;
+        };
+        this.registrationStatus = response.status >= 500 ? 'offline' : 'error';
+        this.registrationMessage =
+          errPayload.message ||
+          `Device registration failed (HTTP ${response.status}). Check your connection and retry.`;
+        return this.buildDeviceSetupState();
+      }
+
+      const payload =
+        (await response.json()) as AnonymousDeviceRegistrationResponse;
+      const localDisplayName =
+        this.persisted.localProfile?.name ||
+        payload.account.displayName ||
+        os.hostname() ||
+        'Elm Device';
+
+      const accountWithLocalDisplay: AccountProfile = {
+        ...payload.account,
+        displayName: localDisplayName,
+      };
+
+      this.persisted.registeredAccount = accountWithLocalDisplay;
+      this.persisted.registeredToken = payload.token;
+      this.persisted.activeToken = payload.token;
+      this.persisted.activePersonaKey = null;
+
+      const existingIdx = this.persisted.d1Accounts.findIndex(
+        (a) => a.account_id === accountWithLocalDisplay.accountId
+      );
+      const row = {
+        account_id: accountWithLocalDisplay.accountId,
+        provider: accountWithLocalDisplay.provider,
+        provider_subject: accountWithLocalDisplay.providerSubject,
+        display_name: localDisplayName,
+        friend_code: accountWithLocalDisplay.friendCode,
+        created_at: accountWithLocalDisplay.createdAt,
+        updated_at: new Date().toISOString(),
+      };
+      if (existingIdx >= 0) {
+        this.persisted.d1Accounts[existingIdx] = row;
+      } else {
+        this.persisted.d1Accounts.push(row);
+      }
+
+      this.tokenToAccountId.set(
+        payload.token,
+        accountWithLocalDisplay.accountId
+      );
+      this.onlineAccounts.add(accountWithLocalDisplay.accountId);
+      this.registrationStatus = 'registered';
+      this.registrationMessage = null;
+      this.savePersistedState();
+
+      return this.buildDeviceSetupState();
+    } catch {
+      this.registrationStatus = 'offline';
+      this.registrationMessage =
+        'Offline before registration: could not reach the Elm registry to assign a device code. Check your connection and click Retry.';
+      return this.buildDeviceSetupState();
+    }
+  }
+
+  public async getDeviceSetupState(): Promise<ApiActionResult<DeviceSetupState>> {
+    if (
+      this.persisted.localProfile?.name &&
+      !this.persisted.registeredAccount
+    ) {
+      await this.registerDeviceWithBackend();
+    } else if (this.persisted.registeredAccount) {
+      this.registrationStatus = 'registered';
+      this.registrationMessage = null;
+      this.onlineAccounts.add(this.persisted.registeredAccount.accountId);
+      if (this.isRemoteDeviceMode()) {
+        void this.fetchRemoteApi<{ snapshot: PresenceStateSnapshot }>(
+          '/presence/connect',
+          { method: 'POST', body: '{}' }
+        );
+      }
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: this.buildDeviceSetupState(),
+    };
+  }
+
+  public async saveLocalProfile(input: {
+    name: string;
+    email?: string;
+    phone?: string;
+  }): Promise<ApiActionResult<DeviceSetupState>> {
+    const cleanedName = String(input.name ?? '').trim().slice(0, 60);
+    if (!cleanedName) {
+      return {
+        ok: false,
+        status: 400,
+        errorCode: 'INVALID_REQUEST',
+        errorMessage: 'Name is required to set up this device.',
+      };
+    }
+
+    this.persisted.localProfile = {
+      name: cleanedName,
+      email: String(input.email ?? '').trim().slice(0, 120),
+      phone: String(input.phone ?? '').trim().slice(0, 40),
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (this.persisted.registeredAccount) {
+      this.persisted.registeredAccount = {
+        ...this.persisted.registeredAccount,
+        displayName: cleanedName,
+      };
+      const row = this.persisted.d1Accounts.find(
+        (a) => a.account_id === this.persisted.registeredAccount?.accountId
+      );
+      if (row) {
+        row.display_name = cleanedName;
+        row.updated_at = new Date().toISOString();
+      }
+    }
+
+    this.savePersistedState();
+
+    if (!this.persisted.registeredAccount) {
+      await this.registerDeviceWithBackend();
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: this.buildDeviceSetupState(),
+    };
+  }
+
+  public async retryDeviceRegistration(): Promise<
+    ApiActionResult<DeviceSetupState>
+  > {
+    const state = await this.registerDeviceWithBackend();
+    return {
+      ok: true,
+      status: 200,
+      data: state,
+    };
+  }
+
+  public updateLocalDisplayName(displayName: string): ApiActionResult<{
+    account: AccountProfile;
+    snapshot: PresenceStateSnapshot;
+  }> {
+    const current = this.getCurrentAccount();
+    if (!current) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Device is not registered yet.',
+      };
+    }
+    const cleaned = displayName.trim().slice(0, 60) || current.displayName;
+    if (this.persisted.localProfile) {
+      this.persisted.localProfile = {
+        ...this.persisted.localProfile,
+        name: cleaned,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    if (this.persisted.registeredAccount) {
+      this.persisted.registeredAccount = {
+        ...this.persisted.registeredAccount,
+        displayName: cleaned,
+      };
+    }
+    const row = this.persisted.d1Accounts.find(
+      (a) => a.account_id === current.accountId
+    );
+    if (row) {
+      row.display_name = cleaned;
+      row.updated_at = new Date().toISOString();
+    }
+    this.savePersistedState();
+    const updated = row
+      ? this.mapAccountRow(row)
+      : { ...current, displayName: cleaned };
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        account: updated,
+        snapshot: this.buildSnapshot(updated),
+      },
+    };
+  }
+
   public getStoredAuthSession(): ApiActionResult<{
     account: AccountProfile;
     snapshot: PresenceStateSnapshot;
@@ -493,12 +843,12 @@ export class DesktopAuthAndInviteController {
     if (!account) {
       return {
         ok: false,
-        status: 401,
+        status: 404,
         errorCode: 'UNAUTHORIZED',
-        errorMessage: 'Not signed in.',
+        errorMessage:
+          this.registrationMessage ?? 'Device has not been registered yet.',
       };
     }
-
     this.onlineAccounts.add(account.accountId);
     return {
       ok: true,
@@ -723,9 +1073,17 @@ export class DesktopAuthAndInviteController {
     return null;
   }
 
-  public getPresenceSnapshot(): ApiActionResult<{
-    snapshot: PresenceStateSnapshot;
-  }> {
+  public async getPresenceSnapshot(): Promise<
+    ApiActionResult<{
+      snapshot: PresenceStateSnapshot;
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{ snapshot: PresenceStateSnapshot }>(
+        '/presence/state',
+        { method: 'GET' }
+      );
+    }
     const account = this.getCurrentAccount();
     if (!account) {
       return {
@@ -744,17 +1102,69 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public setPresenceOnline(
+  public async setPresenceOnline(
     online: boolean,
     options?: {
       personaKey?: string;
       reason?: SessionTerminationReason;
       subReason?: string;
     }
-  ): ApiActionResult<{
-    snapshot: PresenceStateSnapshot;
-    receipt?: SessionTeardownReceipt | null;
-  }> {
+  ): Promise<
+    ApiActionResult<{
+      snapshot: PresenceStateSnapshot;
+      receipt?: SessionTeardownReceipt | null;
+    }>
+  > {
+    if (!options?.personaKey && this.isRemoteDeviceMode()) {
+      if (online) {
+        return this.fetchRemoteApi<{
+          snapshot: PresenceStateSnapshot;
+          receipt?: SessionTeardownReceipt | null;
+        }>('/presence/connect', {
+          method: 'POST',
+          body: '{}',
+        });
+      }
+      const disc = await this.fetchRemoteApi<{
+        ok: boolean;
+        receipt?: SessionTeardownReceipt | null;
+      }>('/presence/disconnect', {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: options?.reason ?? 'connection_lost',
+          subReason:
+            options?.subReason ?? options?.reason ?? 'connection_lost',
+        }),
+      });
+      if (!disc.ok) {
+        return {
+          ok: false,
+          status: disc.status,
+          errorCode: disc.errorCode,
+          errorMessage: disc.errorMessage,
+        };
+      }
+      const stateRes = await this.fetchRemoteApi<{
+        snapshot: PresenceStateSnapshot;
+      }>('/presence/state', { method: 'GET' });
+      if (!stateRes.ok || !stateRes.data) {
+        return {
+          ok: false,
+          status: stateRes.status,
+          errorCode: stateRes.errorCode,
+          errorMessage: stateRes.errorMessage,
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          snapshot: stateRes.data.snapshot,
+          receipt: disc.data?.receipt ?? null,
+        },
+      };
+    }
+
     const targetAccount = options?.personaKey
       ? this.getAccountByPersona(options.personaKey)
       : this.getCurrentAccount();
@@ -791,9 +1201,20 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public sendFriendCodeInvite(
+  public async sendFriendCodeInvite(
     rawFriendCode: string
-  ): ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }> {
+  ): Promise<
+    ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{
+        invite: InviteSummary;
+        snapshot: PresenceStateSnapshot;
+      }>('/invites', {
+        method: 'POST',
+        body: JSON.stringify({ friendCode: rawFriendCode }),
+      });
+    }
     const requester = this.getCurrentAccount();
     if (!requester) {
       return {
@@ -920,15 +1341,30 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public respondToInvite(params: {
+  public async respondToInvite(params: {
     inviteId: string;
     action: 'accept' | 'decline';
     mediaSelection?: HostMediaSelection;
-  }): ApiActionResult<{
-    invite: InviteSummary;
-    session: ApprovedSessionSummary | null;
-    snapshot: PresenceStateSnapshot;
-  }> {
+  }): Promise<
+    ApiActionResult<{
+      invite: InviteSummary;
+      session: ApprovedSessionSummary | null;
+      snapshot: PresenceStateSnapshot;
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{
+        invite: InviteSummary;
+        session: ApprovedSessionSummary | null;
+        snapshot: PresenceStateSnapshot;
+      }>(`/invites/${encodeURIComponent(params.inviteId)}/respond`, {
+        method: 'POST',
+        body: JSON.stringify({
+          action: params.action,
+          mediaSelection: params.mediaSelection,
+        }),
+      });
+    }
     const responder = this.getCurrentAccount();
     if (!responder) {
       return {
@@ -1059,7 +1495,7 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public disconnectActiveSession(
+  public async disconnectActiveSession(
     sessionIdOrOptions?:
       | string
       | {
@@ -1069,17 +1505,36 @@ export class DesktopAuthAndInviteController {
           callerAccountId?: string;
           detectionTimeMs?: number;
         }
-  ): ApiActionResult<{
-    disconnected: boolean;
-    alreadyEnded: boolean;
-    receipt: SessionTeardownReceipt;
-    snapshot: PresenceStateSnapshot;
-  }> {
-    const current = this.getCurrentAccount();
+  ): Promise<
+    ApiActionResult<{
+      disconnected: boolean;
+      alreadyEnded: boolean;
+      receipt: SessionTeardownReceipt;
+      snapshot: PresenceStateSnapshot;
+    }>
+  > {
     const opts =
       typeof sessionIdOrOptions === 'string'
         ? { sessionId: sessionIdOrOptions }
         : sessionIdOrOptions ?? {};
+
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{
+        disconnected: boolean;
+        alreadyEnded: boolean;
+        receipt: SessionTeardownReceipt;
+        snapshot: PresenceStateSnapshot;
+      }>('/sessions/disconnect', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: opts.sessionId,
+          reason: opts.reason ?? 'user_top_bar_disconnect',
+          subReason: opts.subReason,
+        }),
+      });
+    }
+
+    const current = this.getCurrentAccount();
 
     const callerAccountId = opts.callerAccountId || current?.accountId;
     if (!callerAccountId) {
@@ -1323,15 +1778,31 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public sendSessionSignal(params: {
+  public async sendSessionSignal(params: {
     sessionId: string;
     senderAccountId?: string;
     payload: WebRtcSignalPayload;
-  }): ApiActionResult<{
-    admitted: boolean;
-    session: ApprovedSessionSummary;
-    envelope: WebRtcSignalEnvelope;
-  }> {
+  }): Promise<
+    ApiActionResult<{
+      admitted: boolean;
+      session: ApprovedSessionSummary;
+      envelope: WebRtcSignalEnvelope;
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{
+        admitted: boolean;
+        session: ApprovedSessionSummary;
+        envelope: WebRtcSignalEnvelope;
+      }>('/sessions/signal', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: params.sessionId,
+          signalType: params.payload.type,
+          payload: params.payload,
+        }),
+      });
+    }
     const current = this.getCurrentAccount();
     const senderId = params.senderAccountId || current?.accountId;
     if (!senderId) {
@@ -1439,14 +1910,28 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public pollSessionSignals(params: {
+  public async pollSessionSignals(params: {
     sessionId: string;
     receiverAccountId?: string;
     afterSeq: number;
-  }): ApiActionResult<{
-    session: ApprovedSessionSummary;
-    signals: readonly WebRtcSignalEnvelope[];
-  }> {
+  }): Promise<
+    ApiActionResult<{
+      session: ApprovedSessionSummary;
+      signals: readonly WebRtcSignalEnvelope[];
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      const qs = new URLSearchParams({
+        sessionId: params.sessionId,
+        afterSeq: String(params.afterSeq ?? 0),
+      });
+      return this.fetchRemoteApi<{
+        session: ApprovedSessionSummary;
+        signals: readonly WebRtcSignalEnvelope[];
+      }>(`/sessions/signals?${qs.toString()}`, {
+        method: 'GET',
+      });
+    }
     const current = this.getCurrentAccount();
     const receiverId = params.receiverAccountId || current?.accountId;
     if (!receiverId) {

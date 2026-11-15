@@ -42,9 +42,15 @@ function buildWasapiNativeHelper() {
 }
 
 async function buildEntry(entryRelPath, outDirRelPath) {
+  const defaultApiBaseUrl =
+    process.env.ELM_API_BASE_URL?.trim() ||
+    'https://elm-anydesk-api-staging.elm-api.workers.dev';
   await build({
     configFile: false,
     root: rootDir,
+    define: {
+      __ELM_DEFAULT_API_BASE_URL__: JSON.stringify(defaultApiBaseUrl),
+    },
     build: {
       ssr: path.resolve(rootDir, entryRelPath),
       outDir: path.resolve(rootDir, outDirRelPath),

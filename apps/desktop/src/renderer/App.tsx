@@ -8,11 +8,27 @@ import type {
 } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
+  DeviceSetupState,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
 import type { ThemeMode, ThemeStateSnapshot } from '../shared/theme';
+import {
+  MAX_CHAT_IMAGE_BYTES,
+  SUPPORTED_CHAT_IMAGE_MIME_TYPES,
+  validateChatImageAttachment,
+} from '../shared/chat-attachments';
+import { formatIncomingRequestHeadline } from '../shared/incoming-request';
+import {
+  buildBackgroundRgba,
+  clampFloatingPanelLayout,
+  DEFAULT_FLOATING_PANEL_APPEARANCE,
+  DEFAULT_FLOATING_PANEL_LAYOUT,
+  sanitizeFloatingPanelAppearance,
+  type FloatingPanelAppearance,
+  type FloatingPanelLayout,
+} from '../shared/floating-panel';
 import {
   ApprovedWebRtcSessionController,
   runAllWebRtcSessionVerificationMatrix,
@@ -112,7 +128,36 @@ export function App(): React.ReactElement {
     ShareableSourceDescriptor[]
   >([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
-  const [playWasapiTestTone, setPlayWasapiTestTone] = useState<boolean>(true);
+  const [playWasapiTestTone] = useState<boolean>(false);
+
+  // On-device first-launch profile & anonymous device registration state
+  const [deviceSetupState, setDeviceSetupState] =
+    useState<DeviceSetupState | null>(null);
+  const [setupNameInput, setSetupNameInput] = useState<string>('');
+  const [setupEmailInput, setSetupEmailInput] = useState<string>('');
+  const [setupPhoneInput, setSetupPhoneInput] = useState<string>('');
+  const [savingProfile, setSavingProfile] = useState<boolean>(false);
+  const [retryingRegistration, setRetryingRegistration] =
+    useState<boolean>(false);
+  const [showSettingsPanel, setShowSettingsPanel] = useState<boolean>(false);
+
+  // On-device in-memory-only session chat/image drafts
+  const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(
+    null
+  );
+  const [pendingImageName, setPendingImageName] = useState<string | null>(null);
+  const [pendingImageMimeType, setPendingImageMimeType] = useState<
+    string | null
+  >(null);
+  const [pendingImageByteLength, setPendingImageByteLength] =
+    useState<number>(0);
+  const [chatAttachmentError, setChatAttachmentError] = useState<string | null>(
+    null
+  );
+  const [inMemoryImagesByMsgId, setInMemoryImagesByMsgId] = useState<
+    Record<string, string>
+  >({});
+  const imageFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // WebRTC Session State (Main Window)
   const webrtcControllerRef = useRef<ApprovedWebRtcSessionController | null>(
@@ -140,11 +185,6 @@ export function App(): React.ReactElement {
   const [optInDiagnostics, setOptInDiagnostics] = useState<boolean>(false);
   const [liveDiagnostics, setLiveDiagnostics] =
     useState<WebRtcReadabilityDiagnostics | null>(null);
-  const [lastResizeInfo, setLastResizeInfo] = useState<{
-    timestamp: number;
-    width: number;
-    height: number;
-  } | null>(null);
   const [renderedDimensions, setRenderedDimensions] = useState<{
     clientWidth: number;
     clientHeight: number;
@@ -153,6 +193,36 @@ export function App(): React.ReactElement {
     dpr: number;
   } | null>(null);
   const viewerContainerRef = useRef<HTMLDivElement | null>(null);
+  const viewerViewportRef = useRef<HTMLDivElement | null>(null);
+  const presentationVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // One Floating Panel over Active Viewer
+  const [floatingChatOpen, setFloatingChatOpen] = useState<boolean>(false);
+  const [floatingSettingsOpen, setFloatingSettingsOpen] =
+    useState<boolean>(false);
+  const [panelAppearance, setPanelAppearance] =
+    useState<FloatingPanelAppearance>(() => {
+      try {
+        const raw = localStorage.getItem('elm-floating-panel-appearance');
+        if (raw) {
+          return sanitizeFloatingPanelAppearance(
+            JSON.parse(raw) as Partial<FloatingPanelAppearance>
+          );
+        }
+      } catch {
+        // Ignore storage errors
+      }
+      return DEFAULT_FLOATING_PANEL_APPEARANCE;
+    });
+  const [panelLayout, setPanelLayout] = useState<FloatingPanelLayout>(
+    DEFAULT_FLOATING_PANEL_LAYOUT
+  );
+  const panelInteractionRef = useRef<{
+    kind: 'drag' | 'resize-width' | 'resize-both';
+    startX: number;
+    startY: number;
+    initial: FloatingPanelLayout;
+  } | null>(null);
 
   // 5-Combination Verification Matrix state
   const [matrixReport, setMatrixReport] = useState<Record<
@@ -176,6 +246,13 @@ export function App(): React.ReactElement {
     if (guestDeviceAudioRef.current) {
       guestDeviceAudioRef.current.srcObject = null;
     }
+    setChatInputText('');
+    setPendingImageDataUrl(null);
+    setPendingImageName(null);
+    setPendingImageMimeType(null);
+    setPendingImageByteLength(0);
+    setChatAttachmentError(null);
+    setInMemoryImagesByMsgId({});
   };
 
   // Prototype drawer state
@@ -206,12 +283,13 @@ export function App(): React.ReactElement {
     let mounted = true;
     Promise.all([
       window.elmDesktop.getRuntimeMetadata(),
+      window.elmDesktop.getDeviceSetupState(),
       window.elmDesktop.getStoredAuthSession(),
       window.elmDesktop.getVolatileSessionUiState(),
       window.elmDesktop.getTaskbarDwmTelemetry().catch(() => null),
       window.elmDesktop.getThemeState().catch(() => null),
     ])
-      .then(([meta, storedRes, volatileState, dwm, initialTheme]) => {
+      .then(([meta, setupRes, storedRes, volatileState, dwm, initialTheme]) => {
         if (!mounted) return;
         setMetadata(meta);
         setVolatileChatState(volatileState);
@@ -219,6 +297,17 @@ export function App(): React.ReactElement {
         if (initialTheme) {
           setThemeState(initialTheme);
           applyThemeToDom(initialTheme.mode);
+        }
+        if (setupRes.ok && setupRes.data) {
+          setDeviceSetupState(setupRes.data);
+          if (setupRes.data.localProfile) {
+            setSetupNameInput(setupRes.data.localProfile.name);
+            setSetupEmailInput(setupRes.data.localProfile.email);
+            setSetupPhoneInput(setupRes.data.localProfile.phone);
+          }
+          if (setupRes.data.registeredAccount) {
+            setAccount(setupRes.data.registeredAccount);
+          }
         }
         if (storedRes.ok && storedRes.data) {
           setAccount(storedRes.data.account);
@@ -261,6 +350,35 @@ export function App(): React.ReactElement {
     applyThemeToDom(updated.mode);
   };
 
+  // Background remote presence/invite/session polling in Main Window for real registered devices
+  useEffect(() => {
+    if (
+      !metadata ||
+      metadata.windowRole !== 'main' ||
+      !account ||
+      account.provider === 'test-double'
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const res = await window.elmDesktop.getPresenceSnapshot();
+      if (!cancelled && res.ok && res.data) {
+        setSnapshot(res.data.snapshot);
+      }
+    };
+
+    const timer = setInterval(() => {
+      void poll();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [metadata?.windowRole, account?.accountId, account?.provider]);
+
   // Manage ApprovedWebRtcSessionController lifecycle in Main Window when an approved session starts/ends
   const activeSessionId = snapshot?.activeSession?.sessionId ?? null;
   useEffect(() => {
@@ -272,6 +390,9 @@ export function App(): React.ReactElement {
         webrtcControllerRef.current.destroy();
         webrtcControllerRef.current = null;
       }
+      clearGuestMediaElements();
+      setFloatingChatOpen(false);
+      setFloatingSettingsOpen(false);
       setWebrtcSnap(null);
       void window.elmDesktop.syncVolatileSessionUiState({
         session: null,
@@ -295,6 +416,10 @@ export function App(): React.ReactElement {
       webrtcControllerRef.current.destroy();
     }
 
+    const isRemoteSession = account?.provider !== 'test-double';
+    const localRole: 'host' | 'guest' =
+      account?.accountId === currentSession.guestAccountId ? 'guest' : 'host';
+
     const controller = new ApprovedWebRtcSessionController(
       currentSession,
       (nextSnap) => {
@@ -309,6 +434,8 @@ export function App(): React.ReactElement {
         });
       },
       {
+        mode: isRemoteSession ? 'remote' : 'loopback',
+        localRole,
         onGuestViewerCleared: clearGuestMediaElements,
       }
     );
@@ -449,6 +576,186 @@ export function App(): React.ReactElement {
     };
   }, [optInDiagnostics, activeSessionId]);
 
+  // Persist floating panel appearance preferences locally
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'elm-floating-panel-appearance',
+        JSON.stringify(panelAppearance)
+      );
+    } catch {
+      // Ignore storage errors
+    }
+  }, [panelAppearance]);
+
+  // Keep floating panel reachable when window shrinks, display scale changes, or sidebars toggle
+  useEffect(() => {
+    const clampToViewport = () => {
+      const vp = viewerViewportRef.current;
+      const vw = vp ? vp.clientWidth : window.innerWidth;
+      const vh = vp ? vp.clientHeight : window.innerHeight;
+      setPanelLayout((prev) =>
+        clampFloatingPanelLayout(prev, vw, vh, {
+          chatOpen: floatingChatOpen,
+          settingsOpen: floatingSettingsOpen,
+        })
+      );
+    };
+    clampToViewport();
+    const vp = viewerViewportRef.current;
+    const ro = vp ? new ResizeObserver(clampToViewport) : null;
+    if (vp && ro) ro.observe(vp);
+    window.addEventListener('resize', clampToViewport);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', clampToViewport);
+    };
+  }, [floatingChatOpen, floatingSettingsOpen, activeSessionId]);
+
+  // Drag & resize pointer listeners for the floating panel assembly
+  useEffect(() => {
+    const onPointerMove = (e: PointerEvent) => {
+      const active = panelInteractionRef.current;
+      if (!active) return;
+      const vp = viewerViewportRef.current;
+      const vw = vp ? vp.clientWidth : window.innerWidth;
+      const vh = vp ? vp.clientHeight : window.innerHeight;
+      const dx = e.clientX - active.startX;
+      const dy = e.clientY - active.startY;
+
+      setPanelLayout(() => {
+        const next: FloatingPanelLayout =
+          active.kind === 'drag'
+            ? {
+                ...active.initial,
+                x: active.initial.x + dx,
+                y: active.initial.y + dy,
+              }
+            : active.kind === 'resize-width'
+              ? {
+                  ...active.initial,
+                  width: active.initial.width + dx,
+                }
+              : {
+                  ...active.initial,
+                  width: active.initial.width + dx,
+                  chatHeight: active.initial.chatHeight + dy,
+                };
+        return clampFloatingPanelLayout(next, vw, vh, {
+          chatOpen: floatingChatOpen,
+          settingsOpen: floatingSettingsOpen,
+        });
+      });
+    };
+
+    const onPointerUp = () => {
+      panelInteractionRef.current = null;
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+  }, [floatingChatOpen, floatingSettingsOpen]);
+
+  // Video-only Presentation View WebRTC loopback over BroadcastChannel
+  useEffect(() => {
+    if (!metadata) return;
+    if (metadata.windowRole === 'presentation') {
+      const channel = new BroadcastChannel('elm-presentation-webrtc');
+      const pc = new RTCPeerConnection();
+      pc.ontrack = (ev) => {
+        if (presentationVideoRef.current && ev.streams[0]) {
+          presentationVideoRef.current.srcObject = ev.streams[0];
+        } else if (presentationVideoRef.current) {
+          presentationVideoRef.current.srcObject = new MediaStream([ev.track]);
+        }
+      };
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          channel.postMessage({
+            type: 'ice-to-main',
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+      channel.onmessage = async (ev: MessageEvent) => {
+        const msg = ev.data as {
+          type?: string;
+          sdp?: RTCSessionDescriptionInit;
+          candidate?: RTCIceCandidateInit;
+        };
+        if (msg.type === 'offer' && msg.sdp) {
+          await pc.setRemoteDescription(msg.sdp);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          channel.postMessage({ type: 'answer', sdp: answer });
+        } else if (msg.type === 'ice-to-pres' && msg.candidate) {
+          await pc.addIceCandidate(msg.candidate).catch(() => {});
+        } else if (msg.type === 'clear') {
+          if (presentationVideoRef.current) {
+            presentationVideoRef.current.srcObject = null;
+          }
+        }
+      };
+      channel.postMessage({ type: 'presentation-ready' });
+      return () => {
+        channel.close();
+        pc.close();
+      };
+    }
+
+    if (metadata.windowRole !== 'main') return;
+    const channel = new BroadcastChannel('elm-presentation-webrtc');
+    let pc: RTCPeerConnection | null = null;
+
+    const startMirroring = async () => {
+      const srcObj = guestVideoRef.current?.srcObject;
+      const videoStream = srcObj instanceof MediaStream ? srcObj : null;
+      const videoTrack = videoStream?.getVideoTracks()[0];
+      if (!videoTrack) {
+        channel.postMessage({ type: 'clear' });
+        return;
+      }
+      pc?.close();
+      pc = new RTCPeerConnection();
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          channel.postMessage({
+            type: 'ice-to-pres',
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+      pc.addTrack(videoTrack, new MediaStream([videoTrack]));
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      channel.postMessage({ type: 'offer', sdp: offer });
+    };
+
+    channel.onmessage = async (ev: MessageEvent) => {
+      const msg = ev.data as {
+        type?: string;
+        sdp?: RTCSessionDescriptionInit;
+        candidate?: RTCIceCandidateInit;
+      };
+      if (msg.type === 'presentation-ready') {
+        await startMirroring();
+      } else if (msg.type === 'answer' && msg.sdp && pc) {
+        await pc.setRemoteDescription(msg.sdp);
+      } else if (msg.type === 'ice-to-main' && msg.candidate && pc) {
+        await pc.addIceCandidate(msg.candidate).catch(() => {});
+      }
+    };
+
+    return () => {
+      channel.close();
+      pc?.close();
+    };
+  }, [metadata, webrtcSnap?.guestVideoTracksCount]);
+
   // Track rendered DOM dimensions & DPI scaling of Guest B video
   useEffect(() => {
     const video = guestVideoRef.current;
@@ -479,11 +786,6 @@ export function App(): React.ReactElement {
   const handleVideoResize = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     const v = e.currentTarget;
     if (v.videoWidth > 0 && v.videoHeight > 0) {
-      setLastResizeInfo({
-        timestamp: Date.now(),
-        width: v.videoWidth,
-        height: v.videoHeight,
-      });
       setRenderedDimensions({
         clientWidth: v.clientWidth,
         clientHeight: v.clientHeight,
@@ -500,17 +802,60 @@ export function App(): React.ReactElement {
     setStatusMessage(null);
   };
 
-  const handleBrowserOAuthSignIn = async () => {
+  const handleSaveLocalProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
     clearAlerts();
-    const res = await window.elmDesktop.startBrowserOAuthSignIn();
-    if (!res.ok) {
-      setErrorCode(res.errorCode ?? 'AUTH_PROVIDER_NOT_CONFIGURED');
-      setErrorMessage(
-        res.errorMessage ?? 'Browser OAuth sign-in is not configured.'
-      );
+    if (!setupNameInput.trim()) {
+      setErrorCode('INVALID_REQUEST');
+      setErrorMessage('Name is required to set up this device.');
       return;
     }
-    setStatusMessage(res.data?.message ?? 'Opened browser for OAuth sign-in.');
+    setSavingProfile(true);
+    try {
+      const res = await window.elmDesktop.saveLocalProfile({
+        name: setupNameInput,
+        email: setupEmailInput,
+        phone: setupPhoneInput,
+      });
+      if (!res.ok || !res.data) {
+        setErrorCode(res.errorCode ?? 'INVALID_REQUEST');
+        setErrorMessage(res.errorMessage ?? 'Could not save local profile.');
+        return;
+      }
+      setDeviceSetupState(res.data);
+      if (res.data.registeredAccount) {
+        setAccount(res.data.registeredAccount);
+        const stored = await window.elmDesktop.getStoredAuthSession();
+        if (stored.ok && stored.data) {
+          setAccount(stored.data.account);
+          setSnapshot(stored.data.snapshot);
+        }
+      }
+      setShowSettingsPanel(false);
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const handleRetryRegistration = async () => {
+    clearAlerts();
+    setRetryingRegistration(true);
+    try {
+      const res = await window.elmDesktop.retryDeviceRegistration();
+      if (res.ok && res.data) {
+        setDeviceSetupState(res.data);
+        if (res.data.registeredAccount) {
+          setAccount(res.data.registeredAccount);
+          const stored = await window.elmDesktop.getStoredAuthSession();
+          if (stored.ok && stored.data) {
+            setAccount(stored.data.account);
+            setSnapshot(stored.data.snapshot);
+          }
+        }
+      }
+    } finally {
+      setRetryingRegistration(false);
+    }
   };
 
   const handleTestDoubleSignIn = async (personaKey: string) => {
@@ -541,6 +886,64 @@ export function App(): React.ReactElement {
     setStatusMessage(
       'Signed out. Sign back in anytime to reuse your permanent Friend Code.'
     );
+  };
+
+  const handleAttachInMemoryImage = (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    setChatAttachmentError(null);
+    if (!file) return;
+    const normalizedMime = file.type.trim().toLowerCase();
+    if (
+      !(SUPPORTED_CHAT_IMAGE_MIME_TYPES as readonly string[]).includes(
+        normalizedMime
+      )
+    ) {
+      const msg = `Unsupported image type "${file.type || 'unknown'}". Supported types: PNG, JPEG, WEBP, GIF.`;
+      setChatAttachmentError(msg);
+      setErrorMessage(msg);
+      return;
+    }
+    if (file.size <= 0) {
+      const msg = 'Image attachment is empty.';
+      setChatAttachmentError(msg);
+      setErrorMessage(msg);
+      return;
+    }
+    if (file.size > MAX_CHAT_IMAGE_BYTES) {
+      const msg = `Image exceeds the ${Math.round(
+        MAX_CHAT_IMAGE_BYTES / (1024 * 1024)
+      )} MB peer-to-peer transfer limit.`;
+      setChatAttachmentError(msg);
+      setErrorMessage(msg);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      const validation = validateChatImageAttachment({
+        mimeType: normalizedMime,
+        byteLength: file.size,
+        dataUrl: reader.result,
+      });
+      if (!validation.ok) {
+        setChatAttachmentError(validation.error);
+        setErrorMessage(validation.error);
+        return;
+      }
+      setPendingImageDataUrl(reader.result);
+      setPendingImageName(file.name);
+      setPendingImageMimeType(normalizedMime);
+      setPendingImageByteLength(file.size);
+    };
+    reader.onerror = () => {
+      const msg = 'Failed to read selected image file.';
+      setChatAttachmentError(msg);
+      setErrorMessage(msg);
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleCopyFriendCode = async () => {
@@ -627,6 +1030,8 @@ export function App(): React.ReactElement {
       webrtcControllerRef.current = null;
     }
     clearGuestMediaElements();
+    setFloatingChatOpen(false);
+    setFloatingSettingsOpen(false);
     setWebrtcSnap(null);
     const res = await window.elmDesktop.disconnectActiveSession({
       sessionId: targetSessionId,
@@ -677,11 +1082,23 @@ export function App(): React.ReactElement {
 
   const handleSendChatFromAnyWindow = async (e: React.FormEvent) => {
     e.preventDefault();
-    const text = chatInputText.trim();
-    if (!text) return;
-    setChatInputText('');
+    setChatAttachmentError(null);
+    const rawText = chatInputText.trim();
+    const imageUrl = pendingImageDataUrl;
+    const imageName = pendingImageName;
+    const imageMime = pendingImageMimeType;
+    const imageBytes = pendingImageByteLength;
+    if (!rawText && !imageUrl) return;
+
+    const text =
+      rawText || `[In-memory image: ${imageName ?? 'image'}]`;
 
     if (metadata?.windowRole === 'chat') {
+      setChatInputText('');
+      setPendingImageDataUrl(null);
+      setPendingImageName(null);
+      setPendingImageMimeType(null);
+      setPendingImageByteLength(0);
       await window.elmDesktop.sendChatFromChatWindow({
         text,
         senderOverride: chatSenderRole,
@@ -690,9 +1107,46 @@ export function App(): React.ReactElement {
     }
 
     const ctrl = webrtcControllerRef.current;
-    if (!ctrl) return;
+    if (!ctrl) {
+      setChatAttachmentError('No active session.');
+      return;
+    }
+    const activeSender: 'host' | 'guest' =
+      account?.accountId === ctrl.session.guestAccountId ? 'guest' : 'host';
+
+    if (imageUrl && imageMime) {
+      const result = ctrl.sendChatImageOverDataChannel({
+        sender: activeSender,
+        senderAccountId:
+          account?.accountId ??
+          (activeSender === 'host'
+            ? ctrl.session.hostAccountId
+            : ctrl.session.guestAccountId),
+        senderDisplayName:
+          account?.displayName ??
+          (activeSender === 'host'
+            ? ctrl.session.hostDisplayName
+            : ctrl.session.guestDisplayName),
+        text,
+        mimeType: imageMime,
+        byteLength: imageBytes,
+        dataUrl: imageUrl,
+      });
+      if (!result.ok) {
+        setChatAttachmentError(result.error);
+        return;
+      }
+      setChatInputText('');
+      setPendingImageDataUrl(null);
+      setPendingImageName(null);
+      setPendingImageMimeType(null);
+      setPendingImageByteLength(0);
+      return;
+    }
+
+    setChatInputText('');
     await ctrl.sendChatMessageOverDataChannel({
-      sender: chatSenderRole,
+      sender: activeSender,
       text,
     });
   };
@@ -742,6 +1196,26 @@ export function App(): React.ReactElement {
         <section className="card">
           <p>Loading Elm-AnyDesk runtime...</p>
         </section>
+      </main>
+    );
+  }
+
+  // ============================================================================
+  // VIDEO-ONLY PRESENTATION VIEW WINDOW (windowRole === 'presentation')
+  // ============================================================================
+  if (metadata.windowRole === 'presentation') {
+    return (
+      <main
+        className="presentation-viewport"
+        data-testid="presentation-view-window"
+      >
+        <video
+          ref={presentationVideoRef}
+          autoPlay
+          playsInline
+          muted
+          className="presentation-video-full"
+        />
       </main>
     );
   }
@@ -970,43 +1444,65 @@ export function App(): React.ReactElement {
     Boolean(webrtcSnap?.hostMediaState.screenVideo.active) ||
     Boolean(webrtcSnap?.hostMediaState.microphoneAudio.active) ||
     Boolean(webrtcSnap?.hostMediaState.deviceAudio.active);
+  const isLocalHost =
+    Boolean(snapshot?.activeSession) &&
+    snapshot?.activeSession?.hostAccountId === account?.accountId;
 
   return (
     <main className="app-shell">
       <header className="top-bar">
         <div className="top-bar-left">
-          <div className="top-bar-eyebrow">
-            <span className="badge">{metadata.phase}</span>
-            <span className="badge badge-neutral">
-              Theme: {themeState.mode.toUpperCase()}
+          <div className="brand-lockup">
+            <svg
+              className="brand-mark"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <rect width="24" height="24" rx="4" fill="var(--accent-action-bg)" />
+              <rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="#FFFFFF" strokeWidth="1.75" />
+              <rect x="8" y="8" width="8" height="8" rx="1" fill="#FFFFFF" />
+            </svg>
+            <h1>Elm-AnyDesk</h1>
+            <span
+              className={`presence-pill ${
+                snapshot?.activeSession
+                  ? 'online'
+                  : snapshot?.online
+                  ? 'online'
+                  : 'offline'
+              }`}
+            >
+              {snapshot?.activeSession
+                ? 'IN SESSION'
+                : snapshot?.online
+                ? 'READY'
+                : 'OFFLINE'}
             </span>
           </div>
-          <h1>Elm-AnyDesk — Consent-Based 1:1 Screen Sharing</h1>
         </div>
         <div className="top-bar-right">
           {snapshot?.activeSession && (
             <button
               type="button"
               data-testid="top-bar-disconnect-button"
-              className="danger-btn"
+              className="danger-btn no-drag"
               onClick={handleDisconnectSession}
             >
-              Disconnect Active Session
+              Disconnect
             </button>
           )}
-          <button
-            type="button"
-            className="secondary-btn"
-            onClick={() => window.elmDesktop.openSeparateChatWindow()}
-          >
-            Open Separate Chat Window (
-            {webrtcSnap ? `${webrtcSnap.messages.length} msgs` : '0 msgs'} — No
-            Preview)
-          </button>
-          <div className="meta-pill">
-            Protocol <code>{metadata.protocolVersion}</code> | Electron{' '}
-            <code>{metadata.electronVersion}</code>
-          </div>
+          {(deviceSetupState?.profileCompleted || account) && (
+            <button
+              type="button"
+              data-testid="settings-profile-button"
+              className="small-secondary-btn no-drag"
+              onClick={() => setShowSettingsPanel((prev) => !prev)}
+            >
+              {showSettingsPanel ? 'Close Settings' : 'Settings'}
+            </button>
+          )}
           <ThemeToggleButton
             themeState={themeState}
             onToggle={() => void handleToggleTheme()}
@@ -1041,290 +1537,199 @@ export function App(): React.ReactElement {
 
       {webrtcSnap?.lastStatusBanner && (
         <section className="card card-info">
-          <strong>Live Media Status Notice: </strong>
+          <strong>Status: </strong>
           <span>{webrtcSnap.lastStatusBanner}</span>
         </section>
       )}
 
-      {/* SIGN-IN SCREEN WHEN UNAUTHENTICATED */}
-      {!account ? (
-        <div className="grid">
-          <section className="card">
-            <h2>1. Production Desktop-Safe Browser Sign-In</h2>
-            <p className="muted">
-              Uses GitHub OAuth 2.0 in your system browser with a local loopback
-              callback listener (<code>127.0.0.1</code>). Provider secrets live
-              strictly on the Cloudflare Worker (<code>apps/api/.dev.vars</code>)
-              and are never bundled into Electron.
-            </p>
+      {showSettingsPanel && (deviceSetupState?.profileCompleted || account) && (
+        <section className="card card-full" data-testid="settings-profile-card">
+          <div className="subcard-header">
+            <div>
+              <h2>Settings — My Profile</h2>
+              <p className="muted">
+                Stored only on this device. Never sent to the server.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="small-secondary-btn"
+              onClick={() => setShowSettingsPanel(false)}
+            >
+              Close
+            </button>
+          </div>
+          <form className="setup-form" onSubmit={handleSaveLocalProfile}>
+            <div className="setup-field">
+              <label htmlFor="settings-name">Name *</label>
+              <input
+                id="settings-name"
+                type="text"
+                className="code-input"
+                placeholder="Your name"
+                value={setupNameInput}
+                onChange={(e) => setSetupNameInput(e.target.value)}
+                required
+                maxLength={60}
+              />
+            </div>
+            <div className="setup-field">
+              <label htmlFor="settings-email">Email (optional)</label>
+              <input
+                id="settings-email"
+                type="email"
+                className="code-input"
+                placeholder="name@example.com"
+                value={setupEmailInput}
+                onChange={(e) => setSetupEmailInput(e.target.value)}
+                maxLength={120}
+              />
+            </div>
+            <div className="setup-field">
+              <label htmlFor="settings-phone">Phone number (optional)</label>
+              <input
+                id="settings-phone"
+                type="tel"
+                className="code-input"
+                placeholder="+1 555 0100"
+                value={setupPhoneInput}
+                onChange={(e) => setSetupPhoneInput(e.target.value)}
+                maxLength={40}
+              />
+            </div>
             <div className="actions-row">
               <button
-                type="button"
+                type="submit"
                 className="primary-btn"
-                onClick={handleBrowserOAuthSignIn}
+                disabled={savingProfile || !setupNameInput.trim()}
               >
-                Sign In with GitHub (System Browser)
+                {savingProfile ? 'Saving...' : 'Save Profile'}
               </button>
             </div>
-          </section>
+          </form>
+        </section>
+      )}
 
-          <section className="card">
-            <h2>2. Local Test-Double Adapter (No Secrets Required)</h2>
-            <p className="muted">
-              Isolated behind <code>AuthProviderAdapter</code> for local
-              development & multi-peer testing when OAuth secrets are unavailable
-              locally. Creates a permanent Friend Code once in D1 storage and
-              reuses it across restarts and sign-ins.
-            </p>
+      {!deviceSetupState ? (
+        <section className="card">
+          <p className="muted">Loading Elm-AnyDesk...</p>
+        </section>
+      ) : !deviceSetupState.profileCompleted && !account ? (
+        <section className="card setup-card" data-testid="first-launch-setup-card">
+          <h2>Set up this device</h2>
+          <p className="muted">
+            Your profile is saved locally on this device and is never sent to
+            the backend.
+          </p>
+          <form className="setup-form" onSubmit={handleSaveLocalProfile}>
+            <div className="setup-field">
+              <label htmlFor="setup-name">Name *</label>
+              <input
+                id="setup-name"
+                type="text"
+                className="code-input"
+                placeholder="Enter your name"
+                value={setupNameInput}
+                onChange={(e) => setSetupNameInput(e.target.value)}
+                required
+                maxLength={60}
+              />
+            </div>
+            <div className="setup-field">
+              <label htmlFor="setup-email">Email (optional)</label>
+              <input
+                id="setup-email"
+                type="email"
+                className="code-input"
+                placeholder="name@example.com"
+                value={setupEmailInput}
+                onChange={(e) => setSetupEmailInput(e.target.value)}
+                maxLength={120}
+              />
+            </div>
+            <div className="setup-field">
+              <label htmlFor="setup-phone">Phone number (optional)</label>
+              <input
+                id="setup-phone"
+                type="tel"
+                className="code-input"
+                placeholder="+1 555 0100"
+                value={setupPhoneInput}
+                onChange={(e) => setSetupPhoneInput(e.target.value)}
+                maxLength={40}
+              />
+            </div>
             <div className="actions-row">
               <button
-                type="button"
-                className="secondary-btn"
-                onClick={() => handleTestDoubleSignIn('alice')}
+                type="submit"
+                data-testid="setup-continue-button"
+                className="primary-btn"
+                disabled={savingProfile || !setupNameInput.trim()}
               >
-                Sign In as Alice (Host A)
-              </button>
-              <button
-                type="button"
-                className="secondary-btn"
-                onClick={() => handleTestDoubleSignIn('bob')}
-              >
-                Sign In as Bob (Requester B)
-              </button>
-              <button
-                type="button"
-                className="secondary-btn"
-                onClick={() => handleTestDoubleSignIn('charlie')}
-              >
-                Sign In as Charlie (Peer C)
+                {savingProfile ? 'Setting up...' : 'Continue'}
               </button>
             </div>
-          </section>
-        </div>
+          </form>
+        </section>
       ) : (
         <>
-          {/* ACCOUNT & PRESENCE BAR */}
-          <section className="card card-full">
-            <div className="subcard-header">
-              <div>
-                <h2>
-                  Signed In: {account.displayName}{' '}
-                  <span
-                    className={`presence-pill ${
-                      snapshot?.online ? 'online' : 'offline'
-                    }`}
-                  >
-                    {snapshot?.online ? 'ONLINE' : 'OFFLINE'}
-                  </span>
-                </h2>
-                <p className="muted">
-                  Account ID: <code>{account.accountId}</code> | Permanent Friend
-                  Code: <code>{account.friendCode}</code>
-                </p>
-              </div>
-              <div className="actions-row">
-                <button
-                  type="button"
-                  className="secondary-btn"
-                  onClick={() => handleTogglePresence(!snapshot?.online)}
-                >
-                  {snapshot?.online
-                    ? 'Go Offline'
-                    : 'Reconnect Presence Online'}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-btn"
-                  onClick={handleSignOut}
-                >
-                  Sign Out
-                </button>
-              </div>
-            </div>
-
-            <div className="persona-switcher-bar">
-              <span className="muted">
-                Quick Multi-Peer Switcher (switch between Alice, Bob, and
-                Charlie):
-              </span>
-              <div className="actions-row">
-                <button
-                  type="button"
-                  className="small-secondary-btn"
-                  onClick={() => handleTestDoubleSignIn('alice')}
-                >
-                  Switch to Alice (Host A)
-                </button>
-                <button
-                  type="button"
-                  className="small-secondary-btn"
-                  onClick={() => handleTestDoubleSignIn('bob')}
-                >
-                  Switch to Bob (Requester B)
-                </button>
-                <button
-                  type="button"
-                  className="small-secondary-btn"
-                  onClick={() => handleTestDoubleSignIn('charlie')}
-                >
-                  Switch to Charlie (Peer C)
-                </button>
-              </div>
-            </div>
-          </section>
-
-          {/* APPROVED ACTIVE 1:1 WEBRTC SESSION PANEL */}
-          {snapshot?.activeSession && webrtcSnap && (
-            <section className="card card-full card-session-active">
-              <div className="subcard-header">
-                <div>
-                  <span className="badge badge-green">
-                    Approved 1:1 WebRTC Session — Media A → B | Chat A ↔ B (
-                    {anyHostMediaActive
-                      ? 'SHARING ACTIVE'
-                      : 'CHAT CONNECTED / MEDIA IDLE'}
-                    )
-                  </span>
-                  <h2>Session ID: {snapshot.activeSession.sessionId}</h2>
-                  <p className="muted">
-                    PeerConnection: <code>{webrtcSnap.connectionState}</code> |
-                    Reliable DataChannel:{' '}
-                    <code>
-                      {webrtcSnap.dataChannelState} (ordered=
-                      {String(webrtcSnap.dataChannelOrdered)}, reliable=
-                      {String(webrtcSnap.dataChannelReliable)})
-                    </code>
-                  </p>
-                </div>
+          {metadata.devModeEnabled && (
+            <section className="card card-full">
+              <div className="persona-switcher-bar">
+                <span className="muted">
+                  Dev Mode Identity (
+                  {account
+                    ? `${account.displayName} — ${account.friendCode}`
+                    : 'Not Registered'}
+                  ):
+                </span>
                 <div className="actions-row">
                   <button
                     type="button"
-                    className="danger-btn"
-                    disabled={!anyHostMediaActive}
-                    onClick={handleStopAllSharing}
+                    className="small-secondary-btn"
+                    onClick={() => handleTestDoubleSignIn('alice')}
                   >
-                    Stop All Sharing (Host A)
+                    Alice
                   </button>
                   <button
                     type="button"
-                    className="secondary-btn"
-                    onClick={() => window.elmDesktop.openSeparateChatWindow()}
+                    className="small-secondary-btn"
+                    onClick={() => handleTestDoubleSignIn('bob')}
                   >
-                    Open Separate Chat Window
+                    Bob
                   </button>
                   <button
                     type="button"
-                    className="danger-btn"
-                    onClick={handleDisconnectSession}
+                    className="small-secondary-btn"
+                    onClick={() => handleTestDoubleSignIn('charlie')}
                   >
-                    Top-Bar Disconnect (Ends for Both)
+                    Charlie
+                  </button>
+                  <button
+                    type="button"
+                    className="small-secondary-btn"
+                    onClick={handleSignOut}
+                  >
+                    Reset
                   </button>
                 </div>
               </div>
+            </section>
+          )}
 
-              {/* DEDICATED FULL-WIDTH ACTIVE SCREEN VIEWER STAGE */}
-              <div className="active-viewer-stage" data-testid="active-viewer-stage">
-                <div className="viewer-stage-header">
-                  <div className="viewer-title-group">
-                    <span
-                      className={
-                        webrtcSnap.guestVideoTracksCount > 0
-                          ? 'badge badge-accent'
-                          : 'badge badge-neutral'
-                      }
-                    >
-                      {webrtcSnap.guestVideoTracksCount > 0
-                        ? 'Live Screen Share'
-                        : 'Screen Share (Standby)'}
-                    </span>
-                    <h3>Guest B Viewer</h3>
-                    {webrtcSnap.guestVideoTracksCount > 0 &&
-                      renderedDimensions &&
-                      renderedDimensions.videoWidth > 0 && (
-                        <span className="viewer-resolution-badge">
-                          Decoded: {renderedDimensions.videoWidth} ×{' '}
-                          {renderedDimensions.videoHeight}
-                        </span>
-                      )}
-                    <span className="viewer-dpi-badge">
-                      DPI:{' '}
-                      {Math.round(
-                        (window.devicePixelRatio || 1) * 100
-                      )}
-                      % ({window.devicePixelRatio || 1}x)
-                    </span>
-                  </div>
-
-                  <div className="viewer-stage-controls">
-                    <div
-                      className="mode-toggle-group"
-                      role="group"
-                      aria-label="Viewer Display Mode"
-                    >
-                      <button
-                        type="button"
-                        className={
-                          viewerMode === 'fit'
-                            ? 'mode-toggle-btn active'
-                            : 'mode-toggle-btn'
-                        }
-                        onClick={() => setViewerMode('fit')}
-                        title="Aspect-ratio-preserving Fit to Window"
-                      >
-                        Fit to Window
-                      </button>
-                      <button
-                        type="button"
-                        className={
-                          viewerMode === 'actual'
-                            ? 'mode-toggle-btn active'
-                            : 'mode-toggle-btn'
-                        }
-                        onClick={() => setViewerMode('actual')}
-                        title="Scrollable 1:1 Actual Size based on decoded dimensions"
-                      >
-                        Actual Size (1:1)
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      className={
-                        optInDiagnostics
-                          ? 'small-secondary-btn active'
-                          : 'small-secondary-btn'
-                      }
-                      onClick={() => setOptInDiagnostics((prev) => !prev)}
-                      title="Toggle privacy-safe WebRTC readability telemetry"
-                    >
-                      {optInDiagnostics ? 'Hide Diagnostics' : 'Show Diagnostics'}
-                    </button>
-
-                    {webrtcSnap.guestVideoTracksCount > 0 && (
-                      <button
-                        type="button"
-                        className="small-secondary-btn"
-                        onClick={() =>
-                          webrtcControllerRef.current?.updateGuestLocalPlayback({
-                            videoPausedLocally:
-                              !webrtcSnap.guestPlayback.videoPausedLocally,
-                          })
-                        }
-                      >
-                        {webrtcSnap.guestPlayback.videoPausedLocally
-                          ? 'Resume Display'
-                          : 'Pause Display'}
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div
-                  ref={viewerContainerRef}
-                  className={`viewer-stage-container ${
-                    viewerMode === 'fit' ? 'fit-mode' : 'actual-mode'
-                  }`}
-                >
+          {/* FULL-AREA ACTIVE SESSION VIEWER + ONE FLOATING PANEL */}
+          {snapshot?.activeSession && webrtcSnap && (
+            <section
+              ref={viewerViewportRef}
+              className="active-viewer-viewport"
+              data-testid="active-viewer-stage"
+            >
+              <div
+                ref={viewerContainerRef}
+                className={`viewer-stage-container ${
+                  viewerMode === 'fit' ? 'fit-mode' : 'actual-mode'
+                }`}
+              >
                   <video
                     ref={guestVideoRef}
                     autoPlay
@@ -1361,640 +1766,808 @@ export function App(): React.ReactElement {
                       className="viewer-stage-empty-placeholder muted"
                       style={{ padding: '40px 20px', textAlign: 'center' }}
                     >
-                      Screen Video is currently OFF. Host A can select a
-                      Window/Display and click &quot;Start Sharing&quot; below.
+                      Screen sharing is currently off. The host can select a
+                      window or display and click &quot;Start Sharing&quot; below.
                     </div>
                   )}
                   {webrtcSnap.guestVideoTracksCount > 0 &&
                     webrtcSnap.guestPlayback.videoPausedLocally && (
                       <div className="viewer-paused-overlay">
-                        Local video display paused by Guest B
+                        Local video display paused
                       </div>
                     )}
                 </div>
 
-                {/* Status Bar */}
-                <div className="viewer-status-bar">
-                  <span>
-                    Mode:{' '}
-                    <strong>
-                      {viewerMode === 'fit'
-                        ? 'Fit (Aspect-Preserving)'
-                        : 'Actual Size (1:1 Decoded Mapping)'}
-                    </strong>
-                  </span>
-                  {renderedDimensions &&
-                    renderedDimensions.videoWidth > 0 && (
-                      <>
-                        <span className="separator">•</span>
-                        <span>
-                          Rendered:{' '}
-                          <strong>
-                            {renderedDimensions.clientWidth} ×{' '}
-                            {renderedDimensions.clientHeight} CSS px
-                          </strong>{' '}
-                          (
-                          {Math.round(
-                            renderedDimensions.clientWidth *
-                              (window.devicePixelRatio || 1)
-                          )}{' '}
-                          ×{' '}
-                          {Math.round(
-                            renderedDimensions.clientHeight *
-                              (window.devicePixelRatio || 1)
-                          )}{' '}
-                          physical px)
-                        </span>
-                        <span className="separator">•</span>
-                        <span>
-                          Scale:{' '}
-                          <strong>
-                            {Math.round(
-                              (renderedDimensions.clientWidth /
-                                (renderedDimensions.videoWidth || 1)) *
-                                100
-                            )}
-                            %
-                          </strong>
-                        </span>
-                      </>
-                    )}
-                  {lastResizeInfo && (
-                    <>
-                      <span className="separator">•</span>
-                      <span>
-                        Last Resize: {lastResizeInfo.width}×
-                        {lastResizeInfo.height}
-                      </span>
-                    </>
-                  )}
-                </div>
+              {/* Hidden audio elements for remote mic & device sound */}
+              <audio ref={guestMicAudioRef} autoPlay />
+              <audio ref={guestDeviceAudioRef} autoPlay />
 
-                {/* Opt-in Diagnostics Panel */}
-                {optInDiagnostics && (
+              {/* ONE FLOATING PANEL ASSEMBLY OVER THE VIDEO */}
+              <div
+                className="floating-panel-assembly"
+                data-testid="floating-viewer-panel"
+                style={{
+                  left: `${panelLayout.x}px`,
+                  top: `${panelLayout.y}px`,
+                }}
+              >
+                <div
+                  className="floating-panel-main"
+                  style={{ width: `${panelLayout.width}px` }}
+                >
+                  {/* COMPACT FLOATING BAR */}
                   <div
-                    className="diagnostics-panel"
-                    data-testid="readability-diagnostics-panel"
+                    className="floating-panel-bar"
+                    data-testid="floating-panel-bar"
+                    style={{
+                      backgroundColor: buildBackgroundRgba(
+                        themeState.mode,
+                        panelAppearance.barBgOpacity
+                      ),
+                      fontSize: `${panelAppearance.barTextSizePx}px`,
+                    }}
                   >
-                    <div className="diagnostics-header">
-                      <h4>
-                        Privacy-Safe WebRTC Readability Diagnostics (Local Only)
-                      </h4>
-                      <span className="badge badge-neutral">
-                        No sensitive content, chat, or raw IPs logged
-                      </span>
-                    </div>
-                    <div className="diagnostics-grid">
-                      <div className="diag-item">
-                        <span className="diag-label">Capture Stream:</span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.captureWidth
-                            ? `${liveDiagnostics.captureWidth} × ${liveDiagnostics.captureHeight}`
-                            : '1920 × 1080 (DXGI/DWM)'}
-                          {liveDiagnostics?.captureFps
-                            ? ` @ ${liveDiagnostics.captureFps} fps`
-                            : ''}
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">Encoded (Host A):</span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.encodedWidth
-                            ? `${liveDiagnostics.encodedWidth} × ${liveDiagnostics.encodedHeight}`
-                            : '1920 × 1080'}
-                          {liveDiagnostics?.encodedFps
-                            ? ` @ ${liveDiagnostics.encodedFps} fps`
-                            : ''}
-                          {liveDiagnostics?.outboundBitrateKbps !== null &&
-                          liveDiagnostics?.outboundBitrateKbps !== undefined
-                            ? ` | ${liveDiagnostics.outboundBitrateKbps} kbps`
-                            : ''}
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">Decoded (Guest B):</span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.decodedWidth
-                            ? `${liveDiagnostics.decodedWidth} × ${liveDiagnostics.decodedHeight}`
-                            : `${renderedDimensions?.videoWidth ?? 0} × ${
-                                renderedDimensions?.videoHeight ?? 0
-                              }`}
-                          {liveDiagnostics?.decodedFps
-                            ? ` @ ${liveDiagnostics.decodedFps} fps`
-                            : ''}
-                          {liveDiagnostics?.inboundBitrateKbps !== null &&
-                          liveDiagnostics?.inboundBitrateKbps !== undefined
-                            ? ` | ${liveDiagnostics.inboundBitrateKbps} kbps`
-                            : ''}
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">
-                          Quality Limit Reason:
-                        </span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.qualityLimitationReason ?? 'none'}
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">
-                          Packet Loss / Jitter:
-                        </span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.packetsLost ?? 0} lost (
-                          {liveDiagnostics?.packetLossPercent ?? 0}%) |{' '}
-                          {liveDiagnostics?.jitterMs ?? 0} ms jitter
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">Transport RTT:</span>
-                        <span className="diag-value">
-                          {liveDiagnostics?.rttMs !== null &&
-                          liveDiagnostics?.rttMs !== undefined
-                            ? `${liveDiagnostics.rttMs} ms`
-                            : '< 1 ms (Loopback)'}
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">
-                          Rendered Stage Size:
-                        </span>
-                        <span className="diag-value">
-                          {renderedDimensions?.clientWidth ?? 0} ×{' '}
-                          {renderedDimensions?.clientHeight ?? 0} CSS px
-                        </span>
-                      </div>
-                      <div className="diag-item">
-                        <span className="diag-label">Display Scale & Mode:</span>
-                        <span className="diag-value">
-                          {Math.round(
-                            (window.devicePixelRatio || 1) * 100
-                          )}
-                          % DPI ({window.devicePixelRatio || 1}x) |{' '}
-                          {viewerMode.toUpperCase()}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="telemetry-grid">
-                {/* HOST A: EXPLICIT START SHARING & INDEPENDENT SOURCE CONTROLS */}
-                <div className="subcard">
-                  <h3>
-                    Host A ({snapshot.activeSession.hostDisplayName}) — Capture
-                    Controls
-                  </h3>
-                  <p className="muted">
-                    Media never starts before Host A clicks{' '}
-                    <strong>Start Sharing</strong>. Unchecked sources are never
-                    captured or attached. Each active source can be stopped
-                    independently.
-                  </p>
-
-                  <div className="actions-row">
                     <button
                       type="button"
-                      className="secondary-btn"
-                      onClick={handleRefreshSources}
+                      className="floating-drag-handle"
+                      data-testid="floating-panel-drag-handle"
+                      aria-label="Drag floating panel"
+                      title="Drag panel"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        panelInteractionRef.current = {
+                          kind: 'drag',
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          initial: panelLayout,
+                        };
+                      }}
                     >
-                      1. Load Shareable Windows & Displays
+                      ⋮⋮
+                    </button>
+
+                    <span className="presence-pill online">
+                      {anyHostMediaActive ? 'Connected' : 'Connected'}
+                    </span>
+
+                    <button
+                      type="button"
+                      className={
+                        viewerMode === 'fit'
+                          ? 'mode-toggle-btn active'
+                          : 'mode-toggle-btn'
+                      }
+                      onClick={() => setViewerMode('fit')}
+                    >
+                      Fit
                     </button>
                     <button
                       type="button"
-                      className="primary-btn"
-                      onClick={handleExplicitStartSharing}
+                      className={
+                        viewerMode === 'actual'
+                          ? 'mode-toggle-btn active'
+                          : 'mode-toggle-btn'
+                      }
+                      onClick={() => setViewerMode('actual')}
                     >
-                      2. Explicit Start Sharing (Host A)
+                      1:1
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="floating-chat-toggle"
+                      className={
+                        floatingChatOpen
+                          ? 'small-secondary-btn active'
+                          : 'small-secondary-btn'
+                      }
+                      onClick={() => setFloatingChatOpen((prev) => !prev)}
+                    >
+                      Chat
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="floating-settings-toggle"
+                      className={
+                        floatingSettingsOpen
+                          ? 'small-secondary-btn active'
+                          : 'small-secondary-btn'
+                      }
+                      onClick={() => setFloatingSettingsOpen((prev) => !prev)}
+                    >
+                      Settings
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="floating-end-session"
+                      className="danger-btn"
+                      onClick={handleDisconnectSession}
+                    >
+                      End Session
                     </button>
                   </div>
 
-                  {shareableSources.length > 0 && (
-                    <div className="actions-row">
-                      <label className="muted">
-                        Selected Window/Display (Never Webcam):{' '}
+                  {/* EXPANDED CHAT DIRECTLY BELOW THE SAME BAR (NO SECOND TITLE BAR) */}
+                  {floatingChatOpen && (
+                    <div
+                      className="floating-panel-chat"
+                      data-testid="floating-panel-chat"
+                      style={{
+                        backgroundColor: buildBackgroundRgba(
+                          themeState.mode,
+                          panelAppearance.chatBgOpacity
+                        ),
+                        fontSize: `${panelAppearance.chatTextSizePx}px`,
+                        height: `${panelLayout.chatHeight}px`,
+                      }}
+                    >
+                      <div className="floating-chat-messages">
+                        {webrtcSnap.messages.length === 0 ? (
+                          <div className="muted">
+                            In-memory session chat. Cleared on End Session.
+                          </div>
+                        ) : (
+                          webrtcSnap.messages.map((m) => {
+                            const imgUrl =
+                              webrtcSnap.imageAttachmentsByMessageId[
+                                m.messageId
+                              ] ?? inMemoryImagesByMsgId[m.messageId];
+                            return (
+                              <div
+                                key={m.messageId}
+                                className={`chat-bubble ${
+                                  m.senderAccountId === account?.accountId
+                                    ? 'chat-mine'
+                                    : 'chat-theirs'
+                                }`}
+                              >
+                                <div className="chat-meta">
+                                  <strong>{m.senderDisplayName}</strong> ·{' '}
+                                  {new Date(m.sentAt).toLocaleTimeString()}
+                                </div>
+                                {m.text && (
+                                  <div className="chat-text">{m.text}</div>
+                                )}
+                                {imgUrl && (
+                                  <img
+                                    src={imgUrl}
+                                    alt="In-memory shared attachment"
+                                    className="in-memory-image-preview"
+                                  />
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      {chatAttachmentError && (
+                        <div className="chat-error-banner" role="alert">
+                          {chatAttachmentError}
+                        </div>
+                      )}
+
+                      {pendingImageDataUrl && (
+                        <div className="pending-image-bar">
+                          <img
+                            src={pendingImageDataUrl}
+                            alt={pendingImageName ?? 'Pending attachment'}
+                            className="in-memory-image-thumb"
+                          />
+                          <span className="muted">
+                            {pendingImageName ?? 'Attached image'} (in memory)
+                          </span>
+                          <button
+                            type="button"
+                            className="small-secondary-btn"
+                            onClick={() => {
+                              setPendingImageDataUrl(null);
+                              setPendingImageName(null);
+                              setPendingImageMimeType(null);
+                              setPendingImageByteLength(0);
+                              setChatAttachmentError(null);
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+
+                      <form
+                        className="chat-input-row"
+                        onSubmit={handleSendChatFromAnyWindow}
+                      >
+                        <input
+                          ref={imageFileInputRef}
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif"
+                          style={{ display: 'none' }}
+                          onChange={handleAttachInMemoryImage}
+                        />
+                        <button
+                          type="button"
+                          className="small-secondary-btn"
+                          onClick={() => imageFileInputRef.current?.click()}
+                          title="Attach an image in memory for this session only"
+                        >
+                          Attach Image
+                        </button>
+                        <input
+                          type="text"
+                          className="code-input chat-text-input"
+                          placeholder="Type a message..."
+                          value={chatInputText}
+                          onChange={(e) => setChatInputText(e.target.value)}
+                        />
+                        <button type="submit" className="primary-btn">
+                          Send
+                        </button>
+                      </form>
+
+                      {/* Width + Height resize handle when chat is expanded */}
+                      <div
+                        className="floating-resize-corner"
+                        data-testid="floating-resize-both"
+                        title="Resize panel width and chat height"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          panelInteractionRef.current = {
+                            kind: 'resize-both',
+                            startX: e.clientX,
+                            startY: e.clientY,
+                            initial: panelLayout,
+                          };
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Width resize handle (available in compact and expanded modes) */}
+                  <div
+                    className="floating-resize-edge"
+                    data-testid="floating-resize-width"
+                    title="Resize panel width"
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      panelInteractionRef.current = {
+                        kind: 'resize-width',
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        initial: panelLayout,
+                      };
+                    }}
+                  />
+                </div>
+
+                {/* ATTACHED RIGHT SIDEBAR (OPENS EVEN IF CHAT IS COLLAPSED) */}
+                {floatingSettingsOpen && (
+                  <aside
+                    className="floating-settings-sidebar"
+                    data-testid="floating-settings-sidebar"
+                    style={{
+                      backgroundColor: buildBackgroundRgba(
+                        themeState.mode,
+                        panelAppearance.barBgOpacity
+                      ),
+                    }}
+                  >
+                    <div className="sidebar-section">
+                      <strong>Appearance</strong>
+                      <div className="sidebar-row">
+                        <span>Theme</span>
+                        <ThemeToggleButton
+                          themeState={themeState}
+                          onToggle={() => void handleToggleTheme()}
+                        />
+                      </div>
+
+                      <label className="sidebar-slider">
+                        <span>
+                          Bar Opacity:{' '}
+                          {Math.round(panelAppearance.barBgOpacity * 100)}%
+                        </span>
+                        <input
+                          type="range"
+                          min={0.35}
+                          max={1}
+                          step={0.05}
+                          value={panelAppearance.barBgOpacity}
+                          onChange={(e) =>
+                            setPanelAppearance((prev) =>
+                              sanitizeFloatingPanelAppearance({
+                                ...prev,
+                                barBgOpacity: Number(e.target.value),
+                              })
+                            )
+                          }
+                        />
                       </label>
-                      <select
-                        className="code-input"
-                        value={selectedSourceId ?? ''}
-                        onChange={(e) =>
-                          setSelectedSourceId(e.target.value || null)
+
+                      <label className="sidebar-slider">
+                        <span>
+                          Chat Opacity:{' '}
+                          {Math.round(panelAppearance.chatBgOpacity * 100)}%
+                        </span>
+                        <input
+                          type="range"
+                          min={0.35}
+                          max={1}
+                          step={0.05}
+                          value={panelAppearance.chatBgOpacity}
+                          onChange={(e) =>
+                            setPanelAppearance((prev) =>
+                              sanitizeFloatingPanelAppearance({
+                                ...prev,
+                                chatBgOpacity: Number(e.target.value),
+                              })
+                            )
+                          }
+                        />
+                      </label>
+
+                      <label className="sidebar-slider">
+                        <span>
+                          Bar Text Size: {panelAppearance.barTextSizePx}px
+                        </span>
+                        <input
+                          type="range"
+                          min={11}
+                          max={16}
+                          step={1}
+                          value={panelAppearance.barTextSizePx}
+                          onChange={(e) =>
+                            setPanelAppearance((prev) =>
+                              sanitizeFloatingPanelAppearance({
+                                ...prev,
+                                barTextSizePx: Number(e.target.value),
+                              })
+                            )
+                          }
+                        />
+                      </label>
+
+                      <label className="sidebar-slider">
+                        <span>
+                          Chat Text Size: {panelAppearance.chatTextSizePx}px
+                        </span>
+                        <input
+                          type="range"
+                          min={12}
+                          max={18}
+                          step={1}
+                          value={panelAppearance.chatTextSizePx}
+                          onChange={(e) =>
+                            setPanelAppearance((prev) =>
+                              sanitizeFloatingPanelAppearance({
+                                ...prev,
+                                chatTextSizePx: Number(e.target.value),
+                              })
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+
+                    <div className="sidebar-section">
+                      <strong>Presentation View</strong>
+                      <button
+                        type="button"
+                        data-testid="open-presentation-view-button"
+                        className="secondary-btn"
+                        onClick={() =>
+                          void window.elmDesktop.openPresentationView()
                         }
                       >
-                        {shareableSources.map((src) => (
-                          <option key={src.id} value={src.id}>
-                            [{src.surfaceType.toUpperCase()}] {src.name} (
-                            {src.id})
-                          </option>
-                        ))}
-                      </select>
+                        Open Video-Only Window
+                      </button>
+                      <p className="muted" style={{ fontSize: '0.75rem' }}>
+                        Excludes the floating panel only when sharing that
+                        selected Presentation View window. Normal viewer or
+                        entire-display shares include the panel.
+                      </p>
                     </div>
-                  )}
 
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={playWasapiTestTone}
-                      onChange={(e) => setPlayWasapiTestTone(e.target.checked)}
-                    />
-                    <span>
-                      Play 440Hz Reference Tone in WASAPI Loopback Helper
+                    {isLocalHost && (
+                      <div className="sidebar-section">
+                        <strong>Host Share Controls</strong>
+                        {webrtcSnap.hostMediaState.screenVideo.approved && (
+                          <button
+                            type="button"
+                            className="secondary-btn"
+                            onClick={handleRefreshSources}
+                          >
+                            Choose Window / Display
+                          </button>
+                        )}
+                        {shareableSources.length > 0 && (
+                          <select
+                            className="code-input"
+                            value={selectedSourceId ?? ''}
+                            onChange={(e) =>
+                              setSelectedSourceId(e.target.value || null)
+                            }
+                          >
+                            {shareableSources.map((src) => (
+                              <option key={src.id} value={src.id}>
+                                [{src.surfaceType.toUpperCase()}] {src.name}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        {(webrtcSnap.hostMediaState.screenVideo.approved ||
+                          webrtcSnap.hostMediaState.microphoneAudio.approved ||
+                          webrtcSnap.hostMediaState.deviceAudio.approved) && (
+                          <button
+                            type="button"
+                            className="primary-btn"
+                            onClick={handleExplicitStartSharing}
+                          >
+                            Start Sharing
+                          </button>
+                        )}
+                        {anyHostMediaActive && (
+                          <button
+                            type="button"
+                            className="danger-btn"
+                            onClick={handleStopAllSharing}
+                          >
+                            Stop All Sharing
+                          </button>
+                        )}
+                        {(
+                          [
+                            'screenVideo',
+                            'microphoneAudio',
+                            'deviceAudio',
+                          ] as const
+                        ).map((src) => {
+                          const st = webrtcSnap.hostMediaState[src];
+                          if (!st.active) return null;
+                          const label =
+                            src === 'screenVideo'
+                              ? 'Screen'
+                              : src === 'microphoneAudio'
+                                ? 'Mic'
+                                : 'Device Sound';
+                          return (
+                            <button
+                              key={src}
+                              type="button"
+                              className="small-secondary-btn"
+                              onClick={() => handleStopIndividualSource(src)}
+                            >
+                              Stop {label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="sidebar-section">
+                      <strong>Remote Audio</strong>
+                      <div className="actions-row">
+                        <button
+                          type="button"
+                          className="small-secondary-btn"
+                          onClick={() =>
+                            webrtcControllerRef.current?.updateGuestLocalPlayback(
+                              {
+                                micMutedLocally:
+                                  !webrtcSnap.guestPlayback.micMutedLocally,
+                              }
+                            )
+                          }
+                        >
+                          {webrtcSnap.guestPlayback.micMutedLocally
+                            ? 'Unmute Mic'
+                            : 'Mute Mic'}
+                        </button>
+                        <button
+                          type="button"
+                          className="small-secondary-btn"
+                          onClick={() =>
+                            webrtcControllerRef.current?.updateGuestLocalPlayback(
+                              {
+                                deviceAudioMutedLocally:
+                                  !webrtcSnap.guestPlayback
+                                    .deviceAudioMutedLocally,
+                              }
+                            )
+                          }
+                        >
+                          {webrtcSnap.guestPlayback.deviceAudioMutedLocally
+                            ? 'Unmute Sound'
+                            : 'Mute Sound'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {metadata.devModeEnabled && (
+                      <div className="sidebar-section">
+                        <button
+                          type="button"
+                          className="small-secondary-btn"
+                          onClick={() => setOptInDiagnostics((prev) => !prev)}
+                        >
+                          {optInDiagnostics
+                            ? 'Hide Diagnostics'
+                            : 'Show Diagnostics'}
+                        </button>
+                        {optInDiagnostics && liveDiagnostics && (
+                          <div className="muted" style={{ fontSize: '0.72rem' }}>
+                            Decoded: {liveDiagnostics.decodedWidth ?? 0}×
+                            {liveDiagnostics.decodedHeight ?? 0} @{' '}
+                            {liveDiagnostics.decodedFps ?? 0}fps
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </aside>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* INCOMING REQUEST DIALOG (USER A) */}
+          {snapshot && snapshot.incomingInvites.length > 0 && (() => {
+            const activeInvite = snapshot.incomingInvites[0];
+            return (
+              <section
+                className="card card-full card-incoming-invite"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="incoming-request-headline"
+                data-testid="incoming-request-dialog"
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    void handleRespondToInvite(activeInvite, 'decline');
+                  }
+                }}
+              >
+                <div className="subcard-header">
+                  <div>
+                    <h2 id="incoming-request-headline">
+                      {formatIncomingRequestHeadline(activeInvite)}
+                    </h2>
+                    <p className="muted" style={{ marginTop: '4px' }}>
+                      Device Code:{' '}
+                      <code data-testid="incoming-requester-code">
+                        {activeInvite.requesterFriendCode}
+                      </code>
+                    </p>
+                  </div>
+                  {metadata.devModeEnabled && (
+                    <span className="badge badge-neutral">
+                      Invite: {activeInvite.inviteId}
+                    </span>
+                  )}
+                </div>
+
+                <div className="toggle-bar">
+                  <label
+                    className={`permission-toggle-card ${
+                      preAcceptMedia.screenVideo ? 'checked' : ''
+                    }`}
+                  >
+                    <span className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        autoFocus
+                        checked={preAcceptMedia.screenVideo}
+                        onChange={(e) =>
+                          setPreAcceptMedia((prev) => ({
+                            ...prev,
+                            screenVideo: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Screen</span>
+                    </span>
+                    <span
+                      className={`presence-pill ${
+                        preAcceptMedia.screenVideo ? 'online' : 'offline'
+                      }`}
+                    >
+                      {preAcceptMedia.screenVideo ? 'ON' : 'OFF'}
                     </span>
                   </label>
 
-                  <ul className="feature-list">
-                    {(
-                      [
-                        'screenVideo',
-                        'microphoneAudio',
-                        'deviceAudio',
-                      ] as const
-                    ).map((src) => {
-                      const st = webrtcSnap.hostMediaState[src];
-                      return (
-                        <li key={src}>
-                          <div>
-                            <strong>{src}</strong> — Approved:{' '}
-                            <code>{String(st.approved)}</code> | Active:{' '}
-                            <code>{String(st.active)}</code> | Status:{' '}
-                            <code>{st.status}</code>
-                          </div>
-                          <div className="muted">{st.message}</div>
-                          <div className="actions-row">
-                            {st.active && (
-                              <button
-                                type="button"
-                                className="small-secondary-btn"
-                                onClick={() =>
-                                  handleStopIndividualSource(src)
-                                }
-                              >
-                                Stop {src} Only
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="small-secondary-btn"
-                              onClick={() => {
-                                webrtcControllerRef.current?.setSimulatedSourceFault(
-                                  src,
-                                  'permission_denied'
-                                );
-                                setStatusMessage(
-                                  `Armed permission_denied fault for ${src} on next Start Sharing.`
-                                );
-                              }}
-                            >
-                              Simulate Permission Denied
-                            </button>
-                            <button
-                              type="button"
-                              className="small-secondary-btn"
-                              onClick={() => {
-                                void webrtcControllerRef.current?.handleUnexpectedSourceDisappearance(
-                                  src,
-                                  `${src} disappeared mid-session (simulated source closure). Other approved features remain active.`
-                                );
-                              }}
-                            >
-                              Simulate Source Disappeared
-                            </button>
-                          </div>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-
-                {/* GUEST B: RECEIVED TRACKS & LOCAL-ONLY PLAYBACK CONTROLS */}
-                <div className="subcard">
-                  <h3>
-                    Guest B ({snapshot.activeSession.guestDisplayName}) —
-                    Received Tracks & Local Playback
-                  </h3>
-                  <p className="muted">
-                    Guest B can control <strong>only local playback</strong> and
-                    cannot enable or request Host A&apos;s capture sources.
-                  </p>
-
-                  <ul className="feature-list">
-                    <li>
-                      Active Received Tracks on B:{' '}
-                      <code>{webrtcSnap.guestReceivedTracks.length}</code> (
-                      Video: <code>{webrtcSnap.guestVideoTracksCount}</code>,
-                      Audio: <code>{webrtcSnap.guestAudioTracksCount}</code>)
-                    </li>
-                    <li>
-                      Total Video Tracks Ever Delivered to B in Session:{' '}
-                      <code>
-                        {webrtcSnap.totalVideoTracksEverDeliveredToGuest}
-                      </code>{' '}
-                      (Device-only & Mic-only always <code>0</code>)
-                    </li>
-                    {webrtcSnap.guestReceivedTracks.map((t) => (
-                      <li key={t.streamId}>
-                        Track <code>{t.source}</code> ({t.kind}):{' '}
-                        <code>{t.readyState}</code> — Label:{' '}
-                        <code>{t.label}</code> | Stream:{' '}
-                        <code>{t.streamId}</code>
-                      </li>
-                    ))}
-                  </ul>
-
-                  {/* Guest B Local-Only Playback Controls */}
-                  <div className="actions-row">
-                    <button
-                      type="button"
-                      className="small-secondary-btn"
-                      onClick={() =>
-                        webrtcControllerRef.current?.updateGuestLocalPlayback({
-                          videoPausedLocally:
-                            !webrtcSnap.guestPlayback.videoPausedLocally,
-                        })
-                      }
-                    >
-                      {webrtcSnap.guestPlayback.videoPausedLocally
-                        ? 'Resume Local Video Display (B)'
-                        : 'Pause Local Video Display (B)'}
-                    </button>
-                    <button
-                      type="button"
-                      className="small-secondary-btn"
-                      onClick={() =>
-                        webrtcControllerRef.current?.updateGuestLocalPlayback({
-                          micMutedLocally:
-                            !webrtcSnap.guestPlayback.micMutedLocally,
-                        })
-                      }
-                    >
-                      {webrtcSnap.guestPlayback.micMutedLocally
-                        ? 'Unmute Mic Playback (B)'
-                        : 'Mute Mic Playback (B)'}
-                    </button>
-                    <button
-                      type="button"
-                      className="small-secondary-btn"
-                      onClick={() =>
-                        webrtcControllerRef.current?.updateGuestLocalPlayback({
-                          deviceAudioMutedLocally:
-                            !webrtcSnap.guestPlayback.deviceAudioMutedLocally,
-                        })
-                      }
-                    >
-                      {webrtcSnap.guestPlayback.deviceAudioMutedLocally
-                        ? 'Unmute Device Audio Playback (B)'
-                        : 'Mute Device Audio Playback (B)'}
-                    </button>
-                  </div>
-
-                  {webrtcSnap.guestVideoTracksCount > 0 ? (
-                    <div className="active-video-notice">
-                      <span className="badge badge-accent">
-                        Active in Main Stage
-                      </span>
-                      <p className="muted" style={{ margin: '6px 0 0 0' }}>
-                        Screen video is rendered in the dedicated full-width
-                        stage above in{' '}
-                        <strong>{viewerMode.toUpperCase()}</strong> mode.
-                      </p>
-                    </div>
-                  ) : (
-                    <p className="muted" style={{ marginTop: '8px' }}>
-                      Screen video track is not currently active.
-                    </p>
-                  )}
-                  <audio ref={guestMicAudioRef} autoPlay />
-                  <audio ref={guestDeviceAudioRef} autoPlay />
-                </div>
-              </div>
-            </section>
-          )}
-
-          {/* INCOMING INVITES ACCEPT / DECLINE SCREEN (USER A) */}
-          {snapshot && snapshot.incomingInvites.length > 0 && (
-            <section className="card card-full card-incoming-invite">
-              <div className="subcard-header">
-                <span className="badge">Incoming Session Invite</span>
-                <span className="badge badge-neutral">
-                  Owner Consent Required Before Signaling
-                </span>
-              </div>
-              <h2>Incoming Invite — Choose Media Consent Before Accepting</h2>
-              <p className="muted">
-                Choose Screen Video, Microphone Audio, and Device Audio
-                independently before accepting. Both audio options default{' '}
-                <strong>OFF</strong>. The requester cannot enable your capture.
-                Screen Video means a window or display selected by you, never a
-                webcam.
-              </p>
-
-              <div className="toggle-bar">
-                <label
-                  className={`permission-toggle-card ${
-                    preAcceptMedia.screenVideo ? 'checked' : ''
-                  }`}
-                >
-                  <span className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={preAcceptMedia.screenVideo}
-                      onChange={(e) =>
-                        setPreAcceptMedia((prev) => ({
-                          ...prev,
-                          screenVideo: e.target.checked,
-                        }))
-                      }
-                    />
-                    <span>
-                      Screen Video (Window / Display Only — Never Webcam)
+                  <label
+                    className={`permission-toggle-card ${
+                      preAcceptMedia.microphoneAudio ? 'checked' : ''
+                    }`}
+                  >
+                    <span className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={preAcceptMedia.microphoneAudio}
+                        onChange={(e) =>
+                          setPreAcceptMedia((prev) => ({
+                            ...prev,
+                            microphoneAudio: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Microphone</span>
                     </span>
-                  </span>
-                  <span
-                    className={`presence-pill ${
-                      preAcceptMedia.screenVideo ? 'online' : 'offline'
+                    <span
+                      className={`presence-pill ${
+                        preAcceptMedia.microphoneAudio ? 'online' : 'offline'
+                      }`}
+                    >
+                      {preAcceptMedia.microphoneAudio ? 'ON' : 'OFF'}
+                    </span>
+                  </label>
+
+                  <label
+                    className={`permission-toggle-card ${
+                      preAcceptMedia.deviceAudio ? 'checked' : ''
                     }`}
                   >
-                    {preAcceptMedia.screenVideo ? 'ON' : 'OFF'}
-                  </span>
-                </label>
-
-                <label
-                  className={`permission-toggle-card ${
-                    preAcceptMedia.microphoneAudio ? 'checked' : ''
-                  }`}
-                >
-                  <span className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={preAcceptMedia.microphoneAudio}
-                      onChange={(e) =>
-                        setPreAcceptMedia((prev) => ({
-                          ...prev,
-                          microphoneAudio: e.target.checked,
-                        }))
-                      }
-                    />
-                    <span>Microphone Audio (Default OFF)</span>
-                  </span>
-                  <span
-                    className={`presence-pill ${
-                      preAcceptMedia.microphoneAudio ? 'online' : 'offline'
-                    }`}
-                  >
-                    {preAcceptMedia.microphoneAudio ? 'ON' : 'DEFAULT OFF'}
-                  </span>
-                </label>
-
-                <label
-                  className={`permission-toggle-card ${
-                    preAcceptMedia.deviceAudio ? 'checked' : ''
-                  }`}
-                >
-                  <span className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={preAcceptMedia.deviceAudio}
-                      onChange={(e) =>
-                        setPreAcceptMedia((prev) => ({
-                          ...prev,
-                          deviceAudio: e.target.checked,
-                        }))
-                      }
-                    />
-                    <span>Device / System Audio (Default OFF)</span>
-                  </span>
-                  <span
-                    className={`presence-pill ${
-                      preAcceptMedia.deviceAudio ? 'online' : 'offline'
-                    }`}
-                  >
-                    {preAcceptMedia.deviceAudio ? 'ON' : 'DEFAULT OFF'}
-                  </span>
-                </label>
-              </div>
-
-              <div className="telemetry-grid">
-                {snapshot.incomingInvites.map((inv) => (
-                  <div key={inv.inviteId} className="subcard">
-                    <h3>Requester Identity</h3>
-                    <ul className="feature-list">
-                      <li>
-                        Display Name: <strong>{inv.requesterDisplayName}</strong>
-                      </li>
-                      <li>
-                        Friend Code: <code>{inv.requesterFriendCode}</code>
-                      </li>
-                      <li>
-                        Account ID: <code>{inv.requesterAccountId}</code>
-                      </li>
-                      <li>
-                        Invite ID: <code>{inv.inviteId}</code>
-                      </li>
-                    </ul>
-                    <div className="actions-row">
-                      <button
-                        type="button"
-                        className="primary-btn"
-                        onClick={() => handleRespondToInvite(inv, 'accept')}
-                      >
-                        Accept Invite
-                      </button>
-                      <button
-                        type="button"
-                        className="danger-btn"
-                        onClick={() => handleRespondToInvite(inv, 'decline')}
-                      >
-                        Decline Invite
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* MAIN TWO-COLUMN: MY FRIEND CODE & ENTER FRIEND CODE */}
-          <div className="grid">
-            <section className="card">
-              <div className="subcard-header">
-                <h2>My Friend Code</h2>
-                <span className="badge badge-neutral">Permanent & Reusable</span>
-              </div>
-              <p className="muted">
-                Your permanent, reusable Friend Code. It is created once in D1,
-                never expires, reuses the same value across restarts and
-                sign-ins, and never grants automatic access on its own.
-              </p>
-              <div className="friend-code-display">
-                <code
-                  data-testid="friend-code-value"
-                  className="friend-code-value"
-                >
-                  {account.friendCode}
-                </code>
-                <button
-                  type="button"
-                  data-testid="copy-friend-code-button"
-                  className="primary-btn"
-                  onClick={handleCopyFriendCode}
-                >
-                  {copiedCode ? 'Copied!' : 'Copy Code'}
-                </button>
-              </div>
-            </section>
-
-            <section className="card">
-              <div className="subcard-header">
-                <h2>Enter Friend Code & Send Invite</h2>
-                <span className="badge badge-neutral">Explicit Consent</span>
-              </div>
-              <p className="muted">
-                Enter your peer&apos;s Friend Code (<code>ELM-XXXX-XXXX</code>)
-                to send a 1:1 session invite. They must be online and explicitly
-                Accept.
-              </p>
-              <form className="invite-form" onSubmit={handleSendInvite}>
-                <input
-                  type="text"
-                  className="code-input friend-code-input"
-                  placeholder="ELM-XXXX-XXXX"
-                  value={enteredFriendCode}
-                  onChange={(e) =>
-                    setEnteredFriendCode(e.target.value.toUpperCase())
-                  }
-                  maxLength={13}
-                />
-                <button type="submit" className="primary-btn">
-                  Send Invite
-                </button>
-              </form>
-
-              {snapshot?.outgoingInvite && (
-                <div className="subcard">
-                  <h3>Outgoing Invite Pending</h3>
-                  <ul className="feature-list">
-                    <li>
-                      Target:{' '}
-                      <strong>
-                        {snapshot.outgoingInvite.targetDisplayName}
-                      </strong>{' '}
-                      (<code>{snapshot.outgoingInvite.targetFriendCode}</code>)
-                    </li>
-                    <li>
-                      Status: <code>{snapshot.outgoingInvite.status}</code> (No
-                      signaling admitted before acceptance)
-                    </li>
-                  </ul>
+                    <span className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={preAcceptMedia.deviceAudio}
+                        onChange={(e) =>
+                          setPreAcceptMedia((prev) => ({
+                            ...prev,
+                            deviceAudio: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Device Sound</span>
+                    </span>
+                    <span
+                      className={`presence-pill ${
+                        preAcceptMedia.deviceAudio ? 'online' : 'offline'
+                      }`}
+                    >
+                      {preAcceptMedia.deviceAudio ? 'ON' : 'OFF'}
+                    </span>
+                  </label>
                 </div>
-              )}
-            </section>
-          </div>
+
+                <div className="actions-row" style={{ marginTop: '14px' }}>
+                  <button
+                    type="button"
+                    data-testid="incoming-decline-button"
+                    className="danger-btn"
+                    onClick={() => handleRespondToInvite(activeInvite, 'decline')}
+                  >
+                    Decline
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="incoming-accept-button"
+                    className="primary-btn"
+                    onClick={() => handleRespondToInvite(activeInvite, 'accept')}
+                  >
+                    Accept
+                  </button>
+                </div>
+              </section>
+            );
+          })()}
+
+          {/* HOME DASHBOARD: SINGLE-ROW CONNECT + YOUR DEVICE CODE */}
+          {!snapshot?.activeSession && (
+            <div className="home-stack" data-testid="home-dashboard">
+              <section className="card home-connect-row">
+                <form className="connect-bar" onSubmit={handleSendInvite}>
+                  <button
+                    type="button"
+                    className={`presence-pill ${
+                      account
+                        ? snapshot?.online
+                          ? 'online'
+                          : 'offline'
+                        : 'offline'
+                    }`}
+                    disabled={!account}
+                    onClick={() =>
+                      void handleTogglePresence(!snapshot?.online)
+                    }
+                    title={
+                      account
+                        ? 'Toggle availability'
+                        : 'Registration required before going online'
+                    }
+                  >
+                    {account
+                      ? snapshot?.online
+                        ? 'Connected · Available'
+                        : 'Offline'
+                      : deviceSetupState.registrationStatus === 'registering'
+                        ? 'Setting up...'
+                        : 'Offline'}
+                  </button>
+                  <input
+                    type="text"
+                    className="code-input friend-code-input connect-bar-input"
+                    placeholder="Enter a friend's device code"
+                    aria-label="Enter a friend's device code"
+                    value={enteredFriendCode}
+                    onChange={(e) =>
+                      setEnteredFriendCode(e.target.value.toUpperCase())
+                    }
+                    disabled={!account}
+                    maxLength={13}
+                  />
+                  <button
+                    type="submit"
+                    className="primary-btn"
+                    disabled={!account || !enteredFriendCode.trim()}
+                  >
+                    Send Request
+                  </button>
+                </form>
+
+                {snapshot?.outgoingInvite && (
+                  <div className="subcard" style={{ marginTop: '12px' }}>
+                    <h3>Waiting for Approval</h3>
+                    <p className="muted">
+                      Request sent to{' '}
+                      <code>{snapshot.outgoingInvite.targetFriendCode}</code> (
+                      {snapshot.outgoingInvite.status})
+                    </p>
+                  </div>
+                )}
+              </section>
+
+              <section className="card device-code-card">
+                <div className="subcard-header">
+                  <h2>Your Device Code</h2>
+                </div>
+                {account?.friendCode ? (
+                  <div className="friend-code-display">
+                    <code
+                      data-testid="friend-code-value"
+                      className="friend-code-value device-code-large"
+                    >
+                      {account.friendCode}
+                    </code>
+                    <button
+                      type="button"
+                      data-testid="copy-friend-code-button"
+                      className="primary-btn"
+                      onClick={handleCopyFriendCode}
+                    >
+                      {copiedCode ? 'Copied!' : 'Copy Code'}
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    className="offline-setup-box"
+                    data-testid="offline-registration-status"
+                  >
+                    <p className="muted">
+                      {deviceSetupState.registrationMessage ||
+                        'Offline before registration: unable to assign your device code yet.'}
+                    </p>
+                    <button
+                      type="button"
+                      data-testid="retry-registration-button"
+                      className="primary-btn"
+                      disabled={retryingRegistration}
+                      onClick={() => void handleRetryRegistration()}
+                    >
+                      {retryingRegistration ? 'Retrying...' : 'Retry'}
+                    </button>
+                  </div>
+                )}
+              </section>
+            </div>
+          )}
         </>
       )}
 
-      {/* 5-COMBINATION WEBRTC VERIFICATION RUNNER */}
-      <section className="card card-full">
+      {metadata.devModeEnabled && (
+        <>
+          {/* 5-COMBINATION WEBRTC VERIFICATION RUNNER */}
+          <section className="card card-full">
         <div className="subcard-header">
           <div>
             <h2>
@@ -2248,6 +2821,8 @@ export function App(): React.ReactElement {
           </div>
         )}
       </section>
+        </>
+      )}
     </main>
   );
 }

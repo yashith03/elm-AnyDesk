@@ -16,6 +16,12 @@ import {
   type WebRtcSignalPayload,
   type WebRtcTrackDescriptor,
 } from '@elm/protocol';
+import {
+  ChatImageReassemblyBuffer,
+  chunkChatImagePayload,
+  validateChatImageAttachment,
+  type ChatImageChunkFrame,
+} from '../shared/chat-attachments';
 
 export interface GuestReceivedTrackInfo {
   readonly source: MediaSourceKind;
@@ -73,6 +79,7 @@ export interface WebRtcSessionSnapshot {
   readonly totalVideoTracksEverDeliveredToGuest: number;
   readonly guestPlayback: GuestLocalPlaybackControls;
   readonly messages: readonly EphemeralChatMessage[];
+  readonly imageAttachmentsByMessageId: Readonly<Record<string, string>>;
   readonly lastStatusBanner: string | null;
   readonly permissionsInvalidated: boolean;
   readonly signalingMembershipInvalidated: boolean;
@@ -84,6 +91,8 @@ export interface WebRtcSessionSnapshot {
 }
 
 export interface WebRtcControllerOptions {
+  readonly mode?: 'loopback' | 'remote';
+  readonly localRole?: 'host' | 'guest';
   readonly heartbeatIntervalMs?: number;
   readonly livenessTimeoutMs?: number;
   readonly enableBackgroundLivenessTimer?: boolean;
@@ -141,10 +150,13 @@ export class ApprovedWebRtcSessionController {
   public readonly session: ApprovedSessionSummary;
   private readonly onChange: (snapshot: WebRtcSessionSnapshot) => void;
 
-  private readonly pcHost: RTCPeerConnection;
-  private readonly pcGuest: RTCPeerConnection;
+  private readonly mode: 'loopback' | 'remote';
+  private readonly localRole: 'host' | 'guest';
+  private readonly pcHost: RTCPeerConnection | null;
+  private readonly pcGuest: RTCPeerConnection | null;
   private hostDataChannel: RTCDataChannel | null = null;
   private guestDataChannel: RTCDataChannel | null = null;
+  private signalPollTimerId: ReturnType<typeof setInterval> | null = null;
 
   private hostAfterSeq = 0;
   private guestAfterSeq = 0;
@@ -176,7 +188,71 @@ export class ApprovedWebRtcSessionController {
   };
 
   private readonly messages: EphemeralChatMessage[] = [];
+  private imageAttachments: Record<string, string> = {};
+  private readonly imageReassemblyBuffer = new ChatImageReassemblyBuffer();
   private lastStatusBanner: string | null = null;
+
+  public sendChatImageOverDataChannel(params: {
+    sender: 'host' | 'guest';
+    senderAccountId: string;
+    senderDisplayName: string;
+    text: string;
+    mimeType: string;
+    byteLength: number;
+    dataUrl: string;
+  }): { ok: true; message: EphemeralChatMessage } | { ok: false; error: string } {
+    if (this.closed) {
+      return { ok: false, error: 'Session is closed.' };
+    }
+    const validation = validateChatImageAttachment({
+      mimeType: params.mimeType,
+      byteLength: params.byteLength,
+      dataUrl: params.dataUrl,
+    });
+    if (!validation.ok) {
+      return validation;
+    }
+    const channel =
+      params.sender === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (!channel || channel.readyState !== 'open') {
+      return { ok: false, error: 'Peer chat channel is not open.' };
+    }
+    const messageId = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+    const trimmedText = params.text.trim() || '[Image]';
+    try {
+      const frames = chunkChatImagePayload({
+        messageId,
+        sessionId: this.session.sessionId,
+        senderAccountId: params.senderAccountId,
+        senderDisplayName: params.senderDisplayName,
+        sentAt,
+        text: trimmedText,
+        mimeType: params.mimeType.trim().toLowerCase(),
+        dataUrl: params.dataUrl,
+      });
+      for (const frame of frames) {
+        channel.send(JSON.stringify(frame));
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to send image over peer channel.',
+      };
+    }
+    const message: EphemeralChatMessage = {
+      messageId,
+      sessionId: this.session.sessionId,
+      senderAccountId: params.senderAccountId,
+      senderDisplayName: params.senderDisplayName,
+      text: trimmedText,
+      sentAt,
+    };
+    this.messages.push(message);
+    this.imageAttachments[messageId] = params.dataUrl;
+    this.emitChange();
+    return { ok: true, message };
+  }
 
   // Pre-start fault injection flags for testing permission_denied / unsupported combinations
   private readonly simulatedPreStartFaults = new Map<
@@ -239,8 +315,16 @@ export class ApprovedWebRtcSessionController {
       iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
     };
 
-    this.pcHost = new RTCPeerConnection(rtcConfig);
-    this.pcGuest = new RTCPeerConnection(rtcConfig);
+    this.mode = options?.mode ?? 'loopback';
+    this.localRole = options?.localRole ?? 'host';
+    this.pcHost =
+      this.mode === 'loopback' || this.localRole === 'host'
+        ? new RTCPeerConnection(rtcConfig)
+        : null;
+    this.pcGuest =
+      this.mode === 'loopback' || this.localRole === 'guest'
+        ? new RTCPeerConnection(rtcConfig)
+        : null;
 
     this.setupPeerConnectionListeners();
   }
@@ -267,10 +351,10 @@ export class ApprovedWebRtcSessionController {
   private setupPeerConnectionListeners(): void {
     const checkTransportHealth = () => {
       if (this.closed) return;
-      const hostConn = this.pcHost.connectionState;
-      const guestConn = this.pcGuest.connectionState;
-      const hostIce = this.pcHost.iceConnectionState;
-      const guestIce = this.pcGuest.iceConnectionState;
+      const hostConn = this.pcHost?.connectionState ?? 'new';
+      const guestConn = this.pcGuest?.connectionState ?? 'new';
+      const hostIce = this.pcHost?.iceConnectionState ?? 'new';
+      const guestIce = this.pcGuest?.iceConnectionState ?? 'new';
 
       if (
         hostConn === 'failed' ||
@@ -278,7 +362,11 @@ export class ApprovedWebRtcSessionController {
         hostIce === 'failed' ||
         guestIce === 'failed'
       ) {
-        if (this.hostDataChannel?.readyState !== 'open') {
+        const activeDc =
+          this.mode === 'remote' && this.localRole === 'guest'
+            ? this.guestDataChannel
+            : this.hostDataChannel;
+        if (activeDc?.readyState !== 'open') {
           void this.reportRestrictiveNetworkDirectConnectionFailure(
             `ICE=${hostIce}/${guestIce}, PC=${hostConn}/${guestConn}`
           );
@@ -294,58 +382,61 @@ export class ApprovedWebRtcSessionController {
       this.emitChange();
     };
 
-    this.pcHost.onconnectionstatechange = checkTransportHealth;
-    this.pcHost.oniceconnectionstatechange = checkTransportHealth;
-    this.pcGuest.onconnectionstatechange = checkTransportHealth;
-    this.pcGuest.oniceconnectionstatechange = checkTransportHealth;
+    if (this.pcHost) {
+      this.pcHost.onconnectionstatechange = checkTransportHealth;
+      this.pcHost.oniceconnectionstatechange = checkTransportHealth;
+      // Host A ICE candidates -> Coordinator -> Guest B
+      this.pcHost.onicecandidate = (event) => {
+        if (this.closed || !event.candidate) return;
+        void this.sendSignalFrom(this.session.hostAccountId, {
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        });
+      };
+    }
 
-    // Host A ICE candidates -> Coordinator -> Guest B
-    this.pcHost.onicecandidate = (event) => {
-      if (this.closed || !event.candidate) return;
-      void this.sendSignalFrom(this.session.hostAccountId, {
-        type: 'ice-candidate',
-        candidate: event.candidate.candidate,
-        sdpMid: event.candidate.sdpMid,
-        sdpMLineIndex: event.candidate.sdpMLineIndex,
-      });
-    };
+    if (this.pcGuest) {
+      this.pcGuest.onconnectionstatechange = checkTransportHealth;
+      this.pcGuest.oniceconnectionstatechange = checkTransportHealth;
+      // Guest B ICE candidates -> Coordinator -> Host A
+      this.pcGuest.onicecandidate = (event) => {
+        if (this.closed || !event.candidate) return;
+        void this.sendSignalFrom(this.session.guestAccountId, {
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        });
+      };
 
-    // Guest B ICE candidates -> Coordinator -> Host A
-    this.pcGuest.onicecandidate = (event) => {
-      if (this.closed || !event.candidate) return;
-      void this.sendSignalFrom(this.session.guestAccountId, {
-        type: 'ice-candidate',
-        candidate: event.candidate.candidate,
-        sdpMid: event.candidate.sdpMid,
-        sdpMLineIndex: event.candidate.sdpMLineIndex,
-      });
-    };
+      // Guest B receives media tracks from Host A (A -> B only)
+      this.pcGuest.ontrack = (event) => {
+        if (this.closed) return;
+        if (event.track.kind === 'video') {
+          this.totalVideoTracksEverDeliveredToGuest += 1;
+        }
+        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        this.guestRawTrackEntries.set(stream.id, {
+          track: event.track,
+          stream,
+        });
 
-    // Guest B receives media tracks from Host A (A -> B only)
-    this.pcGuest.ontrack = (event) => {
-      if (this.closed) return;
-      if (event.track.kind === 'video') {
-        this.totalVideoTracksEverDeliveredToGuest += 1;
-      }
-      const stream = event.streams[0] ?? new MediaStream([event.track]);
-      this.guestRawTrackEntries.set( stream.id, {
-        track: event.track,
-        stream,
-      });
+        event.track.onmute = () => this.emitChange();
+        event.track.onunmute = () => this.emitChange();
+        event.track.onended = () => this.emitChange();
+        this.emitChange();
+      };
 
-      event.track.onmute = () => this.emitChange();
-      event.track.onunmute = () => this.emitChange();
-      event.track.onended = () => this.emitChange();
-      this.emitChange();
-    };
-
-    // Guest B receives the reliable, ordered DataChannel created by Host A
-    this.pcGuest.ondatachannel = (event) => {
-      if (this.closed) return;
-      const channel = event.channel;
-      this.guestDataChannel = channel;
-      this.attachDataChannelHandlers(channel, 'guest');
-    };
+      // Guest B receives the reliable, ordered DataChannel created by Host A
+      this.pcGuest.ondatachannel = (event) => {
+        if (this.closed) return;
+        const channel = event.channel;
+        this.guestDataChannel = channel;
+        this.attachDataChannelHandlers(channel, 'guest');
+      };
+    }
   }
 
   private attachDataChannelHandlers(
@@ -364,8 +455,9 @@ export class ApprovedWebRtcSessionController {
     channel.onmessage = (event) => {
       if (this.closed) return;
       try {
-        const parsed = JSON.parse(String(event.data)) as EphemeralChatMessage & {
+        const parsed = JSON.parse(String(event.data)) as (EphemeralChatMessage | ChatImageChunkFrame) & {
           __elmControl?: 'liveness-heartbeat' | 'teardown-notice';
+          __elmImageChunk?: true;
           sender?: 'host' | 'guest';
           reason?: SessionTerminationReason;
           subReason?: string;
@@ -394,13 +486,28 @@ export class ApprovedWebRtcSessionController {
           return;
         }
 
+        if (parsed && parsed.__elmImageChunk) {
+          const completed = this.imageReassemblyBuffer.acceptChunk(
+            parsed as ChatImageChunkFrame,
+            this.session.sessionId
+          );
+          if (completed) {
+            if (!this.messages.some((m) => m.messageId === completed.message.messageId)) {
+              this.messages.push(completed.message);
+            }
+            this.imageAttachments[completed.message.messageId] = completed.dataUrl;
+            this.emitChange();
+          }
+          return;
+        }
         if (
           parsed &&
+          'messageId' in parsed &&
           parsed.messageId &&
           parsed.sessionId === this.session.sessionId &&
           !this.messages.some((m) => m.messageId === parsed.messageId)
         ) {
-          this.messages.push(parsed);
+          this.messages.push(parsed as EphemeralChatMessage);
           this.emitChange();
         }
       } catch {
@@ -416,7 +523,30 @@ export class ApprovedWebRtcSessionController {
    * explicitly clicks "Start Sharing".
    */
   public async connectAcceptedSession(): Promise<WebRtcSessionSnapshot> {
+    if (this.mode === 'remote') {
+      if (this.signalPollTimerId === null && !this.closed) {
+        this.signalPollTimerId = setInterval(() => {
+          void this.pumpSignalsOnce();
+        }, 350);
+      }
+      if (this.localRole === 'guest') {
+        await this.pumpSignalsOnce();
+        const nowPerf = performance.now();
+        this.lastHostHeartbeatPerfMs = nowPerf;
+        this.lastGuestHeartbeatPerfMs = nowPerf;
+        if (this.enableBackgroundLivenessTimer) {
+          this.startLivenessMonitor();
+        }
+        this.emitChange();
+        return this.getSnapshot();
+      }
+    }
+
     if (this.hostDataChannel) {
+      return this.getSnapshot();
+    }
+
+    if (!this.pcHost) {
       return this.getSnapshot();
     }
 
@@ -427,7 +557,9 @@ export class ApprovedWebRtcSessionController {
     this.attachDataChannelHandlers(this.hostDataChannel, 'host');
 
     await this.renegotiateHostToGuest();
-    await this.waitForDataChannelOpen(4000);
+    if (this.mode === 'loopback') {
+      await this.waitForDataChannelOpen(4000);
+    }
     const nowPerf = performance.now();
     this.lastHostHeartbeatPerfMs = nowPerf;
     this.lastGuestHeartbeatPerfMs = nowPerf;
@@ -640,30 +772,34 @@ export class ApprovedWebRtcSessionController {
         this.pumpAgainRequested = false;
 
         // 1. Poll signals destined for Guest B
-        const guestPoll = await window.elmDesktop.pollSessionSignals({
-          sessionId: this.session.sessionId,
-          receiverAccountId: this.session.guestAccountId,
-          afterSeq: this.guestAfterSeq,
-        });
-        if (guestPoll.ok && guestPoll.data) {
-          for (const env of guestPoll.data.signals) {
-            if (env.seq <= this.guestAfterSeq) continue;
-            this.guestAfterSeq = env.seq;
-            await this.handleSignalForGuest(env.payload);
+        if (this.mode === 'loopback' || this.localRole === 'guest') {
+          const guestPoll = await window.elmDesktop.pollSessionSignals({
+            sessionId: this.session.sessionId,
+            receiverAccountId: this.session.guestAccountId,
+            afterSeq: this.guestAfterSeq,
+          });
+          if (guestPoll.ok && guestPoll.data) {
+            for (const env of guestPoll.data.signals) {
+              if (env.seq <= this.guestAfterSeq) continue;
+              this.guestAfterSeq = env.seq;
+              await this.handleSignalForGuest(env.payload);
+            }
           }
         }
 
         // 2. Poll signals destined for Host A
-        const hostPoll = await window.elmDesktop.pollSessionSignals({
-          sessionId: this.session.sessionId,
-          receiverAccountId: this.session.hostAccountId,
-          afterSeq: this.hostAfterSeq,
-        });
-        if (hostPoll.ok && hostPoll.data) {
-          for (const env of hostPoll.data.signals) {
-            if (env.seq <= this.hostAfterSeq) continue;
-            this.hostAfterSeq = env.seq;
-            await this.handleSignalForHost(env.payload);
+        if (this.mode === 'loopback' || this.localRole === 'host') {
+          const hostPoll = await window.elmDesktop.pollSessionSignals({
+            sessionId: this.session.sessionId,
+            receiverAccountId: this.session.hostAccountId,
+            afterSeq: this.hostAfterSeq,
+          });
+          if (hostPoll.ok && hostPoll.data) {
+            for (const env of hostPoll.data.signals) {
+              if (env.seq <= this.hostAfterSeq) continue;
+              this.hostAfterSeq = env.seq;
+              await this.handleSignalForHost(env.payload);
+            }
           }
         }
       } while (this.pumpAgainRequested && !this.closed);
@@ -673,7 +809,7 @@ export class ApprovedWebRtcSessionController {
   }
 
   private async handleSignalForGuest(payload: WebRtcSignalPayload): Promise<void> {
-    if (this.closed) return;
+    if (this.closed || !this.pcGuest) return;
     if (payload.type === 'offer') {
       this.latestAdvertisedTracks = [...payload.activeTracks];
       await this.pcGuest.setRemoteDescription({
@@ -709,7 +845,7 @@ export class ApprovedWebRtcSessionController {
   }
 
   private async handleSignalForHost(payload: WebRtcSignalPayload): Promise<void> {
-    if (this.closed) return;
+    if (this.closed || !this.pcHost) return;
     if (payload.type === 'answer') {
       if (this.pcHost.signalingState === 'have-local-offer') {
         await this.pcHost.setRemoteDescription({
@@ -733,7 +869,7 @@ export class ApprovedWebRtcSessionController {
 
   private async renegotiateHostToGuest(): Promise<void> {
     const run = async () => {
-      if (this.closed) return;
+      if (this.closed || !this.pcHost) return;
       const activeTracks = this.buildActiveTrackDescriptors();
       this.latestAdvertisedTracks = activeTracks;
 
@@ -746,15 +882,17 @@ export class ApprovedWebRtcSessionController {
         activeTracks,
       });
 
-      // Pump signals until Guest B's answer and any pending ICE candidates are processed
-      for (let i = 0; i < 10; i++) {
-        await this.pumpSignalsOnce();
-        if (this.pcHost.signalingState === 'stable') {
-          break;
+      if (this.mode === 'loopback') {
+        // Pump signals until Guest B's answer and any pending ICE candidates are processed
+        for (let i = 0; i < 10; i++) {
+          await this.pumpSignalsOnce();
+          if (this.pcHost.signalingState === 'stable') {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 15));
         }
-        await new Promise((r) => setTimeout(r, 15));
+        await this.pumpSignalsOnce();
       }
-      await this.pumpSignalsOnce();
       this.emitChange();
     };
 
@@ -931,6 +1069,7 @@ export class ApprovedWebRtcSessionController {
       }
 
       const dedicatedStream = new MediaStream([videoTrack]);
+      if (!this.pcHost) throw new Error('Host peer connection not initialized.');
       const sender = this.pcHost.addTrack(videoTrack, dedicatedStream);
 
       this.hostSenders.set('screenVideo', {
@@ -1028,6 +1167,7 @@ export class ApprovedWebRtcSessionController {
       }
 
       const dedicatedStream = new MediaStream([audioTrack]);
+      if (!this.pcHost) throw new Error('Host peer connection not initialized.');
       const sender = this.pcHost.addTrack(audioTrack, dedicatedStream);
 
       this.hostSenders.set('microphoneAudio', {
@@ -1149,6 +1289,7 @@ export class ApprovedWebRtcSessionController {
         }
 
         const dedicatedStream = new MediaStream([deviceTrack]);
+        if (!this.pcHost) throw new Error('Host peer connection not initialized.');
         const sender = this.pcHost.addTrack(deviceTrack, dedicatedStream);
 
         const cleanup = () => {
@@ -1209,6 +1350,7 @@ export class ApprovedWebRtcSessionController {
       }
 
       const dedicatedStream = new MediaStream([loopbackTrack]);
+      if (!this.pcHost) throw new Error('Host peer connection not initialized.');
       const sender = this.pcHost.addTrack(loopbackTrack, dedicatedStream);
 
       this.hostSenders.set('deviceAudio', {
@@ -1266,7 +1408,7 @@ export class ApprovedWebRtcSessionController {
     try {
       this.hostSenders.delete(source);
       try {
-        this.pcHost.removeTrack(entry.sender);
+        this.pcHost?.removeTrack(entry.sender);
       } catch {
         // Ignore if pcHost already closed
       }
@@ -1320,7 +1462,7 @@ export class ApprovedWebRtcSessionController {
       try {
         this.hostSenders.delete(source);
         try {
-          this.pcHost.removeTrack(entry.sender);
+          this.pcHost?.removeTrack(entry.sender);
         } catch {
           // Ignore
         }
@@ -1457,7 +1599,7 @@ export class ApprovedWebRtcSessionController {
   }
 
   private computeGuestReceivedTracks(): GuestReceivedTrackInfo[] {
-    if (this.closed) return [];
+    if (this.closed || !this.pcGuest) return [];
 
     // Active transceivers on pcGuest that are currently receiving media from pcHost
     const activeReceivingDirections = new Set(['recvonly', 'sendrecv']);
@@ -1503,26 +1645,47 @@ export class ApprovedWebRtcSessionController {
       (t) => t.kind === 'audio'
     ).length;
 
+    const activeDc =
+      this.mode === 'remote'
+        ? this.localRole === 'host'
+          ? this.hostDataChannel
+          : this.guestDataChannel
+        : null;
     const dcState =
-      this.hostDataChannel?.readyState === 'open' &&
-      this.guestDataChannel?.readyState === 'open'
+      this.mode === 'remote'
+        ? activeDc?.readyState === 'open'
+          ? 'open'
+          : activeDc?.readyState === 'connecting'
+          ? 'connecting'
+          : 'closed'
+        : this.hostDataChannel?.readyState === 'open' &&
+          this.guestDataChannel?.readyState === 'open'
         ? 'open'
         : this.hostDataChannel?.readyState === 'connecting' ||
           this.guestDataChannel?.readyState === 'connecting'
         ? 'connecting'
         : 'closed';
 
+    const primaryPc =
+      this.mode === 'remote'
+        ? this.localRole === 'host'
+          ? this.pcHost
+          : this.pcGuest
+        : this.pcGuest;
+    const dcForMeta =
+      this.mode === 'remote' ? activeDc : this.hostDataChannel;
+
     return {
       sessionId: this.session.sessionId,
-      connectionState: this.pcGuest.connectionState,
-      iceConnectionState: this.pcGuest.iceConnectionState,
+      connectionState: primaryPc?.connectionState ?? 'closed',
+      iceConnectionState: primaryPc?.iceConnectionState ?? 'closed',
       dataChannelState: dcState,
-      dataChannelOrdered: this.hostDataChannel?.ordered ?? null,
+      dataChannelOrdered: dcForMeta?.ordered ?? null,
       dataChannelReliable:
-        this.hostDataChannel !== null &&
-        this.hostDataChannel.ordered === true &&
-        this.hostDataChannel.maxPacketLifeTime === null &&
-        this.hostDataChannel.maxRetransmits === null,
+        dcForMeta !== null &&
+        dcForMeta.ordered === true &&
+        dcForMeta.maxPacketLifeTime === null &&
+        dcForMeta.maxRetransmits === null,
       sharingStartedByHost: this.sharingStartedByHost,
       hostMediaState: { ...this.hostMediaState },
       guestReceivedTracks,
@@ -1532,6 +1695,7 @@ export class ApprovedWebRtcSessionController {
         this.totalVideoTracksEverDeliveredToGuest,
       guestPlayback: { ...this.guestPlayback },
       messages: [...this.messages],
+      imageAttachmentsByMessageId: { ...this.imageAttachments },
       lastStatusBanner: this.lastStatusBanner,
       permissionsInvalidated: this.permissionsInvalidated,
       signalingMembershipInvalidated: this.signalingMembershipInvalidated,
@@ -1747,7 +1911,7 @@ export class ApprovedWebRtcSessionController {
     for (const [source, entry] of this.hostSenders.entries()) {
       this.stoppingByHost.add(source);
       try {
-        this.pcHost.removeTrack(entry.sender);
+        this.pcHost?.removeTrack(entry.sender);
       } catch {
         // Ignore if pcHost already closed
       }
@@ -1790,10 +1954,16 @@ export class ApprovedWebRtcSessionController {
     this.guestRawTrackEntries.clear();
     this.latestAdvertisedTracks = [];
     this.messages.length = 0;
+    this.imageAttachments = {};
+    this.imageReassemblyBuffer.clear();
     this.guestViewerCleared = true;
     this.onGuestViewerCleared?.();
 
     // 4. Close both chat DataChannels and both WebRTC PeerConnections
+    if (this.signalPollTimerId !== null) {
+      clearInterval(this.signalPollTimerId);
+      this.signalPollTimerId = null;
+    }
     try {
       this.hostDataChannel?.close();
     } catch {
@@ -1805,12 +1975,12 @@ export class ApprovedWebRtcSessionController {
       // Ignore
     }
     try {
-      this.pcHost.close();
+      this.pcHost?.close();
     } catch {
       // Ignore
     }
     try {
-      this.pcGuest.close();
+      this.pcGuest?.close();
     } catch {
       // Ignore
     }
@@ -1832,8 +2002,8 @@ export class ApprovedWebRtcSessionController {
       duplicateCallCount: 0,
       hostTracksStoppedCount: stoppedCount,
       peerConnectionsClosed:
-        this.pcHost.connectionState === 'closed' &&
-        this.pcGuest.connectionState === 'closed',
+        (this.pcHost === null || this.pcHost.connectionState === 'closed') &&
+        (this.pcGuest === null || this.pcGuest.connectionState === 'closed'),
       dataChannelsClosed: true,
       guestViewerCleared: true,
       permissionsInvalidated: true,

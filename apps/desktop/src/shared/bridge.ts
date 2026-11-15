@@ -2,10 +2,12 @@ import type {
   AccountProfile,
   AllowedScreenSurface,
   ApprovedSessionSummary,
+  DeviceRegistrationStatus,
   EphemeralChatMessage,
   HostMediaRuntimeState,
   HostMediaSelection,
   InviteSummary,
+  LocalDeviceProfile,
   MediaSourceKind,
   PresenceStateSnapshot,
   ProtocolErrorCode,
@@ -17,7 +19,7 @@ import type {
 } from '@elm/protocol';
 import type { ThemeMode, ThemeStateSnapshot } from './theme';
 
-export type DesktopWindowRole = 'main' | 'chat';
+export type DesktopWindowRole = 'main' | 'chat' | 'presentation';
 
 export interface DesktopSecurityPosture {
   readonly sandbox: true;
@@ -37,6 +39,7 @@ export interface DesktopRuntimeMetadata {
   readonly protocolVersion: string;
   readonly platform: string;
   readonly windowRole: DesktopWindowRole;
+  readonly devModeEnabled: boolean;
   readonly phase: 'Phase 5 — Windows Installer, Cloudflare Staging & Pilot Verification';
   readonly defaultMediaSelection: HostMediaSelection;
   readonly initialSessionState: SessionLifecycleState;
@@ -133,6 +136,14 @@ export interface VolatileSessionUiState {
  * Narrow preload bridge contract exposed on `window.elmDesktop`.
  * Raw Electron IPC primitives and provider secrets are never exposed to the renderer.
  */
+export interface DeviceSetupState {
+  readonly profileCompleted: boolean;
+  readonly localProfile: LocalDeviceProfile | null;
+  readonly registrationStatus: DeviceRegistrationStatus;
+  readonly registrationMessage: string | null;
+  readonly registeredAccount: AccountProfile | null;
+}
+
 export interface ElmDesktopBridge {
   getRuntimeMetadata: () => Promise<DesktopRuntimeMetadata>;
   openSeparateChatWindow: () => Promise<{
@@ -141,10 +152,28 @@ export interface ElmDesktopBridge {
     chatHwndHex?: string;
     distinctHwnds?: boolean;
   }>;
+  openPresentationView: () => Promise<{
+    opened: boolean;
+    mainHwndHex?: string;
+    presentationHwndHex?: string;
+    distinctHwnds?: boolean;
+  }>;
   copyTextToClipboard: (text: string) => Promise<{ copied: boolean }>;
+
+  // Device Setup & Anonymous Registration (On-device profile, zero login)
+  getDeviceSetupState: () => Promise<ApiActionResult<DeviceSetupState>>;
+  saveLocalProfile: (input: {
+    name: string;
+    email?: string;
+    phone?: string;
+  }) => Promise<ApiActionResult<DeviceSetupState>>;
+  retryDeviceRegistration: () => Promise<ApiActionResult<DeviceSetupState>>;
 
   // Phase 2: Authentication, Friend Codes, Presence & Invites
   getStoredAuthSession: () => Promise<
+    ApiActionResult<{ account: AccountProfile; snapshot: PresenceStateSnapshot }>
+  >;
+  updateLocalDisplayName: (displayName: string) => Promise<
     ApiActionResult<{ account: AccountProfile; snapshot: PresenceStateSnapshot }>
   >;
   startBrowserOAuthSignIn: () => Promise<

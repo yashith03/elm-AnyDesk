@@ -21,11 +21,22 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.invoke('elm:get-runtime-metadata'),
   openSeparateChatWindow: () =>
     ipcRenderer.invoke('elm:open-separate-chat-window'),
+  openPresentationView: () =>
+    ipcRenderer.invoke('elm:open-presentation-view'),
   copyTextToClipboard: (text: string): Promise<{ copied: boolean }> =>
     ipcRenderer.invoke('elm:copy-text-to-clipboard', text),
 
+  // Device Setup & Anonymous Registration (On-device profile, zero login)
+  getDeviceSetupState: () => ipcRenderer.invoke('elm:device-get-setup-state'),
+  saveLocalProfile: (input: { name: string; email?: string; phone?: string }) =>
+    ipcRenderer.invoke('elm:device-save-local-profile', input),
+  retryDeviceRegistration: () =>
+    ipcRenderer.invoke('elm:device-retry-registration'),
+
   // Phase 2: Authentication, Friend Codes, Presence & Invites
   getStoredAuthSession: () => ipcRenderer.invoke('elm:auth-get-stored-session'),
+  updateLocalDisplayName: (displayName: string) =>
+    ipcRenderer.invoke('elm:update-local-display-name', displayName),
   startBrowserOAuthSignIn: () =>
     ipcRenderer.invoke('elm:auth-start-browser-oauth'),
   signInWithTestDouble: (personaKey: string) =>

@@ -50,7 +50,7 @@
         {
           "binding": "DB",
           "database_name": "elm-anydesk-db-staging",
-          "database_id": "00000000-0000-0000-0000-000000000000",
+          "database_id": "35072762-8c9d-4f7a-852d-1b450a8957cc",
           "migrations_dir": "migrations"
         }
       ],
