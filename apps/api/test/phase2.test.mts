@@ -1312,3 +1312,145 @@ test('6. Phase 5: Pilot installer download page, download manifest, STUN-only po
   assert.ok(html.includes('Auto-Upgrade Disabled'));
 });
 
+test('7. Anonymous device registration: idempotent retry, secret protection, forced code collision retry, and invite flow', async () => {
+  const env = createTestEnv();
+
+  // Sequence of codes:
+  // 1st call -> ELM-AAAA-BBBB (assigned to Device 1)
+  // 2nd & 3rd calls -> ELM-AAAA-BBBB (forced collision for Device 2!)
+  // 4th call -> ELM-CCCC-DDDD (assigned to Device 2 after collision retries)
+  const generatedSequence = [
+    'ELM-AAAA-BBBB',
+    'ELM-AAAA-BBBB',
+    'ELM-AAAA-BBBB',
+    'ELM-CCCC-DDDD',
+  ];
+  let seqIdx = 0;
+
+  const worker = createApiWorker({
+    codeGenerator: () => {
+      const next = generatedSequence[seqIdx];
+      seqIdx += 1;
+      return next ?? 'ELM-EEEE-FFFF';
+    },
+  });
+
+  const device1Cred = {
+    deviceId: 'device-install-1111-2222-3333',
+    deviceSecret: 'secret-11112222333344445555666677778888',
+  };
+  const device2Cred = {
+    deviceId: 'device-install-4444-5555-6666',
+    deviceSecret: 'secret-44445555666677778888999900001111',
+  };
+
+  // 1. Register Device 1
+  const reg1Res = await worker.fetch!(
+    new Request('https://api.elm.local/devices/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(device1Cred),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(reg1Res.status, 200);
+  const reg1 = (await reg1Res.json()) as {
+    token: string;
+    alreadyRegistered: boolean;
+    account: AccountProfile;
+  };
+  assert.equal(reg1.alreadyRegistered, false);
+  assert.equal(reg1.account.friendCode, 'ELM-AAAA-BBBB');
+
+  // 2. Idempotent retry / restart for Device 1 preserves the same code and accountId
+  const retry1Res = await worker.fetch!(
+    new Request('https://api.elm.local/devices/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(device1Cred),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(retry1Res.status, 200);
+  const retry1 = (await retry1Res.json()) as {
+    token: string;
+    alreadyRegistered: boolean;
+    account: AccountProfile;
+  };
+  assert.equal(retry1.alreadyRegistered, true);
+  assert.equal(retry1.account.accountId, reg1.account.accountId);
+  assert.equal(retry1.account.friendCode, 'ELM-AAAA-BBBB');
+
+  // 3. Wrong secret for Device 1's deviceId is rejected
+  const badSecretRes = await worker.fetch!(
+    new Request('https://api.elm.local/devices/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: device1Cred.deviceId,
+        deviceSecret: 'wrong-secret-0000000000000000000000000000',
+      }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(badSecretRes.status, 401);
+  assert.equal(
+    ((await badSecretRes.json()) as { error: string }).error,
+    'DEVICE_SECRET_MISMATCH'
+  );
+
+  // 4. Register Device 2 with forced code collisions -> retries and receives ELM-CCCC-DDDD
+  const reg2Res = await worker.fetch!(
+    new Request('https://api.elm.local/devices/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(device2Cred),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(reg2Res.status, 200);
+  const reg2 = (await reg2Res.json()) as {
+    token: string;
+    alreadyRegistered: boolean;
+    account: AccountProfile;
+  };
+  assert.equal(reg2.alreadyRegistered, false);
+  assert.equal(reg2.account.friendCode, 'ELM-CCCC-DDDD');
+  assert.equal(seqIdx, 4);
+
+  // 5. Device 1 & Device 2 go online and Device 2 sends an invite to Device 1 without any GitHub login
+  for (const token of [reg1.token, reg2.token]) {
+    const onlineRes = await worker.fetch!(
+      new Request('https://api.elm.local/presence/connect', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(onlineRes.status, 200);
+  }
+
+  const inviteRes = await worker.fetch!(
+    new Request('https://api.elm.local/invites', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${reg2.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ friendCode: reg1.account.friendCode }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(inviteRes.status, 201);
+});
+
+

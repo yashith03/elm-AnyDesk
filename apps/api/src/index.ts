@@ -4,6 +4,7 @@ import {
   PILOT_NETWORK_POLICY,
   PROTOCOL_VERSION,
   type AccountProfile,
+  type AnonymousDeviceRegistrationResponse,
   type ApiHealthResponse,
   type AuthSessionResponse,
   type HostMediaSelection,
@@ -24,6 +25,7 @@ import {
   ensureAccountWithPermanentFriendCode,
   findAccountByFriendCode,
   findAccountById,
+  registerAnonymousDevice,
 } from './db/accounts.ts';
 import { SignalingCoordinator } from './coordinator.ts';
 
@@ -46,6 +48,7 @@ export interface Env {
 
 export interface ApiWorkerDependencies {
   authAdapterFactory?: (env: Env) => AuthProviderAdapter;
+  codeGenerator?: () => string;
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -485,6 +488,44 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
         }
 
         return Response.redirect(loopbackTarget.toString(), 302);
+      }
+
+      // 3b. Anonymous Device Registration (No Login Required): POST /devices/register
+      if (request.method === 'POST' && url.pathname === '/devices/register') {
+        const body = (await request.json().catch(() => ({}))) as {
+          deviceId?: string;
+          deviceSecret?: string;
+        };
+        const result = await registerAnonymousDevice(
+          env.DB,
+          {
+            deviceId: typeof body.deviceId === 'string' ? body.deviceId : '',
+            deviceSecret:
+              typeof body.deviceSecret === 'string' ? body.deviceSecret : '',
+          },
+          deps?.codeGenerator
+        );
+
+        if ('error' in result) {
+          const status = result.error === 'DEVICE_SECRET_MISMATCH' ? 401 : 400;
+          const message =
+            result.error === 'DEVICE_SECRET_MISMATCH'
+              ? 'Device credential does not match the registered installation.'
+              : 'Valid deviceId (>=16 chars) and deviceSecret (>=32 chars) are required.';
+          return jsonError(status, result.error, message);
+        }
+
+        const { token, expiresAt } = await signSessionToken(
+          result.account,
+          getHmacSecret(env)
+        );
+        const payload: AnonymousDeviceRegistrationResponse = {
+          token,
+          expiresAt,
+          account: result.account,
+          alreadyRegistered: result.alreadyRegistered,
+        };
+        return withCors(Response.json(payload));
       }
 
       // All endpoints below require a valid authenticated account

@@ -193,7 +193,38 @@ export type ProtocolErrorCode =
   | 'SESSION_ALREADY_ENDED'
   | 'INVALID_SIGNAL_PAYLOAD'
   | 'RESTRICTIVE_NETWORK_STUN_ONLY_LIMITATION'
-  | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2';
+  | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2'
+  | 'INVALID_DEVICE_CREDENTIAL'
+  | 'DEVICE_SECRET_MISMATCH';
+
+/**
+ * Local-only user/device profile stored on-device and never transmitted to the backend.
+ */
+export interface LocalDeviceProfile {
+  readonly name: string;
+  readonly email: string;
+  readonly phone: string;
+  readonly updatedAt: string;
+}
+
+export type DeviceRegistrationStatus =
+  | 'unregistered'
+  | 'registering'
+  | 'registered'
+  | 'offline'
+  | 'error';
+
+export interface AnonymousDeviceRegistrationRequest {
+  readonly deviceId: string;
+  readonly deviceSecret: string;
+}
+
+export interface AnonymousDeviceRegistrationResponse {
+  readonly token: string;
+  readonly expiresAt: string;
+  readonly account: AccountProfile;
+  readonly alreadyRegistered: boolean;
+}
 
 /**
  * Structured receipt produced by the unified idempotent session teardown path.

@@ -329,6 +329,40 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   return win;
 }
 
+let presentationWindow: BrowserWindow | null = null;
+
+async function createOrFocusPresentationWindow(): Promise<BrowserWindow> {
+  if (presentationWindow && !presentationWindow.isDestroyed()) {
+    if (presentationWindow.isMinimized()) presentationWindow.restore();
+    presentationWindow.focus();
+    return presentationWindow;
+  }
+
+  const win = new BrowserWindow({
+    width: 1120,
+    height: 680,
+    minWidth: 480,
+    minHeight: 320,
+    title: 'Elm-AnyDesk — Presentation View',
+    autoHideMenuBar: true,
+    backgroundColor: '#07080A',
+    webPreferences: createSecureWebPreferences(),
+  });
+
+  windowRoles.set(win, 'presentation');
+  attachWindowSecurityGuards(win);
+
+  const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
+  await win.loadFile(rendererHtmlPath, { query: { role: 'presentation' } });
+
+  win.on('closed', () => {
+    presentationWindow = null;
+  });
+
+  presentationWindow = win;
+  return win;
+}
+
 let lastDisplayMediaRequestFlags: {
   videoRequested: boolean;
   audioRequested: boolean;
@@ -396,6 +430,10 @@ function registerIpcHandlers(): void {
       protocolVersion: PROTOCOL_VERSION,
       platform: process.platform,
       windowRole: role,
+      devModeEnabled:
+        process.argv.includes('--dev-mode') ||
+        process.argv.includes('--run-prototype-suite') ||
+        process.env.ELM_DEV_MODE === '1',
       phase:
         'Phase 5 — Windows Installer, Cloudflare Staging & Pilot Verification',
       defaultMediaSelection: DEFAULT_HOST_MEDIA_SELECTION,
@@ -429,15 +467,59 @@ function registerIpcHandlers(): void {
     };
   });
 
+  ipcMain.handle('elm:open-presentation-view', async () => {
+    const pWin = await createOrFocusPresentationWindow();
+    const mainHwndHex =
+      mainWindow && !mainWindow.isDestroyed()
+        ? `0x${mainWindow.getNativeWindowHandle().toString('hex')}`
+        : '';
+    const presentationHwndHex = !pWin.isDestroyed()
+      ? `0x${pWin.getNativeWindowHandle().toString('hex')}`
+      : '';
+    return {
+      opened: true,
+      mainHwndHex,
+      presentationHwndHex,
+      distinctHwnds:
+        Boolean(mainHwndHex && presentationHwndHex) &&
+        mainHwndHex !== presentationHwndHex,
+    };
+  });
+
   ipcMain.handle('elm:copy-text-to-clipboard', (_event, text: string) => {
     clipboard.writeText(String(text ?? ''));
     return { copied: true };
+  });
+
+  // Device Setup & Anonymous Registration
+  ipcMain.handle('elm:device-get-setup-state', () => {
+    return getAuthController().getDeviceSetupState();
+  });
+
+  ipcMain.handle(
+    'elm:device-save-local-profile',
+    (_event, input: { name: string; email?: string; phone?: string }) => {
+      return getAuthController().saveLocalProfile(input);
+    }
+  );
+
+  ipcMain.handle('elm:device-retry-registration', () => {
+    return getAuthController().retryDeviceRegistration();
   });
 
   // Phase 2: Auth, Permanent Friend Code, Presence & Invites
   ipcMain.handle('elm:auth-get-stored-session', () => {
     return getAuthController().getStoredAuthSession();
   });
+
+  ipcMain.handle(
+    'elm:update-local-display-name',
+    (_event, displayName: string) => {
+      return getAuthController().updateLocalDisplayName(
+        String(displayName ?? '')
+      );
+    }
+  );
 
   ipcMain.handle('elm:auth-start-browser-oauth', async () => {
     return getAuthController().startBrowserOAuthSignIn();
@@ -814,9 +896,16 @@ app.whenReady().then(async () => {
       await sleep(250);
       const dwm = taskbarDwmController?.getTelemetry() ?? null;
       const wasapiProbe = await wasapiManager.probeEndpoint();
-      const rendererReady = await mainWindow.webContents.executeJavaScript(
-        `Boolean(document.querySelector('.top-bar h1'))`
-      );
+      let rendererReady = false;
+      for (let i = 0; i < 30; i++) {
+        rendererReady = Boolean(
+          await mainWindow.webContents.executeJavaScript(
+            `Boolean(document.querySelector('.top-bar h1'))`
+          )
+        );
+        if (rendererReady) break;
+        await sleep(100);
+      }
       const iconPath = getWindowIconPath() ?? null;
       fs.writeFileSync(
         outPath,
