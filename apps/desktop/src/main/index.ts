@@ -1084,6 +1084,18 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
             },
           };
 
+          // Phase 7: WebRTC Readability, Dedicated Viewer Stage & Privacy-Safe Diagnostics Telemetry
+          if (typeof window.runElmReadabilityVerificationSuite === 'function') {
+            results.phase7ReadabilitySuite = await withTimeout(
+              window.runElmReadabilityVerificationSuite(),
+              30000,
+              'runElmReadabilityVerificationSuite'
+            );
+          } else {
+            results.phase7ReadabilitySuiteError =
+              'runElmReadabilityVerificationSuite not found on window';
+          }
+
           return JSON.stringify(results);
         } catch (err) {
           return JSON.stringify({

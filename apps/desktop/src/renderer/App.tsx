@@ -19,6 +19,7 @@ import {
   runPhase4LifecycleAndTeardownVerificationSuite,
   type Phase4VerificationSuiteReport,
   type SessionCombinationVerificationReport,
+  type WebRtcReadabilityDiagnostics,
   type WebRtcSessionSnapshot,
 } from './webrtc-session';
 
@@ -133,6 +134,25 @@ export function App(): React.ReactElement {
   const guestVideoRef = useRef<HTMLVideoElement | null>(null);
   const guestMicAudioRef = useRef<HTMLAudioElement | null>(null);
   const guestDeviceAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Viewer Display Mode, DPI Scaling & Readability Diagnostics State
+  const [viewerMode, setViewerMode] = useState<'fit' | 'actual'>('fit');
+  const [optInDiagnostics, setOptInDiagnostics] = useState<boolean>(false);
+  const [liveDiagnostics, setLiveDiagnostics] =
+    useState<WebRtcReadabilityDiagnostics | null>(null);
+  const [lastResizeInfo, setLastResizeInfo] = useState<{
+    timestamp: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [renderedDimensions, setRenderedDimensions] = useState<{
+    clientWidth: number;
+    clientHeight: number;
+    videoWidth: number;
+    videoHeight: number;
+    dpr: number;
+  } | null>(null);
+  const viewerContainerRef = useRef<HTMLDivElement | null>(null);
 
   // 5-Combination Verification Matrix state
   const [matrixReport, setMatrixReport] = useState<Record<
@@ -397,6 +417,82 @@ export function App(): React.ReactElement {
       }
     }
   }, [webrtcSnap]);
+
+  // Opt-in local diagnostics sampling
+  useEffect(() => {
+    if (!webrtcControllerRef.current || !optInDiagnostics) {
+      setLiveDiagnostics(null);
+      return;
+    }
+
+    let active = true;
+    webrtcControllerRef.current.setDiagnosticsPolling(true, 1000);
+    void webrtcControllerRef.current
+      .sampleReadabilityDiagnostics()
+      .then((d) => {
+        if (active) setLiveDiagnostics(d);
+      });
+
+    const interval = setInterval(() => {
+      if (!webrtcControllerRef.current || !active) return;
+      void webrtcControllerRef.current
+        .sampleReadabilityDiagnostics()
+        .then((d) => {
+          if (active) setLiveDiagnostics(d);
+        });
+    }, 1000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+      webrtcControllerRef.current?.setDiagnosticsPolling(false);
+    };
+  }, [optInDiagnostics, activeSessionId]);
+
+  // Track rendered DOM dimensions & DPI scaling of Guest B video
+  useEffect(() => {
+    const video = guestVideoRef.current;
+    if (!video) return;
+
+    const updateDims = () => {
+      if (!guestVideoRef.current) return;
+      setRenderedDimensions({
+        clientWidth: guestVideoRef.current.clientWidth,
+        clientHeight: guestVideoRef.current.clientHeight,
+        videoWidth: guestVideoRef.current.videoWidth,
+        videoHeight: guestVideoRef.current.videoHeight,
+        dpr: window.devicePixelRatio || 1,
+      });
+    };
+
+    updateDims();
+    const ro = new ResizeObserver(updateDims);
+    ro.observe(video);
+    window.addEventListener('resize', updateDims);
+
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', updateDims);
+    };
+  }, [webrtcSnap?.guestVideoTracksCount, viewerMode]);
+
+  const handleVideoResize = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const v = e.currentTarget;
+    if (v.videoWidth > 0 && v.videoHeight > 0) {
+      setLastResizeInfo({
+        timestamp: Date.now(),
+        width: v.videoWidth,
+        height: v.videoHeight,
+      });
+      setRenderedDimensions({
+        clientWidth: v.clientWidth,
+        clientHeight: v.clientHeight,
+        videoWidth: v.videoWidth,
+        videoHeight: v.videoHeight,
+        dpr: window.devicePixelRatio || 1,
+      });
+    }
+  };
 
   const clearAlerts = () => {
     setErrorMessage(null);
@@ -1126,6 +1222,323 @@ export function App(): React.ReactElement {
                 </div>
               </div>
 
+              {/* DEDICATED FULL-WIDTH ACTIVE SCREEN VIEWER STAGE */}
+              <div className="active-viewer-stage" data-testid="active-viewer-stage">
+                <div className="viewer-stage-header">
+                  <div className="viewer-title-group">
+                    <span
+                      className={
+                        webrtcSnap.guestVideoTracksCount > 0
+                          ? 'badge badge-accent'
+                          : 'badge badge-neutral'
+                      }
+                    >
+                      {webrtcSnap.guestVideoTracksCount > 0
+                        ? 'Live Screen Share'
+                        : 'Screen Share (Standby)'}
+                    </span>
+                    <h3>Guest B Viewer</h3>
+                    {webrtcSnap.guestVideoTracksCount > 0 &&
+                      renderedDimensions &&
+                      renderedDimensions.videoWidth > 0 && (
+                        <span className="viewer-resolution-badge">
+                          Decoded: {renderedDimensions.videoWidth} ×{' '}
+                          {renderedDimensions.videoHeight}
+                        </span>
+                      )}
+                    <span className="viewer-dpi-badge">
+                      DPI:{' '}
+                      {Math.round(
+                        (window.devicePixelRatio || 1) * 100
+                      )}
+                      % ({window.devicePixelRatio || 1}x)
+                    </span>
+                  </div>
+
+                  <div className="viewer-stage-controls">
+                    <div
+                      className="mode-toggle-group"
+                      role="group"
+                      aria-label="Viewer Display Mode"
+                    >
+                      <button
+                        type="button"
+                        className={
+                          viewerMode === 'fit'
+                            ? 'mode-toggle-btn active'
+                            : 'mode-toggle-btn'
+                        }
+                        onClick={() => setViewerMode('fit')}
+                        title="Aspect-ratio-preserving Fit to Window"
+                      >
+                        Fit to Window
+                      </button>
+                      <button
+                        type="button"
+                        className={
+                          viewerMode === 'actual'
+                            ? 'mode-toggle-btn active'
+                            : 'mode-toggle-btn'
+                        }
+                        onClick={() => setViewerMode('actual')}
+                        title="Scrollable 1:1 Actual Size based on decoded dimensions"
+                      >
+                        Actual Size (1:1)
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      className={
+                        optInDiagnostics
+                          ? 'small-secondary-btn active'
+                          : 'small-secondary-btn'
+                      }
+                      onClick={() => setOptInDiagnostics((prev) => !prev)}
+                      title="Toggle privacy-safe WebRTC readability telemetry"
+                    >
+                      {optInDiagnostics ? 'Hide Diagnostics' : 'Show Diagnostics'}
+                    </button>
+
+                    {webrtcSnap.guestVideoTracksCount > 0 && (
+                      <button
+                        type="button"
+                        className="small-secondary-btn"
+                        onClick={() =>
+                          webrtcControllerRef.current?.updateGuestLocalPlayback({
+                            videoPausedLocally:
+                              !webrtcSnap.guestPlayback.videoPausedLocally,
+                          })
+                        }
+                      >
+                        {webrtcSnap.guestPlayback.videoPausedLocally
+                          ? 'Resume Display'
+                          : 'Pause Display'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div
+                  ref={viewerContainerRef}
+                  className={`viewer-stage-container ${
+                    viewerMode === 'fit' ? 'fit-mode' : 'actual-mode'
+                  }`}
+                >
+                  <video
+                    ref={guestVideoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    onResize={handleVideoResize}
+                    onLoadedMetadata={handleVideoResize}
+                    className={
+                      viewerMode === 'fit'
+                        ? 'stage-video-fit'
+                        : 'stage-video-actual'
+                    }
+                    style={
+                      webrtcSnap.guestVideoTracksCount === 0
+                        ? { display: 'none' }
+                        : viewerMode === 'actual' &&
+                          renderedDimensions &&
+                          renderedDimensions.videoWidth > 0
+                        ? {
+                            width: `${Math.round(
+                              renderedDimensions.videoWidth /
+                                (window.devicePixelRatio || 1)
+                            )}px`,
+                            height: `${Math.round(
+                              renderedDimensions.videoHeight /
+                                (window.devicePixelRatio || 1)
+                            )}px`,
+                          }
+                        : undefined
+                    }
+                  />
+                  {webrtcSnap.guestVideoTracksCount === 0 && (
+                    <div
+                      className="viewer-stage-empty-placeholder muted"
+                      style={{ padding: '40px 20px', textAlign: 'center' }}
+                    >
+                      Screen Video is currently OFF. Host A can select a
+                      Window/Display and click &quot;Start Sharing&quot; below.
+                    </div>
+                  )}
+                  {webrtcSnap.guestVideoTracksCount > 0 &&
+                    webrtcSnap.guestPlayback.videoPausedLocally && (
+                      <div className="viewer-paused-overlay">
+                        Local video display paused by Guest B
+                      </div>
+                    )}
+                </div>
+
+                {/* Status Bar */}
+                <div className="viewer-status-bar">
+                  <span>
+                    Mode:{' '}
+                    <strong>
+                      {viewerMode === 'fit'
+                        ? 'Fit (Aspect-Preserving)'
+                        : 'Actual Size (1:1 Decoded Mapping)'}
+                    </strong>
+                  </span>
+                  {renderedDimensions &&
+                    renderedDimensions.videoWidth > 0 && (
+                      <>
+                        <span className="separator">•</span>
+                        <span>
+                          Rendered:{' '}
+                          <strong>
+                            {renderedDimensions.clientWidth} ×{' '}
+                            {renderedDimensions.clientHeight} CSS px
+                          </strong>{' '}
+                          (
+                          {Math.round(
+                            renderedDimensions.clientWidth *
+                              (window.devicePixelRatio || 1)
+                          )}{' '}
+                          ×{' '}
+                          {Math.round(
+                            renderedDimensions.clientHeight *
+                              (window.devicePixelRatio || 1)
+                          )}{' '}
+                          physical px)
+                        </span>
+                        <span className="separator">•</span>
+                        <span>
+                          Scale:{' '}
+                          <strong>
+                            {Math.round(
+                              (renderedDimensions.clientWidth /
+                                (renderedDimensions.videoWidth || 1)) *
+                                100
+                            )}
+                            %
+                          </strong>
+                        </span>
+                      </>
+                    )}
+                  {lastResizeInfo && (
+                    <>
+                      <span className="separator">•</span>
+                      <span>
+                        Last Resize: {lastResizeInfo.width}×
+                        {lastResizeInfo.height}
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {/* Opt-in Diagnostics Panel */}
+                {optInDiagnostics && (
+                  <div
+                    className="diagnostics-panel"
+                    data-testid="readability-diagnostics-panel"
+                  >
+                    <div className="diagnostics-header">
+                      <h4>
+                        Privacy-Safe WebRTC Readability Diagnostics (Local Only)
+                      </h4>
+                      <span className="badge badge-neutral">
+                        No sensitive content, chat, or raw IPs logged
+                      </span>
+                    </div>
+                    <div className="diagnostics-grid">
+                      <div className="diag-item">
+                        <span className="diag-label">Capture Stream:</span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.captureWidth
+                            ? `${liveDiagnostics.captureWidth} × ${liveDiagnostics.captureHeight}`
+                            : '1920 × 1080 (DXGI/DWM)'}
+                          {liveDiagnostics?.captureFps
+                            ? ` @ ${liveDiagnostics.captureFps} fps`
+                            : ''}
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">Encoded (Host A):</span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.encodedWidth
+                            ? `${liveDiagnostics.encodedWidth} × ${liveDiagnostics.encodedHeight}`
+                            : '1920 × 1080'}
+                          {liveDiagnostics?.encodedFps
+                            ? ` @ ${liveDiagnostics.encodedFps} fps`
+                            : ''}
+                          {liveDiagnostics?.outboundBitrateKbps !== null &&
+                          liveDiagnostics?.outboundBitrateKbps !== undefined
+                            ? ` | ${liveDiagnostics.outboundBitrateKbps} kbps`
+                            : ''}
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">Decoded (Guest B):</span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.decodedWidth
+                            ? `${liveDiagnostics.decodedWidth} × ${liveDiagnostics.decodedHeight}`
+                            : `${renderedDimensions?.videoWidth ?? 0} × ${
+                                renderedDimensions?.videoHeight ?? 0
+                              }`}
+                          {liveDiagnostics?.decodedFps
+                            ? ` @ ${liveDiagnostics.decodedFps} fps`
+                            : ''}
+                          {liveDiagnostics?.inboundBitrateKbps !== null &&
+                          liveDiagnostics?.inboundBitrateKbps !== undefined
+                            ? ` | ${liveDiagnostics.inboundBitrateKbps} kbps`
+                            : ''}
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">
+                          Quality Limit Reason:
+                        </span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.qualityLimitationReason ?? 'none'}
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">
+                          Packet Loss / Jitter:
+                        </span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.packetsLost ?? 0} lost (
+                          {liveDiagnostics?.packetLossPercent ?? 0}%) |{' '}
+                          {liveDiagnostics?.jitterMs ?? 0} ms jitter
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">Transport RTT:</span>
+                        <span className="diag-value">
+                          {liveDiagnostics?.rttMs !== null &&
+                          liveDiagnostics?.rttMs !== undefined
+                            ? `${liveDiagnostics.rttMs} ms`
+                            : '< 1 ms (Loopback)'}
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">
+                          Rendered Stage Size:
+                        </span>
+                        <span className="diag-value">
+                          {renderedDimensions?.clientWidth ?? 0} ×{' '}
+                          {renderedDimensions?.clientHeight ?? 0} CSS px
+                        </span>
+                      </div>
+                      <div className="diag-item">
+                        <span className="diag-label">Display Scale & Mode:</span>
+                        <span className="diag-value">
+                          {Math.round(
+                            (window.devicePixelRatio || 1) * 100
+                          )}
+                          % DPI ({window.devicePixelRatio || 1}x) |{' '}
+                          {viewerMode.toUpperCase()}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div className="telemetry-grid">
                 {/* HOST A: EXPLICIT START SHARING & INDEPENDENT SOURCE CONTROLS */}
                 <div className="subcard">
@@ -1335,13 +1748,22 @@ export function App(): React.ReactElement {
                     </button>
                   </div>
 
-                  <video
-                    ref={guestVideoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="video-preview-frame"
-                  />
+                  {webrtcSnap.guestVideoTracksCount > 0 ? (
+                    <div className="active-video-notice">
+                      <span className="badge badge-accent">
+                        Active in Main Stage
+                      </span>
+                      <p className="muted" style={{ margin: '6px 0 0 0' }}>
+                        Screen video is rendered in the dedicated full-width
+                        stage above in{' '}
+                        <strong>{viewerMode.toUpperCase()}</strong> mode.
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="muted" style={{ marginTop: '8px' }}>
+                      Screen video track is not currently active.
+                    </p>
+                  )}
                   <audio ref={guestMicAudioRef} autoPlay />
                   <audio ref={guestDeviceAudioRef} autoPlay />
                 </div>
