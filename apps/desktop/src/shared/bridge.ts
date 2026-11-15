@@ -15,6 +15,7 @@ import type {
   WebRtcSignalEnvelope,
   WebRtcSignalPayload,
 } from '@elm/protocol';
+import type { ThemeMode, ThemeStateSnapshot } from './theme';
 
 export type DesktopWindowRole = 'main' | 'chat';
 
@@ -277,6 +278,15 @@ export interface ElmDesktopBridge {
   ) => () => void;
   onHostStopSharingRequest: (
     listener: (target: MediaSourceKind | 'all') => void
+  ) => () => void;
+
+  // Centralized Theme State (Single Source of Truth across Main & Chat Windows)
+  getThemeState: () => Promise<ThemeStateSnapshot>;
+  setThemeMode: (mode: ThemeMode) => Promise<ThemeStateSnapshot>;
+  resetThemeToSystemDefault: () => Promise<ThemeStateSnapshot>;
+  reloadThemeFromDisk: () => Promise<ThemeStateSnapshot>;
+  onThemeUpdated: (
+    listener: (themeState: ThemeStateSnapshot) => void
   ) => () => void;
 
   // Windows 11 Taskbar & DWM Preview Prototype

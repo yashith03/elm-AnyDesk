@@ -30,6 +30,10 @@ const FORBIDDEN_PATTERNS = [
     allowInFile: 'webrtc-session.ts',
     reason: 'Paid TURN relay servers must not be enabled in the STUN-only zero-bill pilot',
   },
+  {
+    regex: /fonts\.googleapis\.com|fonts\.gstatic\.com|use\.typekit\.net/i,
+    reason: 'Fonts must be bundled locally; loading fonts from a CDN at runtime is prohibited',
+  },
 ];
 
 function collectFiles(dir, out = []) {
@@ -38,7 +42,7 @@ function collectFiles(dir, out = []) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       collectFiles(full, out);
-    } else if (/\.(ts|tsx|js|mjs|cjs)$/.test(entry.name)) {
+    } else if (/\.(ts|tsx|js|mjs|cjs|css|html)$/.test(entry.name)) {
       out.push(full);
     }
   }

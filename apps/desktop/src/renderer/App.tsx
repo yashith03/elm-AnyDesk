@@ -12,6 +12,7 @@ import type {
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
+import type { ThemeMode, ThemeStateSnapshot } from '../shared/theme';
 import {
   ApprovedWebRtcSessionController,
   runAllWebRtcSessionVerificationMatrix,
@@ -20,6 +21,69 @@ import {
   type SessionCombinationVerificationReport,
   type WebRtcSessionSnapshot,
 } from './webrtc-session';
+
+function ThemeToggleButton(props: {
+  themeState: ThemeStateSnapshot;
+  onToggle: () => void;
+}): React.ReactElement {
+  const isDark = props.themeState.mode === 'dark';
+  return (
+    <button
+      type="button"
+      data-testid="theme-toggle-button"
+      className="theme-toggle-btn no-drag"
+      aria-label={`Switch to ${isDark ? 'Light' : 'Dark'} theme (current: ${
+        isDark ? 'Dark' : 'Light'
+      })`}
+      aria-pressed={isDark}
+      title={`Current theme: ${isDark ? 'Dark' : 'Light'} (${
+        props.themeState.source === 'system_default'
+          ? 'System Default'
+          : 'Saved Preference'
+      }). Click or press Enter/Space to switch.`}
+      onClick={props.onToggle}
+    >
+      <span className="theme-toggle-icon" aria-hidden="true">
+        {isDark ? (
+          <svg
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="square"
+            strokeLinejoin="miter"
+          >
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+          </svg>
+        ) : (
+          <svg
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="square"
+            strokeLinejoin="miter"
+          >
+            <circle cx="12" cy="12" r="4" />
+            <line x1="12" y1="2" x2="12" y2="5" />
+            <line x1="12" y1="19" x2="12" y2="22" />
+            <line x1="4.93" y1="4.93" x2="7.05" y2="7.05" />
+            <line x1="16.95" y1="16.95" x2="19.07" y2="19.07" />
+            <line x1="2" y1="12" x2="5" y2="12" />
+            <line x1="19" y1="12" x2="22" y2="12" />
+            <line x1="4.93" y1="19.07" x2="7.05" y2="16.95" />
+            <line x1="16.95" y1="7.05" x2="19.07" y2="4.93" />
+          </svg>
+        )}
+      </span>
+      <span>{isDark ? 'Dark' : 'Light'}</span>
+    </button>
+  );
+}
 
 export function App(): React.ReactElement {
   const [metadata, setMetadata] = useState<DesktopRuntimeMetadata | null>(null);
@@ -101,6 +165,23 @@ export function App(): React.ReactElement {
     null
   );
 
+  // Shared Light/Dark Theme State (synced across Main Window & Separate Chat Window)
+  const [themeState, setThemeState] = useState<ThemeStateSnapshot>({
+    mode: 'dark',
+    source: 'system_default',
+    systemPrefersDark: true,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const applyThemeToDom = (mode: ThemeMode) => {
+    document.documentElement.setAttribute('data-theme', mode);
+    document.documentElement.style.colorScheme = mode;
+  };
+
+  useEffect(() => {
+    applyThemeToDom(themeState.mode);
+  }, [themeState.mode]);
+
   useEffect(() => {
     let mounted = true;
     Promise.all([
@@ -108,12 +189,17 @@ export function App(): React.ReactElement {
       window.elmDesktop.getStoredAuthSession(),
       window.elmDesktop.getVolatileSessionUiState(),
       window.elmDesktop.getTaskbarDwmTelemetry().catch(() => null),
+      window.elmDesktop.getThemeState().catch(() => null),
     ])
-      .then(([meta, storedRes, volatileState, dwm]) => {
+      .then(([meta, storedRes, volatileState, dwm, initialTheme]) => {
         if (!mounted) return;
         setMetadata(meta);
         setVolatileChatState(volatileState);
         if (dwm) setDwmTelemetry(dwm);
+        if (initialTheme) {
+          setThemeState(initialTheme);
+          applyThemeToDom(initialTheme.mode);
+        }
         if (storedRes.ok && storedRes.data) {
           setAccount(storedRes.data.account);
           setSnapshot(storedRes.data.snapshot);
@@ -133,11 +219,27 @@ export function App(): React.ReactElement {
       }
     );
 
+    const unsubTheme = window.elmDesktop.onThemeUpdated((nextTheme) => {
+      if (mounted) {
+        setThemeState(nextTheme);
+        applyThemeToDom(nextTheme.mode);
+      }
+    });
+
     return () => {
       mounted = false;
       unsubVolatile();
+      unsubTheme();
     };
   }, []);
+
+  const handleToggleTheme = async () => {
+    const nextMode: ThemeMode = themeState.mode === 'dark' ? 'light' : 'dark';
+    applyThemeToDom(nextMode);
+    const updated = await window.elmDesktop.setThemeMode(nextMode);
+    setThemeState(updated);
+    applyThemeToDom(updated.mode);
+  };
 
   // Manage ApprovedWebRtcSessionController lifecycle in Main Window when an approved session starts/ends
   const activeSessionId = snapshot?.activeSession?.sessionId ?? null;
@@ -563,10 +665,15 @@ export function App(): React.ReactElement {
     return (
       <main className="app-shell">
         <header className="top-bar">
-          <div>
-            <span className="badge">
-              Separate 1:1 Chat Window — Volatile DataChannel Only
-            </span>
+          <div className="top-bar-left">
+            <div className="top-bar-eyebrow">
+              <span className="badge">
+                Separate 1:1 Chat Window — Volatile DataChannel Only
+              </span>
+              <span className="badge badge-neutral">
+                Theme: {themeState.mode.toUpperCase()}
+              </span>
+            </div>
             <h1>Elm-AnyDesk — Private Session Chat</h1>
             <p className="muted">
               Message previews disabled by default. Zero OS toast notifications.
@@ -578,12 +685,17 @@ export function App(): React.ReactElement {
             {activeSession && (
               <button
                 type="button"
+                data-testid="top-bar-disconnect-button"
                 className="danger-btn"
                 onClick={handleDisconnectSession}
               >
-                Top-Bar Disconnect
+                Disconnect Session
               </button>
             )}
+            <ThemeToggleButton
+              themeState={themeState}
+              onToggle={() => void handleToggleTheme()}
+            />
           </div>
         </header>
 
@@ -766,11 +878,26 @@ export function App(): React.ReactElement {
   return (
     <main className="app-shell">
       <header className="top-bar">
-        <div>
-          <span className="badge">{metadata.phase}</span>
+        <div className="top-bar-left">
+          <div className="top-bar-eyebrow">
+            <span className="badge">{metadata.phase}</span>
+            <span className="badge badge-neutral">
+              Theme: {themeState.mode.toUpperCase()}
+            </span>
+          </div>
           <h1>Elm-AnyDesk — Consent-Based 1:1 Screen Sharing</h1>
         </div>
         <div className="top-bar-right">
+          {snapshot?.activeSession && (
+            <button
+              type="button"
+              data-testid="top-bar-disconnect-button"
+              className="danger-btn"
+              onClick={handleDisconnectSession}
+            >
+              Disconnect Active Session
+            </button>
+          )}
           <button
             type="button"
             className="secondary-btn"
@@ -780,19 +907,14 @@ export function App(): React.ReactElement {
             {webrtcSnap ? `${webrtcSnap.messages.length} msgs` : '0 msgs'} — No
             Preview)
           </button>
-          {snapshot?.activeSession && (
-            <button
-              type="button"
-              className="danger-btn"
-              onClick={handleDisconnectSession}
-            >
-              Disconnect Active Session
-            </button>
-          )}
           <div className="meta-pill">
             Protocol <code>{metadata.protocolVersion}</code> | Electron{' '}
             <code>{metadata.electronVersion}</code>
           </div>
+          <ThemeToggleButton
+            themeState={themeState}
+            onToggle={() => void handleToggleTheme()}
+          />
         </div>
       </header>
 
@@ -1218,13 +1340,7 @@ export function App(): React.ReactElement {
                     autoPlay
                     playsInline
                     muted
-                    style={{
-                      width: '100%',
-                      maxHeight: '180px',
-                      background: '#020617',
-                      borderRadius: '6px',
-                      marginTop: '8px',
-                    }}
+                    className="video-preview-frame"
                   />
                   <audio ref={guestMicAudioRef} autoPlay />
                   <audio ref={guestDeviceAudioRef} autoPlay />
@@ -1236,7 +1352,12 @@ export function App(): React.ReactElement {
           {/* INCOMING INVITES ACCEPT / DECLINE SCREEN (USER A) */}
           {snapshot && snapshot.incomingInvites.length > 0 && (
             <section className="card card-full card-incoming-invite">
-              <span className="badge">Incoming Session Invite</span>
+              <div className="subcard-header">
+                <span className="badge">Incoming Session Invite</span>
+                <span className="badge badge-neutral">
+                  Owner Consent Required Before Signaling
+                </span>
+              </div>
               <h2>Incoming Invite — Choose Media Consent Before Accepting</h2>
               <p className="muted">
                 Choose Screen Video, Microphone Audio, and Device Audio
@@ -1247,48 +1368,87 @@ export function App(): React.ReactElement {
               </p>
 
               <div className="toggle-bar">
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={preAcceptMedia.screenVideo}
-                    onChange={(e) =>
-                      setPreAcceptMedia((prev) => ({
-                        ...prev,
-                        screenVideo: e.target.checked,
-                      }))
-                    }
-                  />
-                  <span>
-                    Screen Video (Window / Display Only — Never Webcam)
+                <label
+                  className={`permission-toggle-card ${
+                    preAcceptMedia.screenVideo ? 'checked' : ''
+                  }`}
+                >
+                  <span className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={preAcceptMedia.screenVideo}
+                      onChange={(e) =>
+                        setPreAcceptMedia((prev) => ({
+                          ...prev,
+                          screenVideo: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>
+                      Screen Video (Window / Display Only — Never Webcam)
+                    </span>
+                  </span>
+                  <span
+                    className={`presence-pill ${
+                      preAcceptMedia.screenVideo ? 'online' : 'offline'
+                    }`}
+                  >
+                    {preAcceptMedia.screenVideo ? 'ON' : 'OFF'}
                   </span>
                 </label>
 
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={preAcceptMedia.microphoneAudio}
-                    onChange={(e) =>
-                      setPreAcceptMedia((prev) => ({
-                        ...prev,
-                        microphoneAudio: e.target.checked,
-                      }))
-                    }
-                  />
-                  <span>Microphone Audio (Default OFF)</span>
+                <label
+                  className={`permission-toggle-card ${
+                    preAcceptMedia.microphoneAudio ? 'checked' : ''
+                  }`}
+                >
+                  <span className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={preAcceptMedia.microphoneAudio}
+                      onChange={(e) =>
+                        setPreAcceptMedia((prev) => ({
+                          ...prev,
+                          microphoneAudio: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>Microphone Audio (Default OFF)</span>
+                  </span>
+                  <span
+                    className={`presence-pill ${
+                      preAcceptMedia.microphoneAudio ? 'online' : 'offline'
+                    }`}
+                  >
+                    {preAcceptMedia.microphoneAudio ? 'ON' : 'DEFAULT OFF'}
+                  </span>
                 </label>
 
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={preAcceptMedia.deviceAudio}
-                    onChange={(e) =>
-                      setPreAcceptMedia((prev) => ({
-                        ...prev,
-                        deviceAudio: e.target.checked,
-                      }))
-                    }
-                  />
-                  <span>Device / System Audio (Default OFF)</span>
+                <label
+                  className={`permission-toggle-card ${
+                    preAcceptMedia.deviceAudio ? 'checked' : ''
+                  }`}
+                >
+                  <span className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={preAcceptMedia.deviceAudio}
+                      onChange={(e) =>
+                        setPreAcceptMedia((prev) => ({
+                          ...prev,
+                          deviceAudio: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>Device / System Audio (Default OFF)</span>
+                  </span>
+                  <span
+                    className={`presence-pill ${
+                      preAcceptMedia.deviceAudio ? 'online' : 'offline'
+                    }`}
+                  >
+                    {preAcceptMedia.deviceAudio ? 'ON' : 'DEFAULT OFF'}
+                  </span>
                 </label>
               </div>
 
@@ -1335,16 +1495,25 @@ export function App(): React.ReactElement {
           {/* MAIN TWO-COLUMN: MY FRIEND CODE & ENTER FRIEND CODE */}
           <div className="grid">
             <section className="card">
-              <h2>My Friend Code</h2>
+              <div className="subcard-header">
+                <h2>My Friend Code</h2>
+                <span className="badge badge-neutral">Permanent & Reusable</span>
+              </div>
               <p className="muted">
                 Your permanent, reusable Friend Code. It is created once in D1,
                 never expires, reuses the same value across restarts and
                 sign-ins, and never grants automatic access on its own.
               </p>
               <div className="friend-code-display">
-                <code className="friend-code-value">{account.friendCode}</code>
+                <code
+                  data-testid="friend-code-value"
+                  className="friend-code-value"
+                >
+                  {account.friendCode}
+                </code>
                 <button
                   type="button"
+                  data-testid="copy-friend-code-button"
                   className="primary-btn"
                   onClick={handleCopyFriendCode}
                 >
@@ -1354,7 +1523,10 @@ export function App(): React.ReactElement {
             </section>
 
             <section className="card">
-              <h2>Enter Friend Code & Send Invite</h2>
+              <div className="subcard-header">
+                <h2>Enter Friend Code & Send Invite</h2>
+                <span className="badge badge-neutral">Explicit Consent</span>
+              </div>
               <p className="muted">
                 Enter your peer&apos;s Friend Code (<code>ELM-XXXX-XXXX</code>)
                 to send a 1:1 session invite. They must be online and explicitly
@@ -1363,7 +1535,7 @@ export function App(): React.ReactElement {
               <form className="invite-form" onSubmit={handleSendInvite}>
                 <input
                   type="text"
-                  className="code-input"
+                  className="code-input friend-code-input"
                   placeholder="ELM-XXXX-XXXX"
                   value={enteredFriendCode}
                   onChange={(e) =>

@@ -4,6 +4,7 @@ import {
   clipboard,
   desktopCapturer,
   ipcMain,
+  nativeTheme,
   powerMonitor,
   session,
 } from 'electron';
@@ -25,6 +26,12 @@ import type {
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
+import {
+  THEME_TOKENS,
+  computeWcagContrastRatio,
+  type ThemeMode,
+  type ThemeStateSnapshot,
+} from '../shared/theme';
 import { DesktopAuthAndInviteController } from './auth-invite-client';
 import { Win11TaskbarDwmController } from './win11-dwm';
 import { WasapiLoopbackManager } from './wasapi-loopback';
@@ -71,6 +78,128 @@ function broadcastVolatileUiState(): void {
       win.webContents.send('elm:volatile-ui-updated', volatileUiState);
     }
   }
+}
+
+/**
+ * Centralized Theme State Manager (Single Source of Truth across Main & Chat Windows).
+ * Persists user theme choice across restarts in userData/elm-theme-preference.json.
+ * On first launch (when no file exists), uses the OS system preference via Electron nativeTheme.
+ */
+let currentThemeState: ThemeStateSnapshot | null = null;
+
+function getThemePreferenceFilePath(): string {
+  return path.join(app.getPath('userData'), 'elm-theme-preference.json');
+}
+
+function getSystemPreferredThemeMode(): ThemeMode {
+  return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+}
+
+function applyThemeToWindows(state: ThemeStateSnapshot): void {
+  const bg = THEME_TOKENS[state.mode].bgCanvas;
+  for (const win of [mainWindow, chatWindow]) {
+    if (win && !win.isDestroyed()) {
+      try {
+        win.setBackgroundColor(bg);
+      } catch {
+        // Ignore if window is closing
+      }
+      win.webContents.send('elm:theme-updated', state);
+    }
+  }
+}
+
+function loadThemeStateFromDisk(): ThemeStateSnapshot {
+  const filePath = getThemePreferenceFilePath();
+  try {
+    if (fs.existsSync(filePath)) {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
+        mode?: string;
+        updatedAt?: string;
+      };
+      if (raw.mode === 'light' || raw.mode === 'dark') {
+        nativeTheme.themeSource = raw.mode;
+        currentThemeState = {
+          mode: raw.mode,
+          source: 'user_persisted',
+          systemPrefersDark: nativeTheme.shouldUseDarkColors,
+          updatedAt: raw.updatedAt || new Date().toISOString(),
+        };
+        applyThemeToWindows(currentThemeState);
+        return currentThemeState;
+      }
+    }
+  } catch {
+    // Fall back to system preference if file is unreadable
+  }
+
+  nativeTheme.themeSource = 'system';
+  const systemMode = getSystemPreferredThemeMode();
+  currentThemeState = {
+    mode: systemMode,
+    source: 'system_default',
+    systemPrefersDark: nativeTheme.shouldUseDarkColors,
+    updatedAt: new Date().toISOString(),
+  };
+  applyThemeToWindows(currentThemeState);
+  return currentThemeState;
+}
+
+function getOrLoadThemeState(): ThemeStateSnapshot {
+  if (!currentThemeState) {
+    return loadThemeStateFromDisk();
+  }
+  return currentThemeState;
+}
+
+function setPersistedThemeMode(mode: ThemeMode): ThemeStateSnapshot {
+  const validMode: ThemeMode = mode === 'light' ? 'light' : 'dark';
+  const updatedAt = new Date().toISOString();
+  const filePath = getThemePreferenceFilePath();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify(
+      {
+        mode: validMode,
+        source: 'user_persisted',
+        updatedAt,
+      },
+      null,
+      2
+    ),
+    'utf8'
+  );
+  nativeTheme.themeSource = validMode;
+  currentThemeState = {
+    mode: validMode,
+    source: 'user_persisted',
+    systemPrefersDark: nativeTheme.shouldUseDarkColors,
+    updatedAt,
+  };
+  applyThemeToWindows(currentThemeState);
+  return currentThemeState;
+}
+
+function resetThemeStateToSystemDefault(): ThemeStateSnapshot {
+  const filePath = getThemePreferenceFilePath();
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {
+    // Ignore
+  }
+  nativeTheme.themeSource = 'system';
+  const systemMode = getSystemPreferredThemeMode();
+  currentThemeState = {
+    mode: systemMode,
+    source: 'system_default',
+    systemPrefersDark: nativeTheme.shouldUseDarkColors,
+    updatedAt: new Date().toISOString(),
+  };
+  applyThemeToWindows(currentThemeState);
+  return currentThemeState;
 }
 
 if (process.argv.includes('--run-prototype-suite')) {
@@ -122,7 +251,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     minHeight: 640,
     title: 'Elm-AnyDesk — Consent-Based 1:1 Screen Share',
     autoHideMenuBar: true,
-    backgroundColor: '#0f172a',
+    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -168,7 +297,7 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     minHeight: 480,
     title: 'Elm-AnyDesk — Private 1:1 Session Chat (Volatile DataChannel)',
     autoHideMenuBar: true,
-    backgroundColor: '#0f172a',
+    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -484,6 +613,26 @@ function registerIpcHandlers(): void {
     }
   );
 
+  // Centralized Theme State Handlers (Shared across Main & Chat Windows + Persisted to Disk)
+  ipcMain.handle('elm:theme-get', (): ThemeStateSnapshot => {
+    return getOrLoadThemeState();
+  });
+
+  ipcMain.handle(
+    'elm:theme-set',
+    (_event, mode: ThemeMode): ThemeStateSnapshot => {
+      return setPersistedThemeMode(mode);
+    }
+  );
+
+  ipcMain.handle('elm:theme-reset-system', (): ThemeStateSnapshot => {
+    return resetThemeStateToSystemDefault();
+  });
+
+  ipcMain.handle('elm:theme-reload-disk', (): ThemeStateSnapshot => {
+    return loadThemeStateFromDisk();
+  });
+
   // Taskbar & DWM Telemetry + Prototype Controls
   ipcMain.handle(
     'elm:get-taskbar-dwm-telemetry',
@@ -621,6 +770,19 @@ app.whenReady().then(async () => {
   registerDisplayMediaHandler();
   registerIpcHandlers();
 
+  nativeTheme.on('updated', () => {
+    if (!currentThemeState || currentThemeState.source === 'system_default') {
+      const nextState: ThemeStateSnapshot = {
+        mode: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+        source: 'system_default',
+        systemPrefersDark: nativeTheme.shouldUseDarkColors,
+        updatedAt: new Date().toISOString(),
+      };
+      currentThemeState = nextState;
+      applyThemeToWindows(nextState);
+    }
+  });
+
   powerMonitor.on('suspend', () => {
     wasapiManager.stopCapture();
     resetVolatileUiState();
@@ -754,6 +916,116 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
               'runElmPhase5VerificationSuite not found on window';
           }
 
+          // Phase 6: Clean Modern Windows UI Redesign & Light/Dark Theme Verification
+          const firstLaunchState = await window.elmDesktop.resetThemeToSystemDefault();
+          await new Promise((r) => setTimeout(r, 80));
+
+          const lightSet = await window.elmDesktop.setThemeMode('light');
+          await new Promise((r) => setTimeout(r, 80));
+          const lightReloadedAfterRestartSim = await window.elmDesktop.reloadThemeFromDisk();
+          const lightRootDataTheme = document.documentElement.getAttribute('data-theme');
+          const lightRootStyles = getComputedStyle(document.documentElement);
+          const lightSurfaceVar = lightRootStyles.getPropertyValue('--surface-primary').trim();
+          const lightTextVar = lightRootStyles.getPropertyValue('--text-primary').trim();
+          const lightAccentVar = lightRootStyles.getPropertyValue('--accent-primary').trim();
+          const lightBodyBg = getComputedStyle(document.body).backgroundColor;
+          const lightBodyColor = getComputedStyle(document.body).color;
+
+          // Switch to Dark mode via keyboard operation on the top-bar theme toggle button
+          await window.elmDesktop.restoreMainWindow();
+          const toggleBtn = document.querySelector('[data-testid="theme-toggle-button"]');
+          let keyboardToggleFocused = false;
+          let toggleRegionNoDrag = false;
+          let topBarRegionDrag = false;
+          let toggleFocusOutlineStyle = '';
+          let ariaPressedBeforeKey = null;
+          let ariaPressedAfterKey = null;
+
+          const topBarEl = document.querySelector('.top-bar');
+          if (topBarEl) {
+            topBarRegionDrag =
+              getComputedStyle(topBarEl).getPropertyValue('-webkit-app-region').trim() === 'drag';
+          }
+
+          if (toggleBtn instanceof HTMLElement) {
+            toggleBtn.focus();
+            keyboardToggleFocused = document.activeElement === toggleBtn;
+            toggleRegionNoDrag =
+              getComputedStyle(toggleBtn).getPropertyValue('-webkit-app-region').trim() === 'no-drag';
+            toggleFocusOutlineStyle = getComputedStyle(toggleBtn).outlineStyle;
+            ariaPressedBeforeKey = toggleBtn.getAttribute('aria-pressed');
+            // Activate button via keyboard Enter/Click handler
+            toggleBtn.click();
+            await new Promise((r) => setTimeout(r, 120));
+            ariaPressedAfterKey = toggleBtn.getAttribute('aria-pressed');
+          }
+
+          // Open Separate Chat Window and verify immediate sync across both windows
+          await window.elmDesktop.openSeparateChatWindow();
+          await new Promise((r) => setTimeout(r, 150));
+
+          const darkReloadedAfterRestartSim = await window.elmDesktop.reloadThemeFromDisk();
+          const darkRootDataTheme = document.documentElement.getAttribute('data-theme');
+          const darkRootStyles = getComputedStyle(document.documentElement);
+          const darkSurfaceVar = darkRootStyles.getPropertyValue('--surface-primary').trim();
+          const darkTextVar = darkRootStyles.getPropertyValue('--text-primary').trim();
+          const darkAccentVar = darkRootStyles.getPropertyValue('--accent-primary').trim();
+          const darkBodyBg = getComputedStyle(document.body).backgroundColor;
+          const darkBodyColor = getComputedStyle(document.body).color;
+
+          // Check locally bundled Chakra Petch font and zero gradients/heavy shadows
+          await document.fonts.ready;
+          const h1El = document.querySelector('.top-bar h1');
+          const h1FontFamily = h1El ? getComputedStyle(h1El).fontFamily : '';
+          const cardEl = document.querySelector('.card');
+          const cardBoxShadow = cardEl ? getComputedStyle(cardEl).boxShadow : '';
+          const cardBgImage = cardEl ? getComputedStyle(cardEl).backgroundImage : '';
+
+          results.phase6UiThemeSuite = {
+            firstLaunchUsesSystemPreference:
+              firstLaunchState.source === 'system_default' &&
+              firstLaunchState.mode ===
+                (firstLaunchState.systemPrefersDark ? 'dark' : 'light'),
+            lightThemeApplied: {
+              mode: lightSet.mode,
+              persistedAcrossRestart:
+                lightReloadedAfterRestartSim.mode === 'light' &&
+                lightReloadedAfterRestartSim.source === 'user_persisted',
+              domDataTheme: lightRootDataTheme,
+              surfaceToken: lightSurfaceVar,
+              textToken: lightTextVar,
+              accentToken: lightAccentVar,
+              computedBodyBg: lightBodyBg,
+              computedBodyColor: lightBodyColor,
+            },
+            darkThemeAppliedViaToggle: {
+              mode: darkReloadedAfterRestartSim.mode,
+              persistedAcrossRestart:
+                darkReloadedAfterRestartSim.mode === 'dark' &&
+                darkReloadedAfterRestartSim.source === 'user_persisted',
+              domDataTheme: darkRootDataTheme,
+              surfaceToken: darkSurfaceVar,
+              textToken: darkTextVar,
+              accentToken: darkAccentVar,
+              computedBodyBg: darkBodyBg,
+              computedBodyColor: darkBodyColor,
+            },
+            keyboardAndDragRegions: {
+              topBarRegionDrag,
+              toggleRegionNoDrag,
+              keyboardToggleFocused,
+              ariaPressedBeforeKey,
+              ariaPressedAfterKey,
+              toggleFocusOutlineStyle,
+            },
+            typographyAndCrispPanels: {
+              h1FontFamilyIncludesChakraPetch: h1FontFamily.toLowerCase().includes('chakra petch'),
+              h1FontFamily,
+              cardBoxShadowNone: cardBoxShadow === 'none',
+              cardBackgroundImageNone: cardBgImage === 'none',
+            },
+          };
+
           return JSON.stringify(results);
         } catch (err) {
           return JSON.stringify({
@@ -766,6 +1038,88 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
       true
     );
     const mediaSuiteResult = JSON.parse(String(mediaSuiteJson));
+
+    // Verify immediate theme synchronization between Main Window and open Separate Chat Window
+    let chatWindowSyncedLight = false;
+    let chatWindowSyncedDark = false;
+    let chatWindowHasThemeToggle = false;
+    if (chatWindow && !chatWindow.isDestroyed()) {
+      setPersistedThemeMode('light');
+      await sleep(100);
+      const [mainThemeLight, chatThemeLight] = await Promise.all([
+        win.webContents.executeJavaScript(
+          `document.documentElement.getAttribute('data-theme')`
+        ),
+        chatWindow.webContents.executeJavaScript(
+          `document.documentElement.getAttribute('data-theme')`
+        ),
+      ]);
+      chatWindowSyncedLight =
+        mainThemeLight === 'light' && chatThemeLight === 'light';
+
+      setPersistedThemeMode('dark');
+      await sleep(100);
+      const [mainThemeDark, chatThemeDark, chatTogglePresent] =
+        await Promise.all([
+          win.webContents.executeJavaScript(
+            `document.documentElement.getAttribute('data-theme')`
+          ),
+          chatWindow.webContents.executeJavaScript(
+            `document.documentElement.getAttribute('data-theme')`
+          ),
+          chatWindow.webContents.executeJavaScript(
+            `Boolean(document.querySelector('[data-testid="theme-toggle-button"]'))`
+          ),
+        ]);
+      chatWindowSyncedDark =
+        mainThemeDark === 'dark' && chatThemeDark === 'dark';
+      chatWindowHasThemeToggle = Boolean(chatTogglePresent);
+    }
+
+    const contrastVerification = {
+      lightTextOnSurface: computeWcagContrastRatio(
+        THEME_TOKENS.light.textPrimary,
+        THEME_TOKENS.light.surfacePrimary
+      ),
+      lightMutedOnSurface: computeWcagContrastRatio(
+        THEME_TOKENS.light.textMuted,
+        THEME_TOKENS.light.surfacePrimary
+      ),
+      lightActionTextOnBlue: computeWcagContrastRatio(
+        THEME_TOKENS.light.accentActionText,
+        THEME_TOKENS.light.accentActionBg
+      ),
+      darkTextOnSurface: computeWcagContrastRatio(
+        THEME_TOKENS.dark.textPrimary,
+        THEME_TOKENS.dark.surfacePrimary
+      ),
+      darkMutedOnSurface: computeWcagContrastRatio(
+        THEME_TOKENS.dark.textMuted,
+        THEME_TOKENS.dark.surfacePrimary
+      ),
+      darkAccentOnSurface: computeWcagContrastRatio(
+        THEME_TOKENS.dark.accentPrimary,
+        THEME_TOKENS.dark.surfacePrimary
+      ),
+    };
+
+    if (mediaSuiteResult.phase6UiThemeSuite) {
+      mediaSuiteResult.phase6UiThemeSuite.chatWindowImmediateSync = {
+        chatWindowSyncedLight,
+        chatWindowSyncedDark,
+        chatWindowHasThemeToggle,
+      };
+      mediaSuiteResult.phase6UiThemeSuite.wcagContrastRatios = {
+        ...contrastVerification,
+        allExceedWcagAa4_5:
+          contrastVerification.lightTextOnSurface >= 4.5 &&
+          contrastVerification.lightMutedOnSurface >= 4.5 &&
+          contrastVerification.lightActionTextOnBlue >= 4.5 &&
+          contrastVerification.darkTextOnSurface >= 4.5 &&
+          contrastVerification.darkMutedOnSurface >= 4.5 &&
+          contrastVerification.darkAccentOnSurface >= 4.5,
+      };
+    }
 
     const report = {
       timestamp: new Date().toISOString(),

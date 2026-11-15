@@ -14,6 +14,7 @@ import type {
   WasapiAudioChunkPayload,
   WasapiEndpointProbeResult,
 } from '../shared/bridge';
+import type { ThemeMode, ThemeStateSnapshot } from '../shared/theme';
 
 const bridge: ElmDesktopBridge = Object.freeze({
   getRuntimeMetadata: (): Promise<DesktopRuntimeMetadata> =>
@@ -140,6 +141,30 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.on('elm:host-stop-sharing-event', wrapped);
     return () => {
       ipcRenderer.removeListener('elm:host-stop-sharing-event', wrapped);
+    };
+  },
+
+  // Centralized Theme State
+  getThemeState: (): Promise<ThemeStateSnapshot> =>
+    ipcRenderer.invoke('elm:theme-get'),
+  setThemeMode: (mode: ThemeMode): Promise<ThemeStateSnapshot> =>
+    ipcRenderer.invoke('elm:theme-set', mode),
+  resetThemeToSystemDefault: (): Promise<ThemeStateSnapshot> =>
+    ipcRenderer.invoke('elm:theme-reset-system'),
+  reloadThemeFromDisk: (): Promise<ThemeStateSnapshot> =>
+    ipcRenderer.invoke('elm:theme-reload-disk'),
+  onThemeUpdated: (
+    listener: (themeState: ThemeStateSnapshot) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      themeState: ThemeStateSnapshot
+    ) => {
+      listener(themeState);
+    };
+    ipcRenderer.on('elm:theme-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:theme-updated', wrapped);
     };
   },
 

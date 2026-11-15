@@ -7,6 +7,7 @@
   "scripts": {
     "lint": "npm run typecheck",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "node --experimental-strip-types --test test/theme.test.mts",
     "build:node": "node scripts/build-electron.mjs",
     "build:renderer": "vite build",
     "build": "npm run build:node && npm run build:renderer",
