@@ -12,6 +12,7 @@
     "build:renderer": "vite build",
     "build": "npm run build:node && npm run build:renderer",
     "build:installer": "npm run build && node scripts/build-installer.mjs",
+    "dist:win": "npm run build:installer",
     "dev": "npm run build && electron .",
     "start": "electron ."
   },

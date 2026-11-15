@@ -3,9 +3,22 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { generateMultiResolutionElmIcon } from './generate-elm-icon.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+
+function copyIconAssets() {
+  const icoInfo = generateMultiResolutionElmIcon();
+  const distAssetsDir = path.resolve(rootDir, 'dist', 'assets');
+  fs.mkdirSync(distAssetsDir, { recursive: true });
+  fs.copyFileSync(icoInfo.icoPath, path.join(distAssetsDir, 'elm-icon.ico'));
+  fs.copyFileSync(
+    icoInfo.png256Path,
+    path.join(distAssetsDir, 'elm-icon-256.png')
+  );
+  console.log(`✓ Staged custom Elm multi-resolution icon into ${distAssetsDir}`);
+}
 
 function buildWasapiNativeHelper() {
   if (process.platform !== 'win32') {
@@ -53,6 +66,7 @@ async function buildEntry(entryRelPath, outDirRelPath) {
   });
 }
 
+copyIconAssets();
 buildWasapiNativeHelper();
 await buildEntry('src/main/index.ts', 'dist/main');
 await buildEntry('src/preload/index.ts', 'dist/preload');

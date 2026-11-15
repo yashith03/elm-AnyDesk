@@ -66,12 +66,13 @@ npm run build
 # 5. Run the automated Electron Windows 11 verification suite (Taskbar/DWM, Auth/Invites, 5 Media Combinations, Teardown/Liveness, STUN-Only & 3rd-Attendee Presentation Isolation)
 npx electron apps/desktop --run-prototype-suite
 
-# 6. Build the standalone Windows 11 unpacked app and Setup Installer (.exe) + SHA-256 + clean-install smoke test
-npm run build:installer
+# 6. Build the standalone Windows 11 unpacked app and Setup Installer (.exe) + SHA-256 + clean-install/shortcut/icon/uninstall test
+npm run dist:win
+# (or: npm run build:installer)
 ```
 
 ### Installer Artifacts Output (`apps/desktop/release/`)
-- `apps/desktop/release/Elm-AnyDesk-Setup-0.5.0-x64.exe` — Self-contained Windows 11 x64 Setup Installer (interactive console/GUI or `--silent --install-dir="<path>"`).
+- `apps/desktop/release/Elm-AnyDesk-Setup-0.5.0-x64.exe` — Self-contained Windows 11 x64 Setup Installer. Embeds the multi-resolution `elm-icon.ico`, installs `Elm-AnyDesk.exe` (with WASAPI & DWM helpers) to `%LOCALAPPDATA%\Programs\Elm-AnyDesk`, automatically creates the `Elm-AnyDesk` Desktop and Start Menu shortcuts (without pinning to the taskbar), and registers uninstallation.
 - `apps/desktop/release/Elm-AnyDesk-Setup-0.5.0-x64.exe.sha256` — SHA-256 checksum file.
 - `apps/desktop/release/installer-manifest.json` — Build metadata, SHA-256, and clean-install verification receipt.
 - `apps/desktop/release/win-unpacked/Elm-AnyDesk.exe` — Standalone packaged Windows 11 application directory.

@@ -202,8 +202,17 @@ function resetThemeStateToSystemDefault(): ThemeStateSnapshot {
   return currentThemeState;
 }
 
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.elm.anydesk');
+}
+
 if (process.argv.includes('--run-prototype-suite')) {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+}
+
+function getWindowIconPath(): string | undefined {
+  const candidate = path.join(__dirname, '../assets/elm-icon.ico');
+  return fs.existsSync(candidate) ? candidate : undefined;
 }
 
 const windowRoles = new WeakMap<BrowserWindow, DesktopWindowRole>();
@@ -250,6 +259,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     minWidth: 900,
     minHeight: 640,
     title: 'Elm-AnyDesk — Consent-Based 1:1 Screen Share',
+    icon: getWindowIconPath(),
     autoHideMenuBar: true,
     backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
     webPreferences: createSecureWebPreferences(),
@@ -296,6 +306,7 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     minWidth: 380,
     minHeight: 480,
     title: 'Elm-AnyDesk — Private 1:1 Session Chat (Volatile DataChannel)',
+    icon: getWindowIconPath(),
     autoHideMenuBar: true,
     backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
     webPreferences: createSecureWebPreferences(),
@@ -793,6 +804,53 @@ app.whenReady().then(async () => {
   });
 
   mainWindow = await createMainWindow();
+
+  const verifyLaunchArg = process.argv.find((a) =>
+    a.startsWith('--verify-installed-launch=')
+  );
+  if (verifyLaunchArg) {
+    const outPath = verifyLaunchArg.slice('--verify-installed-launch='.length);
+    try {
+      await sleep(250);
+      const dwm = taskbarDwmController?.getTelemetry() ?? null;
+      const wasapiProbe = await wasapiManager.probeEndpoint();
+      const rendererReady = await mainWindow.webContents.executeJavaScript(
+        `Boolean(document.querySelector('.top-bar h1'))`
+      );
+      const iconPath = getWindowIconPath() ?? null;
+      fs.writeFileSync(
+        outPath,
+        JSON.stringify(
+          {
+            ok: true,
+            execPath: process.execPath,
+            appPath: app.getAppPath(),
+            iconPath,
+            iconExists: Boolean(iconPath && fs.existsSync(iconPath)),
+            rendererReady,
+            dwmInitialized: Boolean(dwm && dwm.hwndHex),
+            dwmAttributes: dwm?.dwmAttributes ?? null,
+            wasapiHelperPath: path.join(
+              __dirname,
+              '../native/wasapi-loopback.exe'
+            ),
+            wasapiHelperExists: fs.existsSync(
+              path.join(__dirname, '../native/wasapi-loopback.exe')
+            ),
+            wasapiProbeOk: Boolean(wasapiProbe),
+            verifiedAt: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+    } finally {
+      wasapiManager.stopCapture();
+      app.exit(0);
+    }
+    return;
+  }
 
   if (process.argv.includes('--run-prototype-suite')) {
     await runAutomatedPrototypeSuite(mainWindow);

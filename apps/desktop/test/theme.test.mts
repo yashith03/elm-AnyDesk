@@ -84,3 +84,21 @@ test('Chakra Petch fonts are bundled locally with OFL license and CSS uses zero 
   assert.ok(!/linear-gradient|radial-gradient/i.test(cssContent), 'Styles must avoid gradients');
   assert.ok(!/https?:\/\//i.test(cssContent), 'Styles must not load remote CDN assets at runtime');
 });
+
+test('Multi-resolution Windows .ico asset contains 16x16, 24x24, 32x32, 48x48, 64x64, and 256x256 frames', () => {
+  const icoPath = path.join(desktopRoot, 'assets/elm-icon.ico');
+  assert.ok(fs.existsSync(icoPath), 'assets/elm-icon.ico must exist');
+  const buf = fs.readFileSync(icoPath);
+  assert.equal(buf.readUInt16LE(0), 0, 'ICO reserved field must be 0');
+  assert.equal(buf.readUInt16LE(2), 1, 'ICO type field must be 1');
+  const count = buf.readUInt16LE(4);
+  assert.equal(count, 6, 'ICO must contain 6 resolution frames');
+
+  const widths: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const rawW = buf[6 + i * 16];
+    widths.push(rawW === 0 ? 256 : rawW);
+  }
+  assert.deepEqual(widths, [16, 24, 32, 48, 64, 256]);
+});
+
