@@ -21,6 +21,11 @@ import {
 } from '../shared/chat-attachments';
 import { formatIncomingRequestHeadline } from '../shared/incoming-request';
 import {
+  getChatStatusDisplay,
+  getSessionStageStatus,
+  getTransportStatusDisplay,
+} from '../shared/session-ui-status';
+import {
   buildBackgroundRgba,
   clampFloatingPanelLayout,
   DEFAULT_FLOATING_PANEL_APPEARANCE,
@@ -128,6 +133,7 @@ export function App(): React.ReactElement {
     ShareableSourceDescriptor[]
   >([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [isStartingShare, setIsStartingShare] = useState<boolean>(false);
   const [playWasapiTestTone] = useState<boolean>(false);
 
   // On-device first-launch profile & anonymous device registration state
@@ -253,6 +259,8 @@ export function App(): React.ReactElement {
     setPendingImageByteLength(0);
     setChatAttachmentError(null);
     setInMemoryImagesByMsgId({});
+    setSelectedSourceId(null);
+    setIsStartingShare(false);
   };
 
   // Prototype drawer state
@@ -445,9 +453,11 @@ export function App(): React.ReactElement {
     // Automatically load shareable sources so Host A can pick one before clicking Start Sharing
     void window.elmDesktop.listShareableSources().then((sources) => {
       setShareableSources(sources);
-      if (sources.length > 0 && !selectedSourceId) {
-        setSelectedSourceId(sources[0].id);
-      }
+      setSelectedSourceId((prev) => {
+        if (sources.length === 0) return null;
+        if (prev && sources.some((s) => s.id === prev)) return prev;
+        return sources[0].id;
+      });
     });
 
     // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance
@@ -1000,7 +1010,7 @@ export function App(): React.ReactElement {
     setSnapshot(res.data.snapshot);
     if (action === 'accept' && res.data.session) {
       setStatusMessage(
-        `Accepted invite from ${invite.requesterDisplayName}. Reliable DataChannel chat connected. Media will not start until Host A clicks "Start Sharing".`
+        `Accepted invite from ${invite.requesterDisplayName}. Connecting peer session. Media will not start until you click "Start Sharing".`
       );
     } else {
       setStatusMessage(
@@ -1050,22 +1060,49 @@ export function App(): React.ReactElement {
   const handleRefreshSources = async () => {
     const sources = await window.elmDesktop.listShareableSources();
     setShareableSources(sources);
-    if (sources.length > 0 && !selectedSourceId) {
-      setSelectedSourceId(sources[0].id);
-    }
+    setSelectedSourceId((prev) => {
+      if (sources.length === 0) return null;
+      if (prev && sources.some((s) => s.id === prev)) return prev;
+      return sources[0].id;
+    });
   };
 
   const handleExplicitStartSharing = async () => {
     clearAlerts();
     const ctrl = webrtcControllerRef.current;
     if (!ctrl) return;
-    await ctrl.startHostSharing({
-      selectedSourceId,
-      playWasapiTestTone,
-    });
-    setStatusMessage(
-      'Host A executed explicit "Start Sharing". Only checked media sources were captured and attached as separate tracks.'
-    );
+    setIsStartingShare(true);
+    try {
+      const nextSnap = await ctrl.startHostSharing({
+        selectedSourceId,
+        playWasapiTestTone,
+      });
+      const failedSource = Object.values(nextSnap.hostMediaState).find(
+        (s) =>
+          s.approved &&
+          !s.active &&
+          (s.status === 'permission_denied' ||
+            s.status === 'unsupported' ||
+            s.status === 'source_disappeared')
+      );
+      if (failedSource) {
+        setErrorCode(failedSource.status.toUpperCase());
+        setErrorMessage(failedSource.message);
+        return;
+      }
+      if (nextSnap.hostMediaState.screenVideo.active) {
+        setStatusMessage(nextSnap.hostMediaState.screenVideo.message);
+      } else {
+        setStatusMessage('Approved media sharing started.');
+      }
+    } catch (err) {
+      setErrorCode('CAPTURE_ERROR');
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Failed to start screen sharing.'
+      );
+    } finally {
+      setIsStartingShare(false);
+    }
   };
 
   const handleStopIndividualSource = async (source: MediaSourceKind) => {
@@ -1447,6 +1484,17 @@ export function App(): React.ReactElement {
   const isLocalHost =
     Boolean(snapshot?.activeSession) &&
     snapshot?.activeSession?.hostAccountId === account?.accountId;
+  const transportStatus = webrtcSnap
+    ? getTransportStatusDisplay(webrtcSnap)
+    : null;
+  const chatStatus = webrtcSnap ? getChatStatusDisplay(webrtcSnap) : null;
+  const stageStatus = webrtcSnap
+    ? getSessionStageStatus({
+        isLocalHost,
+        isStartingShare,
+        webrtcSnap,
+      })
+    : null;
 
   return (
     <main className="app-shell">
@@ -1761,15 +1809,109 @@ export function App(): React.ReactElement {
                         : undefined
                     }
                   />
-                  {webrtcSnap.guestVideoTracksCount === 0 && (
+                  {isLocalHost && stageStatus && (
                     <div
-                      className="viewer-stage-empty-placeholder muted"
-                      style={{ padding: '40px 20px', textAlign: 'center' }}
+                      className="host-session-stage-card"
+                      data-testid="host-session-stage"
                     >
-                      Screen sharing is currently off. The host can select a
-                      window or display and click &quot;Start Sharing&quot; below.
+                      <div className="host-stage-status-row">
+                        <span
+                          className={`presence-pill ${
+                            stageStatus.state === 'sharing' ||
+                            stageStatus.state === 'sharing_audio'
+                              ? 'online'
+                              : stageStatus.state === 'error'
+                              ? 'offline'
+                              : 'pending'
+                          }`}
+                          data-testid="host-stage-status-pill"
+                        >
+                          {stageStatus.headline}
+                        </span>
+                        <span className="muted" style={{ fontSize: '0.8rem' }}>
+                          {transportStatus?.label} · {chatStatus?.label}
+                        </span>
+                      </div>
+                      {stageStatus.detail && (
+                        <p
+                          className={
+                            stageStatus.state === 'error'
+                              ? 'host-stage-error'
+                              : 'muted'
+                          }
+                        >
+                          {stageStatus.detail}
+                        </p>
+                      )}
+                      {stageStatus.showHostControls && (
+                        <div className="host-stage-controls">
+                          {webrtcSnap.hostMediaState.screenVideo.approved && (
+                            <div className="host-source-picker-row">
+                              <select
+                                className="code-input"
+                                aria-label="Select window or display to share"
+                                value={selectedSourceId ?? ''}
+                                onChange={(e) =>
+                                  setSelectedSourceId(e.target.value || null)
+                                }
+                              >
+                                {shareableSources.map((src) => (
+                                  <option key={src.id} value={src.id}>
+                                    [{src.surfaceType.toUpperCase()}] {src.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="secondary-btn"
+                                onClick={handleRefreshSources}
+                              >
+                                Refresh Sources
+                              </button>
+                            </div>
+                          )}
+                          <div className="actions-row">
+                            <button
+                              type="button"
+                              data-testid="host-start-sharing-button"
+                              className="primary-btn"
+                              disabled={isStartingShare}
+                              onClick={handleExplicitStartSharing}
+                            >
+                              {isStartingShare
+                                ? 'Starting...'
+                                : webrtcSnap.hostMediaState.screenVideo.active
+                                ? 'Restart Sharing'
+                                : 'Start Sharing'}
+                            </button>
+                            {anyHostMediaActive && (
+                              <button
+                                type="button"
+                                className="danger-btn"
+                                onClick={handleStopAllSharing}
+                              >
+                                Stop All Sharing
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
+                  {!isLocalHost &&
+                    webrtcSnap.guestVideoTracksCount === 0 &&
+                    stageStatus && (
+                      <div
+                        className="viewer-stage-empty-placeholder muted"
+                        data-testid="guest-session-placeholder"
+                        style={{ padding: '40px 20px', textAlign: 'center' }}
+                      >
+                        <strong style={{ display: 'block', marginBottom: '6px' }}>
+                          {stageStatus.headline}
+                        </strong>
+                        <span>{stageStatus.detail}</span>
+                      </div>
+                    )}
                   {webrtcSnap.guestVideoTracksCount > 0 &&
                     webrtcSnap.guestPlayback.videoPausedLocally && (
                       <div className="viewer-paused-overlay">
@@ -1826,8 +1968,13 @@ export function App(): React.ReactElement {
                       ⋮⋮
                     </button>
 
-                    <span className="presence-pill online">
-                      {anyHostMediaActive ? 'Connected' : 'Connected'}
+                    <span
+                      className={`presence-pill ${
+                        transportStatus?.tone ?? 'pending'
+                      }`}
+                      data-testid="floating-transport-status"
+                    >
+                      {transportStatus?.label ?? 'Connecting'}
                     </span>
 
                     <button
@@ -1903,6 +2050,13 @@ export function App(): React.ReactElement {
                         height: `${panelLayout.chatHeight}px`,
                       }}
                     >
+                      <div
+                        className="muted"
+                        data-testid="floating-chat-status"
+                        style={{ fontSize: '0.75rem' }}
+                      >
+                        {chatStatus?.label ?? 'Chat Offline'}
+                      </div>
                       <div className="floating-chat-messages">
                         {webrtcSnap.messages.length === 0 ? (
                           <div className="muted">
@@ -2297,9 +2451,16 @@ export function App(): React.ReactElement {
                         </button>
                         {optInDiagnostics && liveDiagnostics && (
                           <div className="muted" style={{ fontSize: '0.72rem' }}>
-                            Decoded: {liveDiagnostics.decodedWidth ?? 0}×
-                            {liveDiagnostics.decodedHeight ?? 0} @{' '}
-                            {liveDiagnostics.decodedFps ?? 0}fps
+                            <div>
+                              Decoded: {liveDiagnostics.decodedWidth ?? 0}×
+                              {liveDiagnostics.decodedHeight ?? 0} @{' '}
+                              {liveDiagnostics.decodedFps ?? 0}fps
+                            </div>
+                            <div>
+                              Out Frames: {liveDiagnostics.outboundFramesSent ?? 0}{' '}
+                              | In Bytes: {liveDiagnostics.inboundBytesReceived ?? 0}{' '}
+                              | Dec Frames: {liveDiagnostics.inboundFramesDecoded ?? 0}
+                            </div>
                           </div>
                         )}
                       </div>

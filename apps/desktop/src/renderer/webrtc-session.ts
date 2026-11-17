@@ -50,11 +50,14 @@ export interface WebRtcReadabilityDiagnostics {
   readonly encodedWidth: number | null;
   readonly encodedHeight: number | null;
   readonly encodedFps: number | null;
+  readonly outboundFramesSent: number | null;
   readonly outboundBitrateKbps: number | null;
   readonly qualityLimitationReason: string | null;
   readonly decodedWidth: number | null;
   readonly decodedHeight: number | null;
   readonly decodedFps: number | null;
+  readonly inboundFramesDecoded: number | null;
+  readonly inboundBytesReceived: number | null;
   readonly inboundBitrateKbps: number | null;
   readonly packetsLost: number | null;
   readonly packetLossPercent: number | null;
@@ -1723,12 +1726,15 @@ export class ApprovedWebRtcSessionController {
     let encodedWidth: number | null = null;
     let encodedHeight: number | null = null;
     let encodedFps: number | null = null;
+    let outboundFramesSent: number | null = null;
     let outboundBitrateKbps: number | null = null;
     let qualityLimitationReason: string | null = null;
 
     let decodedWidth: number | null = null;
     let decodedHeight: number | null = null;
     let decodedFps: number | null = null;
+    let inboundFramesDecoded: number | null = null;
+    let inboundBytesReceived: number | null = null;
     let inboundBitrateKbps: number | null = null;
     let packetsLost: number | null = null;
     let packetLossPercent: number | null = null;
@@ -1750,6 +1756,7 @@ export class ApprovedWebRtcSessionController {
             if (typeof stat.frameWidth === 'number') encodedWidth = stat.frameWidth;
             if (typeof stat.frameHeight === 'number') encodedHeight = stat.frameHeight;
             if (typeof stat.framesPerSecond === 'number') encodedFps = Math.round(stat.framesPerSecond);
+            if (typeof stat.framesSent === 'number') outboundFramesSent = stat.framesSent;
             if (typeof stat.qualityLimitationReason === 'string') {
               qualityLimitationReason = stat.qualityLimitationReason;
             }
@@ -1783,6 +1790,8 @@ export class ApprovedWebRtcSessionController {
             if (typeof stat.frameWidth === 'number') decodedWidth = stat.frameWidth;
             if (typeof stat.frameHeight === 'number') decodedHeight = stat.frameHeight;
             if (typeof stat.framesPerSecond === 'number') decodedFps = Math.round(stat.framesPerSecond);
+            if (typeof stat.framesDecoded === 'number') inboundFramesDecoded = stat.framesDecoded;
+            if (typeof stat.bytesReceived === 'number') inboundBytesReceived = stat.bytesReceived;
             if (typeof stat.packetsLost === 'number') packetsLost = stat.packetsLost;
             if (
               typeof stat.packetsLost === 'number' &&
@@ -1829,11 +1838,14 @@ export class ApprovedWebRtcSessionController {
       encodedWidth,
       encodedHeight,
       encodedFps,
+      outboundFramesSent,
       outboundBitrateKbps,
       qualityLimitationReason,
       decodedWidth,
       decodedHeight,
       decodedFps,
+      inboundFramesDecoded,
+      inboundBytesReceived,
       inboundBitrateKbps,
       packetsLost,
       packetLossPercent,
@@ -3430,11 +3442,14 @@ export async function runReadabilityAndStageVerificationSuite(): Promise<Readabi
     encodedWidth: 1920,
     encodedHeight: 1080,
     encodedFps: 30,
+    outboundFramesSent: 300,
     outboundBitrateKbps: 2450,
     qualityLimitationReason: 'none',
     decodedWidth: 1920,
     decodedHeight: 1080,
     decodedFps: 30,
+    inboundFramesDecoded: 298,
+    inboundBytesReceived: 1250000,
     inboundBitrateKbps: 2420,
     packetsLost: 0,
     packetLossPercent: 0,
