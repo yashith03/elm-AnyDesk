@@ -59,7 +59,7 @@ Elm-AnyDesk is a Windows 11 Electron desktop application for **consent-based 1:1
 
 ## 3. Explicit Non-Goals & Prohibitions
 The following features are **strictly out of scope and must never be built**:
-1. **No capture-evasion features** (e.g., no `setContentProtection(true)` / `WDA_EXCLUDEFROMCAPTURE` or stealth/overlay hooks designed to hide windows from OS/third-party screen recorders).
+1. **No unauthorized stealth or background capture**: Capture requires explicit Host approval and visible UI indicators. (`BrowserWindow.setContentProtection(true)` is permitted strictly on Elm-AnyDesk's own overlay/UI windows via `apps/desktop/src/main/capture-protection.ts` for Host privacy during screen sharing, enforced always-ON in production builds and never using raw `WDA_EXCLUDEFROMCAPTURE` stealth hooks.)
 2. **No remote keyboard or mouse control** (view-only screen sharing).
 3. **No session recording** (neither local nor cloud media recording).
 4. **No persistent chat history** (chat messages exist only in volatile memory for the duration of the single active session and are wiped upon disconnect).

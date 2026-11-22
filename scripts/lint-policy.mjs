@@ -15,11 +15,12 @@ const SOURCE_DIRS = [
 const FORBIDDEN_PATTERNS = [
   {
     regex: /\bsetContentProtection\b/,
-    reason: 'Capture evasion (setContentProtection) is strictly prohibited by PROJECT_BRIEF.md',
+    allowInFile: 'capture-protection.ts',
+    reason: 'BrowserWindow.setContentProtection must be centralized in apps/desktop/src/main/capture-protection.ts',
   },
   {
     regex: /\bWDA_EXCLUDEFROMCAPTURE\b/,
-    reason: 'Capture evasion (WDA_EXCLUDEFROMCAPTURE) is strictly prohibited by PROJECT_BRIEF.md',
+    reason: 'Raw WDA_EXCLUDEFROMCAPTURE stealth hooks are prohibited by PROJECT_BRIEF.md',
   },
   {
     regex: /\belectron-updater\b|\bautoUpdater\b/,

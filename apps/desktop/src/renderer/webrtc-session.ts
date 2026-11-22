@@ -80,6 +80,7 @@ export interface WebRtcSessionSnapshot {
   readonly dataChannelOrdered: boolean | null;
   readonly dataChannelReliable: boolean;
   readonly sharingStartedByHost: boolean;
+  readonly hostMicMutedLocally: boolean;
   readonly hostMediaState: HostMediaRuntimeState;
   readonly guestReceivedTracks: readonly GuestReceivedTrackInfo[];
   readonly guestVideoTracksCount: number;
@@ -177,6 +178,7 @@ export class ApprovedWebRtcSessionController {
   private closed = false;
 
   private sharingStartedByHost = false;
+  private hostMicMutedLocally = false;
   private hostMediaState: Record<MediaSourceKind, MediaSourceStatusDescriptor>;
   private readonly hostSenders = new Map<MediaSourceKind, ActiveHostSenderEntry>();
   private readonly stoppingByHost = new Set<MediaSourceKind>();
@@ -1165,10 +1167,26 @@ export class ApprovedWebRtcSessionController {
 
     try {
       await window.elmDesktop.selectShareableSource(selectedSourceId);
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: false,
-      });
+      let timedOut = false;
+      const stream = await Promise.race([
+        navigator.mediaDevices
+          .getDisplayMedia({
+            video: true,
+            audio: false,
+          })
+          .then((s) => {
+            if (timedOut) {
+              for (const t of s.getTracks()) t.stop();
+            }
+            return s;
+          }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => {
+            timedOut = true;
+            reject(new Error('Screen capture request timed out after 12s.'));
+          }, 12_000)
+        ),
+      ]);
 
       // Ensure no audio track is ever bundled with the screen video track
       for (const strayAudio of stream.getAudioTracks()) {
@@ -1290,6 +1308,7 @@ export class ApprovedWebRtcSessionController {
       if (!this.pcHost) throw new Error('Host peer connection not initialized.');
       const sender = this.pcHost.addTrack(audioTrack, dedicatedStream);
 
+      this.hostMicMutedLocally = false;
       this.hostSenders.set('microphoneAudio', {
         source: 'microphoneAudio',
         track: audioTrack,
@@ -1512,6 +1531,44 @@ export class ApprovedWebRtcSessionController {
   }
 
   /**
+   * Starts a single approved Host media source ('screenVideo', 'microphoneAudio',
+   * or 'deviceAudio') independently without starting other unrequested sources.
+   * Enforces explicit session approval: unapproved sources are never captured.
+   */
+  public async startHostSource(
+    source: MediaSourceKind,
+    options?: {
+      selectedSourceId?: string | null;
+      playWasapiTestTone?: boolean;
+    }
+  ): Promise<WebRtcSessionSnapshot> {
+    if (this.closed) return this.getSnapshot();
+    if (!this.session.hostMediaSelection[source]) {
+      return this.getSnapshot();
+    }
+
+    if (!this.hostDataChannel) {
+      await this.connectAcceptedSession();
+    }
+
+    this.sharingStartedByHost = true;
+
+    if (!this.hostSenders.has(source)) {
+      if (source === 'screenVideo') {
+        await this.startScreenVideoCapture(options?.selectedSourceId ?? null);
+      } else if (source === 'microphoneAudio') {
+        await this.startMicrophoneAudioCapture();
+      } else if (source === 'deviceAudio') {
+        await this.startDeviceAudioCapture(Boolean(options?.playWasapiTestTone));
+      }
+      await this.renegotiateHostToGuest();
+    }
+
+    this.emitChange();
+    return this.getSnapshot();
+  }
+
+  /**
    * Allows Host A to stop an individual active capture source ('screenVideo',
    * 'microphoneAudio', or 'deviceAudio') independently without dropping the other
    * active sources or the private DataChannel chat.
@@ -1527,6 +1584,9 @@ export class ApprovedWebRtcSessionController {
     this.stoppingByHost.add(source);
     try {
       this.hostSenders.delete(source);
+      if (source === 'microphoneAudio') {
+        this.hostMicMutedLocally = false;
+      }
       try {
         this.pcHost?.removeTrack(entry.sender);
       } catch {
@@ -1678,6 +1738,16 @@ export class ApprovedWebRtcSessionController {
     return msg;
   }
 
+  public setHostMicrophoneMuted(muted: boolean): WebRtcSessionSnapshot {
+    this.hostMicMutedLocally = Boolean(muted);
+    const micEntry = this.hostSenders.get('microphoneAudio');
+    if (micEntry) {
+      micEntry.track.enabled = !this.hostMicMutedLocally;
+    }
+    this.emitChange();
+    return this.getSnapshot();
+  }
+
   /**
    * Updates Guest B's local-only playback controls.
    * Guest B can never enable, disable, or request Host A's capture sources.
@@ -1807,6 +1877,7 @@ export class ApprovedWebRtcSessionController {
         dcForMeta.maxPacketLifeTime === null &&
         dcForMeta.maxRetransmits === null,
       sharingStartedByHost: this.sharingStartedByHost,
+      hostMicMutedLocally: this.hostMicMutedLocally,
       hostMediaState: { ...this.hostMediaState },
       guestReceivedTracks,
       guestVideoTracksCount,
@@ -2053,6 +2124,7 @@ export class ApprovedWebRtcSessionController {
 
     // 2. Invalidate old session media permissions on Host A
     this.sharingStartedByHost = false;
+    this.hostMicMutedLocally = false;
     this.permissionsInvalidated = true;
     for (const src of [
       'screenVideo',

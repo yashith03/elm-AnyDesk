@@ -11,9 +11,16 @@ import type {
   DesktopRuntimeMetadata,
   DeviceSetupState,
   ElmDesktopBridge,
+  HostOverlayUiState,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
+import type { CaptureProtectionState } from '../shared/capture-protection';
+import {
+  DEFAULT_FLOATING_PANEL_APPEARANCE,
+  sanitizeFloatingPanelAppearance,
+  type FloatingPanelAppearance,
+} from '../shared/floating-panel';
 import {
   removeRecentPeerEntry,
   renameRecentPeerEntry,
@@ -155,7 +162,44 @@ export function installBrowserPreviewBridgeIfNeeded(): void {
     dataChannelState: 'closed',
     messagePreviewsEnabled: false,
     messages: [],
+    imageAttachmentsByMessageId: {},
     hostMediaState: null,
+  };
+
+  let previewAppearance: FloatingPanelAppearance = {
+    ...DEFAULT_FLOATING_PANEL_APPEARANCE,
+  };
+  let previewCaptureProtection: CaptureProtectionState = {
+    enabled: true,
+    toggleAllowed: false,
+    windows: {
+      main: true,
+      hostToolbar: false,
+      chat: false,
+      sourcePicker: false,
+      settings: false,
+    },
+  };
+  const previewOverlayState: HostOverlayUiState = {
+    sessionActive: false,
+    sessionId: null,
+    peerDisplayName: '',
+    connectionState: 'closed',
+    iceConnectionState: 'new',
+    dataChannelState: 'closed',
+    hostMediaState: null,
+    hostMicMutedLocally: false,
+    isStartingShare: false,
+    isStartingMic: false,
+    isStartingDeviceSound: false,
+    shareableSources: [],
+    selectedSourceId: null,
+    playWasapiTestTone: false,
+    chatOpen: false,
+    sourcePickerOpen: false,
+    settingsOpen: false,
+    appearance: previewAppearance,
+    captureProtection: previewCaptureProtection,
   };
 
   const metadata: DesktopRuntimeMetadata = {
@@ -403,6 +447,28 @@ export function installBrowserPreviewBridgeIfNeeded(): void {
     onVolatileSessionUiStateUpdated: () => () => {},
     onChatWindowOutboundSend: () => () => {},
     onHostStopSharingRequest: () => () => {},
+    getHostOverlayState: async () => previewOverlayState,
+    syncHostOverlayState: async () => previewOverlayState,
+    onHostOverlayStateUpdated: () => () => {},
+    dispatchHostToolbarAction: async () => ({ dispatched: false }),
+    onHostToolbarAction: () => () => {},
+    toggleHostToolbarWindow: async () => ({ open: false }),
+    toggleHostSourcePickerPopup: async () => ({ open: false }),
+    toggleHostSettingsPopup: async () => ({ open: false }),
+    closeSeparateChatWindow: async () => ({ closed: false }),
+    restoreAndFocusMainWindow: async () => {},
+    getFloatingAppearance: async () => previewAppearance,
+    setFloatingAppearance: async (patch) => {
+      previewAppearance = sanitizeFloatingPanelAppearance({
+        ...previewAppearance,
+        ...patch,
+      });
+      return previewAppearance;
+    },
+    onFloatingAppearanceUpdated: () => () => {},
+    getCaptureProtectionState: async () => previewCaptureProtection,
+    setCaptureProtectionTestEnabled: async () => previewCaptureProtection,
+    onCaptureProtectionUpdated: () => () => {},
     getThemeState: async () => themeState,
     setThemeMode: async (mode: ThemeMode) => {
       themeState = {

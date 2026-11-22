@@ -9,6 +9,8 @@ import type {
 import type {
   DesktopRuntimeMetadata,
   ElmDesktopBridge,
+  HostOverlayUiState,
+  HostToolbarActionPayload,
   PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
@@ -16,6 +18,8 @@ import type {
   WasapiAudioChunkPayload,
   WasapiEndpointProbeResult,
 } from '../shared/bridge';
+import type { CaptureProtectionState } from '../shared/capture-protection';
+import type { FloatingPanelAppearance } from '../shared/floating-panel';
 import type { ThemeMode, ThemeStateSnapshot } from '../shared/theme';
 
 const bridge: ElmDesktopBridge = Object.freeze({
@@ -158,6 +162,10 @@ const bridge: ElmDesktopBridge = Object.freeze({
   sendChatFromChatWindow: (params: {
     text: string;
     senderOverride?: 'host' | 'guest';
+    imageDataUrl?: string;
+    imageMimeType?: string;
+    imageName?: string;
+    imageByteLength?: number;
   }): Promise<{ queued: boolean }> =>
     ipcRenderer.invoke('elm:chat-window-outbound-send', params),
   requestHostStopSharingFromChatWindow: (
@@ -182,11 +190,22 @@ const bridge: ElmDesktopBridge = Object.freeze({
     listener: (params: {
       text: string;
       senderOverride?: 'host' | 'guest';
+      imageDataUrl?: string;
+      imageMimeType?: string;
+      imageName?: string;
+      imageByteLength?: number;
     }) => void
   ): (() => void) => {
     const wrapped = (
       _event: IpcRendererEvent,
-      params: { text: string; senderOverride?: 'host' | 'guest' }
+      params: {
+        text: string;
+        senderOverride?: 'host' | 'guest';
+        imageDataUrl?: string;
+        imageMimeType?: string;
+        imageName?: string;
+        imageByteLength?: number;
+      }
     ) => {
       listener(params);
     };
@@ -207,6 +226,93 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.on('elm:host-stop-sharing-event', wrapped);
     return () => {
       ipcRenderer.removeListener('elm:host-stop-sharing-event', wrapped);
+    };
+  },
+
+  // Independent Host Floating Toolbar, Popups, Appearance & Capture Protection
+  getHostOverlayState: (): Promise<HostOverlayUiState> =>
+    ipcRenderer.invoke('elm:host-overlay-get'),
+  syncHostOverlayState: (
+    patch: Partial<HostOverlayUiState>
+  ): Promise<HostOverlayUiState> =>
+    ipcRenderer.invoke('elm:host-overlay-sync', patch),
+  onHostOverlayStateUpdated: (
+    listener: (state: HostOverlayUiState) => void
+  ): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, state: HostOverlayUiState) => {
+      listener(state);
+    };
+    ipcRenderer.on('elm:host-overlay-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:host-overlay-updated', wrapped);
+    };
+  },
+  dispatchHostToolbarAction: (
+    action: HostToolbarActionPayload
+  ): Promise<{ dispatched: boolean }> =>
+    ipcRenderer.invoke('elm:host-toolbar-action-dispatch', action),
+  onHostToolbarAction: (
+    listener: (action: HostToolbarActionPayload) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      action: HostToolbarActionPayload
+    ) => {
+      listener(action);
+    };
+    ipcRenderer.on('elm:host-toolbar-action-event', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:host-toolbar-action-event', wrapped);
+    };
+  },
+  toggleHostToolbarWindow: (open: boolean): Promise<{ open: boolean }> =>
+    ipcRenderer.invoke('elm:host-toolbar-window-toggle', open),
+  toggleHostSourcePickerPopup: (open?: boolean): Promise<{ open: boolean }> =>
+    ipcRenderer.invoke('elm:host-source-picker-toggle', open),
+  toggleHostSettingsPopup: (open?: boolean): Promise<{ open: boolean }> =>
+    ipcRenderer.invoke('elm:host-settings-toggle', open),
+  closeSeparateChatWindow: (): Promise<{ closed: boolean }> =>
+    ipcRenderer.invoke('elm:close-separate-chat-window'),
+  restoreAndFocusMainWindow: (): Promise<void> =>
+    ipcRenderer.invoke('elm:restore-and-focus-main-window'),
+  getFloatingAppearance: (): Promise<FloatingPanelAppearance> =>
+    ipcRenderer.invoke('elm:floating-appearance-get'),
+  setFloatingAppearance: (
+    patch: Partial<FloatingPanelAppearance>
+  ): Promise<FloatingPanelAppearance> =>
+    ipcRenderer.invoke('elm:floating-appearance-set', patch),
+  onFloatingAppearanceUpdated: (
+    listener: (appearance: FloatingPanelAppearance) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      appearance: FloatingPanelAppearance
+    ) => {
+      listener(appearance);
+    };
+    ipcRenderer.on('elm:floating-appearance-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:floating-appearance-updated', wrapped);
+    };
+  },
+  getCaptureProtectionState: (): Promise<CaptureProtectionState> =>
+    ipcRenderer.invoke('elm:capture-protection-get'),
+  setCaptureProtectionTestEnabled: (
+    enabled: boolean
+  ): Promise<CaptureProtectionState> =>
+    ipcRenderer.invoke('elm:capture-protection-set', enabled),
+  onCaptureProtectionUpdated: (
+    listener: (state: CaptureProtectionState) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      state: CaptureProtectionState
+    ) => {
+      listener(state);
+    };
+    ipcRenderer.on('elm:capture-protection-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:capture-protection-updated', wrapped);
     };
   },
 

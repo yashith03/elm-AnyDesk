@@ -6,6 +6,7 @@ import {
   ipcMain,
   nativeTheme,
   powerMonitor,
+  screen,
   session,
 } from 'electron';
 import fs from 'node:fs';
@@ -23,11 +24,18 @@ import {
 import type {
   DesktopRuntimeMetadata,
   DesktopWindowRole,
+  HostOverlayUiState,
+  HostToolbarActionPayload,
   PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
+import {
+  DEFAULT_FLOATING_PANEL_APPEARANCE,
+  sanitizeFloatingPanelAppearance,
+  type FloatingPanelAppearance,
+} from '../shared/floating-panel';
 import {
   THEME_TOKENS,
   computeWcagContrastRatio,
@@ -35,6 +43,10 @@ import {
   type ThemeStateSnapshot,
 } from '../shared/theme';
 import { DesktopAuthAndInviteController } from './auth-invite-client';
+import {
+  CaptureProtectionController,
+  type ProtectedWindowRegistry,
+} from './capture-protection';
 import { Win11TaskbarDwmController } from './win11-dwm';
 import { WasapiLoopbackManager } from './wasapi-loopback';
 
@@ -51,11 +63,42 @@ if (
 
 let mainWindow: BrowserWindow | null = null;
 let chatWindow: BrowserWindow | null = null;
+let hostToolbarWindow: BrowserWindow | null = null;
+let sourcePickerWindow: BrowserWindow | null = null;
+let settingsWindow: BrowserWindow | null = null;
 let taskbarDwmController: Win11TaskbarDwmController | null = null;
 let authInviteController: DesktopAuthAndInviteController | null = null;
+let lastHostToolbarBounds: Electron.Rectangle | null = null;
+let lastSourcePickerClosedAt = 0;
+let lastSettingsClosedAt = 0;
 const wasapiManager = new WasapiLoopbackManager();
+const captureProtection = new CaptureProtectionController();
 
 let explicitlySelectedSourceId: string | null = null;
+
+function getProtectedRegistry(): ProtectedWindowRegistry {
+  return {
+    main: mainWindow,
+    hostToolbar: hostToolbarWindow,
+    chat: chatWindow,
+    sourcePicker: sourcePickerWindow,
+    settings: settingsWindow,
+  };
+}
+
+let floatingAppearance: FloatingPanelAppearance = {
+  ...DEFAULT_FLOATING_PANEL_APPEARANCE,
+};
+
+function getAllOpenUiWindows(): BrowserWindow[] {
+  return [
+    mainWindow,
+    hostToolbarWindow,
+    chatWindow,
+    sourcePickerWindow,
+    settingsWindow,
+  ].filter((w): w is BrowserWindow => Boolean(w && !w.isDestroyed()));
+}
 
 /**
  * In-memory volatile session and chat UI state shared between the Main Window
@@ -69,8 +112,123 @@ let volatileUiState: VolatileSessionUiState = {
   dataChannelState: 'closed',
   messagePreviewsEnabled: false,
   messages: [],
+  imageAttachmentsByMessageId: {},
   hostMediaState: null,
 };
+
+let hostOverlayState: HostOverlayUiState = {
+  sessionActive: false,
+  sessionId: null,
+  peerDisplayName: '',
+  connectionState: 'closed',
+  iceConnectionState: 'new',
+  dataChannelState: 'closed',
+  hostMediaState: null,
+  hostMicMutedLocally: false,
+  isStartingShare: false,
+  isStartingMic: false,
+  isStartingDeviceSound: false,
+  shareableSources: [],
+  selectedSourceId: null,
+  playWasapiTestTone: false,
+  chatOpen: false,
+  sourcePickerOpen: false,
+  settingsOpen: false,
+  appearance: floatingAppearance,
+  captureProtection: captureProtection.getState(getProtectedRegistry()),
+};
+
+function broadcastHostOverlayState(): void {
+  const nextState: HostOverlayUiState = {
+    ...hostOverlayState,
+    chatOpen: Boolean(chatWindow && !chatWindow.isDestroyed() && chatWindow.isVisible()),
+    sourcePickerOpen: Boolean(
+      sourcePickerWindow &&
+        !sourcePickerWindow.isDestroyed() &&
+        sourcePickerWindow.isVisible()
+    ),
+    settingsOpen: Boolean(
+      settingsWindow && !settingsWindow.isDestroyed() && settingsWindow.isVisible()
+    ),
+    appearance: floatingAppearance,
+    captureProtection: captureProtection.getState(getProtectedRegistry()),
+  };
+  hostOverlayState = nextState;
+  for (const win of getAllOpenUiWindows()) {
+    win.webContents.send('elm:host-overlay-updated', nextState);
+  }
+}
+
+function broadcastCaptureProtectionState(): void {
+  const state = captureProtection.applyToAll(getProtectedRegistry());
+  for (const win of getAllOpenUiWindows()) {
+    win.webContents.send('elm:capture-protection-updated', state);
+  }
+  broadcastHostOverlayState();
+}
+
+function broadcastFloatingAppearance(): void {
+  for (const win of getAllOpenUiWindows()) {
+    win.webContents.send('elm:floating-appearance-updated', floatingAppearance);
+  }
+  broadcastHostOverlayState();
+}
+
+function closeHostSourcePickerWindow(): void {
+  if (sourcePickerWindow && !sourcePickerWindow.isDestroyed()) {
+    lastSourcePickerClosedAt = Date.now();
+    sourcePickerWindow.close();
+  }
+  sourcePickerWindow = null;
+}
+
+function closeHostSettingsWindow(): void {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    lastSettingsClosedAt = Date.now();
+    settingsWindow.close();
+  }
+  settingsWindow = null;
+}
+
+function closeHostOverlayWindows(restoreMain: boolean): void {
+  closeHostSourcePickerWindow();
+  closeHostSettingsWindow();
+  if (hostToolbarWindow && !hostToolbarWindow.isDestroyed()) {
+    hostToolbarWindow.close();
+  }
+  hostToolbarWindow = null;
+  if (chatWindow && !chatWindow.isDestroyed()) {
+    chatWindow.close();
+  }
+  chatWindow = null;
+  lastHostToolbarBounds = null;
+  captureProtection.resetToDefaultOn(getProtectedRegistry());
+  hostOverlayState = {
+    ...hostOverlayState,
+    sessionActive: false,
+    sessionId: null,
+    peerDisplayName: '',
+    connectionState: 'closed',
+    iceConnectionState: 'new',
+    dataChannelState: 'closed',
+    hostMediaState: null,
+    hostMicMutedLocally: false,
+    isStartingShare: false,
+    isStartingMic: false,
+    isStartingDeviceSound: false,
+    chatOpen: false,
+    sourcePickerOpen: false,
+    settingsOpen: false,
+    captureProtection: captureProtection.getState(getProtectedRegistry()),
+  };
+  broadcastCaptureProtectionState();
+  if (restoreMain && mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  }
+}
 
 function resetVolatileUiState(): void {
   volatileUiState = {
@@ -80,13 +238,14 @@ function resetVolatileUiState(): void {
     dataChannelState: 'closed',
     messagePreviewsEnabled: false,
     messages: [],
+    imageAttachmentsByMessageId: {},
     hostMediaState: null,
   };
   broadcastVolatileUiState();
 }
 
 function broadcastVolatileUiState(): void {
-  for (const win of [mainWindow, chatWindow]) {
+  for (const win of [mainWindow, chatWindow, hostToolbarWindow]) {
     if (win && !win.isDestroyed()) {
       win.webContents.send('elm:volatile-ui-updated', volatileUiState);
     }
@@ -110,15 +269,13 @@ function getSystemPreferredThemeMode(): ThemeMode {
 
 function applyThemeToWindows(state: ThemeStateSnapshot): void {
   const bg = THEME_TOKENS[state.mode].bgCanvas;
-  for (const win of [mainWindow, chatWindow]) {
-    if (win && !win.isDestroyed()) {
-      try {
-        win.setBackgroundColor(bg);
-      } catch {
-        // Ignore if window is closing
-      }
-      win.webContents.send('elm:theme-updated', state);
+  for (const win of getAllOpenUiWindows()) {
+    try {
+      win.setBackgroundColor(bg);
+    } catch {
+      // Ignore if window is closing
     }
+    win.webContents.send('elm:theme-updated', state);
   }
 }
 
@@ -313,13 +470,24 @@ async function createMainWindow(): Promise<BrowserWindow> {
 
   windowRoles.set(win, 'main');
   attachWindowSecurityGuards(win);
+  captureProtection.applyToWindow(win);
 
   taskbarDwmController = new Win11TaskbarDwmController(win);
   taskbarDwmController.initialize();
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'main' } });
+  captureProtection.applyToWindow(win);
 
+  win.on('show', () => {
+    captureProtection.applyToWindow(win);
+  });
+  win.on('restore', () => {
+    captureProtection.applyToWindow(win);
+  });
+  win.on('focus', () => {
+    captureProtection.applyToWindow(win);
+  });
   win.on('maximize', () => {
     if (!win.isDestroyed()) {
       win.webContents.send('elm:window-maximized-changed', true);
@@ -336,9 +504,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     resetVolatileUiState();
     mainWindow = null;
     taskbarDwmController = null;
-    if (chatWindow && !chatWindow.isDestroyed()) {
-      chatWindow.close();
-    }
+    closeHostOverlayWindows(false);
     if (presentationWindow && !presentationWindow.isDestroyed()) {
       presentationWindow.close();
     }
@@ -347,20 +513,319 @@ async function createMainWindow(): Promise<BrowserWindow> {
   return win;
 }
 
+function clampRectToDisplayWorkArea(
+  rect: Electron.Rectangle,
+  preferredBounds?: Electron.Rectangle | null
+): Electron.Rectangle {
+  const display = screen.getDisplayMatching(preferredBounds ?? rect);
+  const wa = display.workArea;
+  const width = Math.min(rect.width, Math.max(240, wa.width - 16));
+  const height = Math.min(rect.height, Math.max(48, wa.height - 16));
+  const maxX = Math.max(wa.x + 8, wa.x + wa.width - width - 8);
+  const maxY = Math.max(wa.y + 8, wa.y + wa.height - height - 8);
+  const x = Math.max(wa.x + 8, Math.min(rect.x, maxX));
+  const y = Math.max(wa.y + 8, Math.min(rect.y, maxY));
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+}
+
+function positionPopupBelowHostToolbar(
+  popup: BrowserWindow,
+  popupWidth: number,
+  popupHeight: number,
+  align: 'center' | 'right'
+): void {
+  if (popup.isDestroyed()) return;
+  const anchor =
+    hostToolbarWindow && !hostToolbarWindow.isDestroyed()
+      ? hostToolbarWindow.getBounds()
+      : mainWindow && !mainWindow.isDestroyed()
+        ? mainWindow.getBounds()
+        : screen.getPrimaryDisplay().workArea;
+  const display = screen.getDisplayMatching(anchor);
+  const wa = display.workArea;
+
+  const desiredX =
+    align === 'right'
+      ? anchor.x + anchor.width - popupWidth
+      : anchor.x + Math.round((anchor.width - popupWidth) / 2);
+  let desiredY = anchor.y + anchor.height + 8;
+  if (desiredY + popupHeight > wa.y + wa.height - 8) {
+    desiredY = Math.max(wa.y + 8, anchor.y - popupHeight - 8);
+  }
+
+  const clamped = clampRectToDisplayWorkArea(
+    { x: desiredX, y: desiredY, width: popupWidth, height: popupHeight },
+    anchor
+  );
+  popup.setBounds(clamped, false);
+}
+
+async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
+  if (hostToolbarWindow && !hostToolbarWindow.isDestroyed()) {
+    hostToolbarWindow.setAlwaysOnTop(true, 'floating');
+    captureProtection.applyToWindow(hostToolbarWindow);
+    if (hostToolbarWindow.isMinimized()) {
+      hostToolbarWindow.restore();
+    }
+    hostToolbarWindow.show();
+    broadcastHostOverlayState();
+    return hostToolbarWindow;
+  }
+
+  const anchorBounds =
+    mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.getBounds()
+      : screen.getPrimaryDisplay().workArea;
+  const display = screen.getDisplayMatching(anchorBounds);
+  const wa = display.workArea;
+  const baseWidth = captureProtection.isToggleAllowed() ? 940 : 840;
+  const width = Math.min(Math.max(480, wa.width - 24), baseWidth);
+  const height = 54;
+
+  const initialRect = clampRectToDisplayWorkArea(
+    lastHostToolbarBounds
+      ? {
+          x: lastHostToolbarBounds.x,
+          y: lastHostToolbarBounds.y,
+          width,
+          height,
+        }
+      : {
+          x: wa.x + Math.round((wa.width - width) / 2),
+          y: wa.y + 14,
+          width,
+          height,
+        },
+    anchorBounds
+  );
+  lastHostToolbarBounds = initialRect;
+
+  const win = new BrowserWindow({
+    x: initialRect.x,
+    y: initialRect.y,
+    width: initialRect.width,
+    height: initialRect.height,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: true,
+    show: false,
+    title: 'Elm-AnyDesk — Host Toolbar',
+    icon: getWindowIconPath(),
+    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    webPreferences: createSecureWebPreferences(),
+  });
+
+  windowRoles.set(win, 'host-toolbar');
+  win.setAlwaysOnTop(true, 'floating');
+  attachWindowSecurityGuards(win);
+  captureProtection.applyToWindow(win);
+
+  const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
+  await win.loadFile(rendererHtmlPath, { query: { role: 'host-toolbar' } });
+  captureProtection.applyToWindow(win);
+
+  win.on('move', () => {
+    if (win.isDestroyed()) return;
+    lastHostToolbarBounds = win.getBounds();
+    if (sourcePickerWindow && !sourcePickerWindow.isDestroyed()) {
+      positionPopupBelowHostToolbar(sourcePickerWindow, 360, 340, 'center');
+    }
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      positionPopupBelowHostToolbar(settingsWindow, 320, 410, 'right');
+    }
+  });
+
+  win.on('show', () => {
+    win.setAlwaysOnTop(true, 'floating');
+    captureProtection.applyToWindow(win);
+  });
+
+  win.on('closed', () => {
+    hostToolbarWindow = null;
+    closeHostSourcePickerWindow();
+    closeHostSettingsWindow();
+    broadcastCaptureProtectionState();
+  });
+
+  hostToolbarWindow = win;
+  win.show();
+  broadcastCaptureProtectionState();
+  return win;
+}
+
+async function createOrShowHostSourcePickerWindow(): Promise<BrowserWindow> {
+  if (sourcePickerWindow && !sourcePickerWindow.isDestroyed()) {
+    captureProtection.applyToWindow(sourcePickerWindow);
+    positionPopupBelowHostToolbar(sourcePickerWindow, 360, 340, 'center');
+    sourcePickerWindow.show();
+    sourcePickerWindow.focus();
+    broadcastHostOverlayState();
+    return sourcePickerWindow;
+  }
+
+  const win = new BrowserWindow({
+    width: 360,
+    height: 340,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: true,
+    show: false,
+    title: 'Elm-AnyDesk — Select Screen or Window',
+    icon: getWindowIconPath(),
+    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    webPreferences: createSecureWebPreferences(),
+  });
+
+  windowRoles.set(win, 'host-source-picker');
+  win.setAlwaysOnTop(true, 'floating');
+  attachWindowSecurityGuards(win);
+  captureProtection.applyToWindow(win);
+
+  const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
+  await win.loadFile(rendererHtmlPath, {
+    query: { role: 'host-source-picker' },
+  });
+  captureProtection.applyToWindow(win);
+  positionPopupBelowHostToolbar(win, 360, 340, 'center');
+
+  win.on('blur', () => {
+    closeHostSourcePickerWindow();
+    broadcastHostOverlayState();
+  });
+
+  win.on('closed', () => {
+    if (sourcePickerWindow === win) {
+      sourcePickerWindow = null;
+    }
+    broadcastCaptureProtectionState();
+  });
+
+  sourcePickerWindow = win;
+  win.show();
+  win.focus();
+  broadcastCaptureProtectionState();
+  return win;
+}
+
+async function createOrShowHostSettingsWindow(): Promise<BrowserWindow> {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    captureProtection.applyToWindow(settingsWindow);
+    positionPopupBelowHostToolbar(settingsWindow, 320, 410, 'right');
+    settingsWindow.show();
+    settingsWindow.focus();
+    broadcastHostOverlayState();
+    return settingsWindow;
+  }
+
+  const win = new BrowserWindow({
+    width: 320,
+    height: 410,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: true,
+    show: false,
+    title: 'Elm-AnyDesk — Overlay Appearance Settings',
+    icon: getWindowIconPath(),
+    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    webPreferences: createSecureWebPreferences(),
+  });
+
+  windowRoles.set(win, 'host-settings');
+  win.setAlwaysOnTop(true, 'floating');
+  attachWindowSecurityGuards(win);
+  captureProtection.applyToWindow(win);
+
+  const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
+  await win.loadFile(rendererHtmlPath, { query: { role: 'host-settings' } });
+  captureProtection.applyToWindow(win);
+  positionPopupBelowHostToolbar(win, 320, 410, 'right');
+
+  win.on('blur', () => {
+    closeHostSettingsWindow();
+    broadcastHostOverlayState();
+  });
+
+  win.on('closed', () => {
+    if (settingsWindow === win) {
+      settingsWindow = null;
+    }
+    broadcastCaptureProtectionState();
+  });
+
+  settingsWindow = win;
+  win.show();
+  win.focus();
+  broadcastCaptureProtectionState();
+  return win;
+}
+
 async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   if (chatWindow && !chatWindow.isDestroyed()) {
     if (chatWindow.isMinimized()) {
       chatWindow.restore();
     }
+    chatWindow.setAlwaysOnTop(hostOverlayState.sessionActive, 'floating');
+    captureProtection.applyToWindow(chatWindow);
+    chatWindow.show();
     chatWindow.focus();
+    broadcastHostOverlayState();
     return chatWindow;
   }
 
+  const anchor =
+    hostToolbarWindow && !hostToolbarWindow.isDestroyed()
+      ? hostToolbarWindow.getBounds()
+      : mainWindow && !mainWindow.isDestroyed()
+        ? mainWindow.getBounds()
+        : screen.getPrimaryDisplay().workArea;
+  const display = screen.getDisplayMatching(anchor);
+  const wa = display.workArea;
+  const width = 400;
+  const height = 480;
+  const initialBounds = clampRectToDisplayWorkArea(
+    {
+      x:
+        hostToolbarWindow && !hostToolbarWindow.isDestroyed()
+          ? anchor.x + anchor.width - width
+          : wa.x + wa.width - width - 24,
+      y:
+        hostToolbarWindow && !hostToolbarWindow.isDestroyed()
+          ? anchor.y + anchor.height + 12
+          : wa.y + 40,
+      width,
+      height,
+    },
+    anchor
+  );
+
   const win = new BrowserWindow({
-    width: 480,
-    height: 660,
-    minWidth: 380,
-    minHeight: 480,
+    x: initialBounds.x,
+    y: initialBounds.y,
+    width: initialBounds.width,
+    height: initialBounds.height,
+    minWidth: 320,
+    minHeight: 320,
+    frame: false,
+    skipTaskbar: hostOverlayState.sessionActive,
+    alwaysOnTop: hostOverlayState.sessionActive,
+    hasShadow: true,
     title: 'Elm-AnyDesk — Private 1:1 Session Chat (Volatile DataChannel)',
     icon: getWindowIconPath(),
     autoHideMenuBar: true,
@@ -369,19 +834,30 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   });
 
   windowRoles.set(win, 'chat');
+  if (hostOverlayState.sessionActive) {
+    win.setAlwaysOnTop(true, 'floating');
+  }
   attachWindowSecurityGuards(win);
-
-  const chatDwm = new Win11TaskbarDwmController(win);
-  chatDwm.initialize();
+  captureProtection.applyToWindow(win);
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'chat' } });
+  captureProtection.applyToWindow(win);
+
+  win.on('show', () => {
+    captureProtection.applyToWindow(win);
+  });
+  win.on('restore', () => {
+    captureProtection.applyToWindow(win);
+  });
 
   win.on('closed', () => {
     chatWindow = null;
+    broadcastCaptureProtectionState();
   });
 
   chatWindow = win;
+  broadcastCaptureProtectionState();
   return win;
 }
 
@@ -451,8 +927,14 @@ function registerDisplayMediaHandler(): void {
           return;
         }
 
+        const targetTypes: Array<'screen' | 'window'> =
+          explicitlySelectedSourceId.startsWith('screen:')
+            ? ['screen']
+            : ['window'];
         const sources = await desktopCapturer.getSources({
-          types: ['screen', 'window'],
+          types: targetTypes,
+          thumbnailSize: { width: 0, height: 0 },
+          fetchWindowIcons: false,
         });
         const chosen = sources.find((s) => s.id === explicitlySelectedSourceId);
         if (!chosen) {
@@ -603,6 +1085,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('elm:auth-sign-out', () => {
     resetVolatileUiState();
+    closeHostOverlayWindows(false);
     return getAuthController().signOut();
   });
 
@@ -632,6 +1115,7 @@ function registerIpcHandlers(): void {
       if (!online) {
         wasapiManager.stopCapture();
         resetVolatileUiState();
+        closeHostOverlayWindows(false);
       }
       return getAuthController().setPresenceOnline(Boolean(online), options);
     }
@@ -744,6 +1228,7 @@ function registerIpcHandlers(): void {
     ) => {
       wasapiManager.stopCapture();
       resetVolatileUiState();
+      closeHostOverlayWindows(true);
       return getAuthController().disconnectActiveSession(sessionIdOrOptions);
     }
   );
@@ -777,6 +1262,7 @@ function registerIpcHandlers(): void {
       if (res.ok && res.data && !res.data.alive) {
         wasapiManager.stopCapture();
         resetVolatileUiState();
+        closeHostOverlayWindows(true);
       }
       return res;
     }
@@ -834,7 +1320,14 @@ function registerIpcHandlers(): void {
     'elm:chat-window-outbound-send',
     (
       _event,
-      params: { text: string; senderOverride?: 'host' | 'guest' }
+      params: {
+        text: string;
+        senderOverride?: 'host' | 'guest';
+        imageDataUrl?: string;
+        imageMimeType?: string;
+        imageName?: string;
+        imageByteLength?: number;
+      }
     ): { queued: boolean } => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('elm:chat-window-outbound-event', params);
@@ -957,6 +1450,166 @@ function registerIpcHandlers(): void {
     return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized());
   });
 
+  ipcMain.handle('elm:host-overlay-get', (): HostOverlayUiState => {
+    return {
+      ...hostOverlayState,
+      chatOpen: Boolean(chatWindow && !chatWindow.isDestroyed() && chatWindow.isVisible()),
+      sourcePickerOpen: Boolean(
+        sourcePickerWindow &&
+          !sourcePickerWindow.isDestroyed() &&
+          sourcePickerWindow.isVisible()
+      ),
+      settingsOpen: Boolean(
+        settingsWindow &&
+          !settingsWindow.isDestroyed() &&
+          settingsWindow.isVisible()
+      ),
+      appearance: floatingAppearance,
+      captureProtection: captureProtection.getState(getProtectedRegistry()),
+    };
+  });
+
+  ipcMain.handle(
+    'elm:host-overlay-sync',
+    (_event, patch: Partial<HostOverlayUiState>): HostOverlayUiState => {
+      hostOverlayState = {
+        ...hostOverlayState,
+        ...patch,
+      };
+      broadcastHostOverlayState();
+      return hostOverlayState;
+    }
+  );
+
+  ipcMain.handle(
+    'elm:host-toolbar-action-dispatch',
+    (_event, action: HostToolbarActionPayload): { dispatched: boolean } => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('elm:host-toolbar-action-event', action);
+        return { dispatched: true };
+      }
+      return { dispatched: false };
+    }
+  );
+
+  ipcMain.handle(
+    'elm:host-toolbar-window-toggle',
+    async (_event, open: boolean): Promise<{ open: boolean }> => {
+      if (open) {
+        await createOrShowHostToolbarWindow();
+        return { open: true };
+      }
+      closeHostOverlayWindows(true);
+      return { open: false };
+    }
+  );
+
+  ipcMain.handle(
+    'elm:host-source-picker-toggle',
+    async (_event, open?: boolean): Promise<{ open: boolean }> => {
+      const currentlyOpen = Boolean(
+        sourcePickerWindow &&
+          !sourcePickerWindow.isDestroyed() &&
+          sourcePickerWindow.isVisible()
+      );
+      const justClosedByBlur = Date.now() - lastSourcePickerClosedAt < 250;
+      const shouldOpen =
+        open !== undefined
+          ? Boolean(open)
+          : !(currentlyOpen || justClosedByBlur);
+      if (shouldOpen) {
+        closeHostSettingsWindow();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('elm:host-toolbar-action-event', {
+            type: 'refresh-sources',
+          } satisfies HostToolbarActionPayload);
+        }
+        await createOrShowHostSourcePickerWindow();
+        return { open: true };
+      }
+      closeHostSourcePickerWindow();
+      broadcastHostOverlayState();
+      return { open: false };
+    }
+  );
+
+  ipcMain.handle(
+    'elm:host-settings-toggle',
+    async (_event, open?: boolean): Promise<{ open: boolean }> => {
+      const currentlyOpen = Boolean(
+        settingsWindow &&
+          !settingsWindow.isDestroyed() &&
+          settingsWindow.isVisible()
+      );
+      const justClosedByBlur = Date.now() - lastSettingsClosedAt < 250;
+      const shouldOpen =
+        open !== undefined
+          ? Boolean(open)
+          : !(currentlyOpen || justClosedByBlur);
+      if (shouldOpen) {
+        closeHostSourcePickerWindow();
+        await createOrShowHostSettingsWindow();
+        return { open: true };
+      }
+      closeHostSettingsWindow();
+      broadcastHostOverlayState();
+      return { open: false };
+    }
+  );
+
+  ipcMain.handle('elm:close-separate-chat-window', (): { closed: boolean } => {
+    if (chatWindow && !chatWindow.isDestroyed()) {
+      chatWindow.close();
+      chatWindow = null;
+      broadcastHostOverlayState();
+      return { closed: true };
+    }
+    return { closed: false };
+  });
+
+  ipcMain.handle('elm:restore-and-focus-main-window', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
+      captureProtection.applyToWindow(mainWindow);
+    }
+  });
+
+  ipcMain.handle(
+    'elm:floating-appearance-get',
+    (): FloatingPanelAppearance => {
+      return floatingAppearance;
+    }
+  );
+
+  ipcMain.handle(
+    'elm:floating-appearance-set',
+    (_event, patch: Partial<FloatingPanelAppearance>): FloatingPanelAppearance => {
+      floatingAppearance = sanitizeFloatingPanelAppearance({
+        ...floatingAppearance,
+        ...patch,
+      });
+      broadcastFloatingAppearance();
+      return floatingAppearance;
+    }
+  );
+
+  ipcMain.handle('elm:capture-protection-get', () => {
+    return captureProtection.getState(getProtectedRegistry());
+  });
+
+  ipcMain.handle('elm:capture-protection-set', (_event, enabled: boolean) => {
+    const next = captureProtection.setTestEnabled(
+      Boolean(enabled),
+      getProtectedRegistry()
+    );
+    broadcastCaptureProtectionState();
+    return next;
+  });
+
   ipcMain.handle(
     'elm:verify-static-thumbnail-and-peek',
     async (): Promise<TaskbarDwmTelemetry> => {
@@ -990,9 +1643,15 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     'elm:select-shareable-source',
     async (_event, sourceId: string) => {
+      const targetTypes: Array<'screen' | 'window'> = sourceId.startsWith(
+        'screen:'
+      )
+        ? ['screen']
+        : ['window'];
       const rawSources = await desktopCapturer.getSources({
-        types: ['screen', 'window'],
-        thumbnailSize: { width: 16, height: 16 },
+        types: targetTypes,
+        thumbnailSize: { width: 0, height: 0 },
+        fetchWindowIcons: false,
       });
       const matched = rawSources.find((s) => s.id === sourceId);
       if (!matched) {
@@ -1056,12 +1715,30 @@ app.whenReady().then(async () => {
   powerMonitor.on('suspend', () => {
     wasapiManager.stopCapture();
     resetVolatileUiState();
+    closeHostOverlayWindows(false);
     const ctrl = getAuthController();
     ctrl.pausePresenceForSuspend();
     void ctrl.disconnectActiveSession({
       reason: 'connection_lost',
       subReason: 'os_sleep_suspend',
     });
+  });
+
+  screen.on('display-metrics-changed', () => {
+    if (hostToolbarWindow && !hostToolbarWindow.isDestroyed()) {
+      const clamped = clampRectToDisplayWorkArea(hostToolbarWindow.getBounds());
+      hostToolbarWindow.setBounds(clamped, false);
+      lastHostToolbarBounds = clamped;
+    }
+    if (chatWindow && !chatWindow.isDestroyed()) {
+      chatWindow.setBounds(clampRectToDisplayWorkArea(chatWindow.getBounds()), false);
+    }
+    if (sourcePickerWindow && !sourcePickerWindow.isDestroyed()) {
+      positionPopupBelowHostToolbar(sourcePickerWindow, 360, 340, 'center');
+    }
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      positionPopupBelowHostToolbar(settingsWindow, 320, 410, 'right');
+    }
   });
 
   powerMonitor.on('resume', () => {
@@ -1531,6 +2208,7 @@ let cleanupCompletedBeforeQuit = false;
 app.on('before-quit', (event) => {
   wasapiManager.stopCapture();
   resetVolatileUiState();
+  closeHostOverlayWindows(false);
   if (!cleanupCompletedBeforeQuit) {
     event.preventDefault();
     cleanupCompletedBeforeQuit = true;

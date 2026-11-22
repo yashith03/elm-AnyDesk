@@ -66,4 +66,5 @@ test('simplified Home UI omits session tabs, cancel alert banner, and New Sessio
   assert.equal(appSource.includes('peer-card-email-'), true);
   assert.equal(appSource.includes('peer-card-phone-'), true);
   assert.equal(appSource.includes("showToast('You cannot connect to your code.', 'error')"), true);
+  assert.equal(appSource.includes('showToast(\n        `Declined invite from'), true);
 });
