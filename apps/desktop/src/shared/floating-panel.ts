@@ -23,7 +23,7 @@ export const DEFAULT_FLOATING_PANEL_APPEARANCE: FloatingPanelAppearance =
 export const DEFAULT_FLOATING_PANEL_LAYOUT: FloatingPanelLayout = Object.freeze({
   x: 16,
   y: 16,
-  width: 560,
+  width: 640,
   chatHeight: 260,
 });
 

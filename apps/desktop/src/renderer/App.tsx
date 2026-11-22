@@ -5,17 +5,23 @@ import {
   type HostMediaSelection,
   type InviteIntent,
   type InviteSummary,
-  type MediaSourceKind,
   type PresenceStateSnapshot,
 } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
   DeviceSetupState,
+  HostOverlayUiState,
   PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
 } from '../shared/bridge';
+import {
+  HostFloatingToolbarWindow,
+  HostSettingsPopup,
+  HostSourcePickerPopup,
+  PrivateChatPopupWindow,
+} from './HostOverlayWindows';
 import type { ThemeMode, ThemeStateSnapshot } from '../shared/theme';
 import {
   MAX_CHAT_IMAGE_BYTES,
@@ -47,6 +53,10 @@ import {
   type FloatingPanelAppearance,
   type FloatingPanelLayout,
 } from '../shared/floating-panel';
+import {
+  shouldDismissOnKeyDown,
+  shouldDismissOnOutsidePointerDown,
+} from '../shared/toolbar-media';
 import {
   ApprovedWebRtcSessionController,
   runAllWebRtcSessionVerificationMatrix,
@@ -181,7 +191,18 @@ export function App(): React.ReactElement {
   >([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [isStartingShare, setIsStartingShare] = useState<boolean>(false);
+  const [isStartingMic, setIsStartingMic] = useState<boolean>(false);
+  const [isStartingDeviceSound, setIsStartingDeviceSound] =
+    useState<boolean>(false);
   const [playWasapiTestTone] = useState<boolean>(false);
+  const [hostOverlayState, setHostOverlayState] =
+    useState<HostOverlayUiState | null>(null);
+  const [hostSourcePickerOpen, setHostSourcePickerOpen] =
+    useState<boolean>(false);
+  const hostSourcePopoverRef = useRef<HTMLDivElement | null>(null);
+  const hostSourceToggleRef = useRef<HTMLButtonElement | null>(null);
+  const floatingSettingsSidebarRef = useRef<HTMLElement | null>(null);
+  const floatingSettingsToggleRef = useRef<HTMLButtonElement | null>(null);
 
   // On-device first-launch profile & anonymous device registration state
   const [deviceSetupState, setDeviceSetupState] =
@@ -224,9 +245,6 @@ export function App(): React.ReactElement {
   const [volatileChatState, setVolatileChatState] =
     useState<VolatileSessionUiState | null>(null);
   const [chatInputText, setChatInputText] = useState<string>('');
-  const [chatSenderRole, setChatSenderRole] = useState<'host' | 'guest'>('host');
-  const [revealChatContentInWindow, setRevealChatContentInWindow] =
-    useState<boolean>(false);
 
   // Guest B media element refs for local playback
   const guestVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -366,64 +384,83 @@ export function App(): React.ReactElement {
     Promise.all([
       window.elmDesktop.getRuntimeMetadata(),
       window.elmDesktop.getVolatileSessionUiState(),
+      window.elmDesktop.getHostOverlayState().catch(() => null),
+      window.elmDesktop.getFloatingAppearance().catch(() => null),
       window.elmDesktop.getTaskbarDwmTelemetry().catch(() => null),
       window.elmDesktop.getThemeState().catch(() => null),
       window.elmDesktop.getRecentPeers().catch(() => [] as RecentPeerEntry[]),
       window.elmDesktop.isWindowMaximized().catch(() => false),
     ])
-      .then(([meta, volatileState, dwm, initialTheme, peers, maximized]) => {
-        if (!mounted) return;
-        setMetadata(meta);
-        setVolatileChatState(volatileState);
-        setRecentPeers(Array.isArray(peers) ? peers : []);
-        setIsWindowMaximized(Boolean(maximized));
-        if (dwm) setDwmTelemetry(dwm);
-        if (initialTheme) {
-          setThemeState(initialTheme);
-          applyThemeToDom(initialTheme.mode);
+      .then(
+        ([
+          meta,
+          volatileState,
+          overlayState,
+          floatingApp,
+          dwm,
+          initialTheme,
+          peers,
+          maximized,
+        ]) => {
+          if (!mounted) return;
+          setMetadata(meta);
+          setVolatileChatState(volatileState);
+          if (overlayState) setHostOverlayState(overlayState);
+          if (floatingApp) {
+            setPanelAppearance(sanitizeFloatingPanelAppearance(floatingApp));
+          }
+          setRecentPeers(Array.isArray(peers) ? peers : []);
+          setIsWindowMaximized(Boolean(maximized));
+          if (dwm) setDwmTelemetry(dwm);
+          if (initialTheme) {
+            setThemeState(initialTheme);
+            applyThemeToDom(initialTheme.mode);
+          }
+
+          if (meta.windowRole === 'main') {
+            (async () => {
+              try {
+                const setupRes = await window.elmDesktop.getDeviceSetupState();
+                if (!mounted) return;
+                if (setupRes.ok && setupRes.data) {
+                  setDeviceSetupState(setupRes.data);
+                  if (setupRes.data.localProfile) {
+                    setSetupNameInput(setupRes.data.localProfile.name);
+                    setSetupEmailInput(setupRes.data.localProfile.email);
+                    setSetupPhoneInput(setupRes.data.localProfile.phone);
+                  }
+                  if (setupRes.data.registeredAccount) {
+                    setAccount(setupRes.data.registeredAccount);
+                  }
+                }
+                const [storedRes, runtimeRes] = await Promise.all([
+                  window.elmDesktop.getStoredAuthSession(),
+                  window.elmDesktop.getPresenceRuntimeStatus(),
+                ]);
+                if (!mounted) return;
+                setPresenceRuntime(runtimeRes);
+                if (storedRes.ok && storedRes.data) {
+                  setAccount(storedRes.data.account);
+                  setSnapshot(storedRes.data.snapshot);
+                } else if (runtimeRes.snapshot) {
+                  setSnapshot(runtimeRes.snapshot);
+                }
+              } catch (err: unknown) {
+                if (mounted) {
+                  setErrorMessage(
+                    err instanceof Error ? err.message : String(err)
+                  );
+                }
+              }
+            })();
+          }
         }
-      })
+      )
       .catch((err: unknown) => {
         if (mounted) {
           setErrorMessage(err instanceof Error ? err.message : String(err));
         }
       });
-
-    // Hydrate registration & server-confirmed presence sequentially (single-flight in main)
-    // without blocking initial render or racing GET /presence/state against POST /presence/connect.
-    (async () => {
-      try {
-        const setupRes = await window.elmDesktop.getDeviceSetupState();
-        if (!mounted) return;
-        if (setupRes.ok && setupRes.data) {
-          setDeviceSetupState(setupRes.data);
-          if (setupRes.data.localProfile) {
-            setSetupNameInput(setupRes.data.localProfile.name);
-            setSetupEmailInput(setupRes.data.localProfile.email);
-            setSetupPhoneInput(setupRes.data.localProfile.phone);
-          }
-          if (setupRes.data.registeredAccount) {
-            setAccount(setupRes.data.registeredAccount);
-          }
-        }
-        const [storedRes, runtimeRes] = await Promise.all([
-          window.elmDesktop.getStoredAuthSession(),
-          window.elmDesktop.getPresenceRuntimeStatus(),
-        ]);
-        if (!mounted) return;
-        setPresenceRuntime(runtimeRes);
-        if (storedRes.ok && storedRes.data) {
-          setAccount(storedRes.data.account);
-          setSnapshot(storedRes.data.snapshot);
-        } else if (runtimeRes.snapshot) {
-          setSnapshot(runtimeRes.snapshot);
-        }
-      } catch (err: unknown) {
-        if (mounted) {
-          setErrorMessage(err instanceof Error ? err.message : String(err));
-        }
-      }
-    })();
 
     const unsubPresence = window.elmDesktop.onPresenceStatusUpdated(
       (nextRuntime) => {
@@ -449,6 +486,25 @@ export function App(): React.ReactElement {
       }
     );
 
+    const unsubOverlay = window.elmDesktop.onHostOverlayStateUpdated(
+      (nextOverlay) => {
+        if (mounted) {
+          setHostOverlayState(nextOverlay);
+          setPanelAppearance(
+            sanitizeFloatingPanelAppearance(nextOverlay.appearance)
+          );
+        }
+      }
+    );
+
+    const unsubAppearance = window.elmDesktop.onFloatingAppearanceUpdated(
+      (nextApp) => {
+        if (mounted) {
+          setPanelAppearance(sanitizeFloatingPanelAppearance(nextApp));
+        }
+      }
+    );
+
     const unsubTheme = window.elmDesktop.onThemeUpdated((nextTheme) => {
       if (mounted) {
         setThemeState(nextTheme);
@@ -470,6 +526,8 @@ export function App(): React.ReactElement {
       window.removeEventListener('online', handleNetworkChange);
       window.removeEventListener('offline', handleNetworkChange);
       unsubVolatile();
+      unsubOverlay();
+      unsubAppearance();
       unsubTheme();
       unsubMaximized();
     };
@@ -652,6 +710,7 @@ export function App(): React.ReactElement {
       clearGuestMediaElements();
       setFloatingChatOpen(false);
       setFloatingSettingsOpen(false);
+      setHostSourcePickerOpen(false);
       setWebrtcSnap(null);
       void window.elmDesktop.syncVolatileSessionUiState({
         session: null,
@@ -727,6 +786,9 @@ export function App(): React.ReactElement {
           connectionState: nextSnap.connectionState,
           dataChannelState: nextSnap.dataChannelState,
           messages: nextSnap.messages,
+          imageAttachmentsByMessageId: nextSnap.teardownReceipt
+            ? {}
+            : nextSnap.imageAttachmentsByMessageId,
           hostMediaState: nextSnap.hostMediaState,
         });
       },
@@ -766,6 +828,10 @@ export function App(): React.ReactElement {
         iceConnectionState: snap.iceConnectionState,
         dataChannelState: snap.dataChannelState,
         sharingStartedByHost: snap.sharingStartedByHost,
+        hostMicMutedLocally: snap.hostMicMutedLocally,
+        hostMediaState: snap.hostMediaState,
+        guestPlayback: snap.guestPlayback,
+        guestReceivedTrackSources: snap.guestReceivedTracks.map((t) => t.source),
         guestVideoTracksCount: snap.guestVideoTracksCount,
         guestAudioTracksCount: snap.guestAudioTracksCount,
         messagesCount: snap.messages.length,
@@ -798,13 +864,40 @@ export function App(): React.ReactElement {
     if (!metadata || metadata.windowRole !== 'main') return;
 
     const unsubChatSend = window.elmDesktop.onChatWindowOutboundSend(
-      async ({ text, senderOverride }) => {
+      async ({
+        text,
+        senderOverride,
+        imageDataUrl,
+        imageMimeType,
+        imageByteLength,
+      }) => {
         const ctrl = webrtcControllerRef.current;
         if (!ctrl) return;
         const defaultRole =
           account?.accountId === ctrl.session.guestAccountId ? 'guest' : 'host';
+        const activeSender = senderOverride ?? defaultRole;
+        if (imageDataUrl && imageMimeType) {
+          ctrl.sendChatImageOverDataChannel({
+            sender: activeSender,
+            senderAccountId:
+              account?.accountId ??
+              (activeSender === 'host'
+                ? ctrl.session.hostAccountId
+                : ctrl.session.guestAccountId),
+            senderDisplayName:
+              account?.displayName ??
+              (activeSender === 'host'
+                ? ctrl.session.hostDisplayName
+                : ctrl.session.guestDisplayName),
+            text,
+            mimeType: imageMimeType,
+            byteLength: imageByteLength ?? 0,
+            dataUrl: imageDataUrl,
+          });
+          return;
+        }
         await ctrl.sendChatMessageOverDataChannel({
-          sender: senderOverride ?? defaultRole,
+          sender: activeSender,
           text,
         });
       }
@@ -826,7 +919,7 @@ export function App(): React.ReactElement {
       unsubChatSend();
       unsubStopReq();
     };
-  }, [metadata?.windowRole, account?.accountId]);
+  }, [metadata?.windowRole, account?.accountId, account?.displayName]);
 
   // Bind Guest B's received tracks to Guest B's local <video> and <audio> playback elements
   useEffect(() => {
@@ -1196,6 +1289,132 @@ export function App(): React.ReactElement {
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [openPeerMenuCode]);
+
+  // Close floating Settings sidebar on outside pointerdown or Escape (keeps sliders/inside clicks open)
+  useEffect(() => {
+    if (!floatingSettingsOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      const shouldClose = shouldDismissOnOutsidePointerDown({
+        isOpen: floatingSettingsOpen,
+        insidePopup: Boolean(target && floatingSettingsSidebarRef.current?.contains(target)),
+        insideToggleButton: Boolean(target && floatingSettingsToggleRef.current?.contains(target)),
+      });
+      if (shouldClose) {
+        setFloatingSettingsOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (shouldDismissOnKeyDown({ isOpen: floatingSettingsOpen, key: event.key })) {
+        event.preventDefault();
+        setFloatingSettingsOpen(false);
+        requestAnimationFrame(() => {
+          floatingSettingsToggleRef.current?.focus();
+        });
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [floatingSettingsOpen]);
+
+  // Close Host Source Picker popover on outside pointerdown or Escape
+  useEffect(() => {
+    if (!hostSourcePickerOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      const shouldClose = shouldDismissOnOutsidePointerDown({
+        isOpen: hostSourcePickerOpen,
+        insidePopup: Boolean(target && hostSourcePopoverRef.current?.contains(target)),
+        insideToggleButton: Boolean(target && hostSourceToggleRef.current?.contains(target)),
+      });
+      if (shouldClose) {
+        setHostSourcePickerOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (shouldDismissOnKeyDown({ isOpen: hostSourcePickerOpen, key: event.key })) {
+        event.preventDefault();
+        setHostSourcePickerOpen(false);
+        requestAnimationFrame(() => {
+          hostSourceToggleRef.current?.focus();
+        });
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [hostSourcePickerOpen]);
+
+  // Close Settings, Chat, and Source Picker immediately on unexpected disconnect or teardown
+  useEffect(() => {
+    if (
+      webrtcSnap?.teardownReceipt ||
+      webrtcSnap?.connectionState === 'closed'
+    ) {
+      setFloatingSettingsOpen(false);
+      setFloatingChatOpen(false);
+      setHostSourcePickerOpen(false);
+    }
+  }, [webrtcSnap?.teardownReceipt, webrtcSnap?.connectionState]);
+
+  // Launch and synchronize the independent Host Floating Toolbar BrowserWindow
+  // ONLY when Host is in an active session; close it & restore main on disconnect.
+  const isHostInActiveSession =
+    metadata?.windowRole === 'main' &&
+    Boolean(snapshot?.activeSession) &&
+    Boolean(webrtcSnap) &&
+    !webrtcSnap?.teardownReceipt &&
+    snapshot?.activeSession?.hostAccountId === account?.accountId;
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    if (!isHostInActiveSession) {
+      void window.elmDesktop.toggleHostToolbarWindow(false);
+      return;
+    }
+    void window.elmDesktop.toggleHostToolbarWindow(true);
+  }, [metadata?.windowRole, isHostInActiveSession]);
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    if (!isHostInActiveSession || !snapshot?.activeSession || !webrtcSnap) {
+      return;
+    }
+    void window.elmDesktop.syncHostOverlayState({
+      sessionActive: true,
+      sessionId: snapshot.activeSession.sessionId,
+      peerDisplayName: snapshot.activeSession.guestDisplayName,
+      connectionState: webrtcSnap.connectionState,
+      iceConnectionState: webrtcSnap.iceConnectionState,
+      dataChannelState: webrtcSnap.dataChannelState,
+      hostMediaState: webrtcSnap.hostMediaState,
+      hostMicMutedLocally: webrtcSnap.hostMicMutedLocally,
+      isStartingShare,
+      isStartingMic,
+      isStartingDeviceSound,
+      shareableSources,
+      selectedSourceId,
+      playWasapiTestTone,
+    });
+  }, [
+    metadata?.windowRole,
+    isHostInActiveSession,
+    snapshot?.activeSession,
+    webrtcSnap,
+    isStartingShare,
+    isStartingMic,
+    isStartingDeviceSound,
+    shareableSources,
+    selectedSourceId,
+    playWasapiTestTone,
+  ]);
 
   const openSettingsModal = () => {
     const saved = deviceSetupState?.localProfile;
@@ -1593,7 +1812,7 @@ export function App(): React.ReactElement {
         `Accepted invite from ${invite.requesterDisplayName}. Connecting peer session. Media will not start until you click "Start Sharing".`
       );
     } else {
-      setStatusMessage(
+      showToast(
         `Declined invite from ${invite.requesterDisplayName} (${invite.requesterFriendCode}).`
       );
     }
@@ -1647,55 +1866,201 @@ export function App(): React.ReactElement {
     });
   };
 
-  const handleExplicitStartSharing = async () => {
-    clearAlerts();
+  const handleSelectHostSource = async (nextSourceId: string) => {
+    setSelectedSourceId(nextSourceId);
     const ctrl = webrtcControllerRef.current;
-    if (!ctrl) return;
+    if (!ctrl || !webrtcSnap?.hostMediaState.screenVideo.active) {
+      return;
+    }
     setIsStartingShare(true);
     try {
-      const nextSnap = await ctrl.startHostSharing({
-        selectedSourceId,
-        playWasapiTestTone,
+      await ctrl.stopHostSource('screenVideo');
+      await ctrl.startHostSource('screenVideo', {
+        selectedSourceId: nextSourceId,
       });
-      const failedSource = Object.values(nextSnap.hostMediaState).find(
-        (s) =>
-          s.approved &&
-          !s.active &&
-          (s.status === 'permission_denied' ||
-            s.status === 'unsupported' ||
-            s.status === 'source_disappeared')
-      );
-      if (failedSource) {
-        setErrorCode(failedSource.status.toUpperCase());
-        setErrorMessage(failedSource.message);
-        return;
-      }
-      if (nextSnap.hostMediaState.screenVideo.active) {
-        setStatusMessage(nextSnap.hostMediaState.screenVideo.message);
-      } else {
-        setStatusMessage('Approved media sharing started.');
-      }
+      setHostSourcePickerOpen(false);
     } catch (err) {
-      setErrorCode('CAPTURE_ERROR');
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Failed to start screen sharing.'
+      showToast(
+        err instanceof Error ? err.message : 'Failed to switch screen source.',
+        'error'
       );
     } finally {
       setIsStartingShare(false);
     }
   };
 
-  const handleStopIndividualSource = async (source: MediaSourceKind) => {
+  const handleToggleHostMic = async () => {
     const ctrl = webrtcControllerRef.current;
-    if (!ctrl) return;
-    await ctrl.stopHostSource(source);
+    if (!ctrl || !webrtcSnap) return;
+    const micState = webrtcSnap.hostMediaState.microphoneAudio;
+    if (!micState.approved) return;
+    if (micState.active) {
+      ctrl.setHostMicrophoneMuted(!webrtcSnap.hostMicMutedLocally);
+      return;
+    }
+    if (
+      micState.status === 'permission_denied' ||
+      micState.status === 'unsupported' ||
+      micState.status === 'source_disappeared'
+    ) {
+      return;
+    }
+    setIsStartingMic(true);
+    try {
+      const nextSnap = await ctrl.startHostSource('microphoneAudio');
+      const nextMic = nextSnap.hostMediaState.microphoneAudio;
+      if (!nextMic.active && nextMic.message) {
+        showToast(nextMic.message, 'error');
+      }
+    } finally {
+      setIsStartingMic(false);
+    }
   };
 
-  const handleStopAllSharing = async () => {
+  const handleToggleHostDeviceSound = async () => {
+    const ctrl = webrtcControllerRef.current;
+    if (!ctrl || !webrtcSnap) return;
+    const soundState = webrtcSnap.hostMediaState.deviceAudio;
+    if (!soundState.approved) return;
+    if (soundState.active) {
+      await ctrl.stopHostSource('deviceAudio');
+      showToast('Device sound stopped.');
+      return;
+    }
+    if (
+      soundState.status === 'permission_denied' ||
+      soundState.status === 'unsupported' ||
+      soundState.status === 'source_disappeared'
+    ) {
+      return;
+    }
+    setIsStartingDeviceSound(true);
+    try {
+      const nextSnap = await ctrl.startHostSource('deviceAudio', {
+        playWasapiTestTone,
+      });
+      const nextSound = nextSnap.hostMediaState.deviceAudio;
+      if (!nextSound.active && nextSound.message) {
+        showToast(nextSound.message, 'error');
+      }
+    } finally {
+      setIsStartingDeviceSound(false);
+    }
+  };
+
+  const handleStartOrRestartHostScreen = async (sourceOverride?: string | null) => {
+    clearAlerts();
+    const ctrl = webrtcControllerRef.current;
+    if (!ctrl || !webrtcSnap) return;
+    if (!webrtcSnap.hostMediaState.screenVideo.approved) return;
+
+    let targetSourceId = sourceOverride ?? selectedSourceId;
+    if (!targetSourceId) {
+      const sources = await window.elmDesktop.listShareableSources();
+      setShareableSources(sources);
+      targetSourceId = sources[0]?.id ?? null;
+      setSelectedSourceId(targetSourceId);
+      if (!targetSourceId) {
+        showToast('No shareable display or window found.', 'error');
+        return;
+      }
+    }
+
+    setIsStartingShare(true);
+    try {
+      if (webrtcSnap.hostMediaState.screenVideo.active) {
+        await ctrl.stopHostSource('screenVideo');
+      }
+      const nextSnap = await ctrl.startHostSource('screenVideo', {
+        selectedSourceId: targetSourceId,
+      });
+      setHostSourcePickerOpen(false);
+      const sv = nextSnap.hostMediaState.screenVideo;
+      if (sv.active) {
+        showToast('Screen sharing started.');
+      } else if (sv.message) {
+        showToast(sv.message, 'error');
+      }
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Failed to start screen sharing.',
+        'error'
+      );
+    } finally {
+      setIsStartingShare(false);
+    }
+  };
+
+  const handleStopHostScreen = async () => {
     const ctrl = webrtcControllerRef.current;
     if (!ctrl) return;
-    await ctrl.stopAllHostSharing();
+    await ctrl.stopHostSource('screenVideo');
+    showToast('Screen sharing stopped.');
   };
+
+  // Subscribe in Main Window to actions dispatched from independent Host overlay windows
+  const hostActionHandlersRef = useRef({
+    toggleMic: () => void handleToggleHostMic(),
+    stopMic: () => void webrtcControllerRef.current?.stopHostSource('microphoneAudio'),
+    toggleDeviceSound: () => void handleToggleHostDeviceSound(),
+    startScreen: () => void handleStartOrRestartHostScreen(),
+    stopScreen: () => void handleStopHostScreen(),
+    selectSource: (sourceId: string) => void handleSelectHostSource(sourceId),
+    refreshSources: () => void handleRefreshSources(),
+    endSession: () => void handleDisconnectSession(),
+    focusMain: () => void window.elmDesktop.restoreAndFocusMainWindow(),
+  });
+  hostActionHandlersRef.current = {
+    toggleMic: () => void handleToggleHostMic(),
+    stopMic: () => void webrtcControllerRef.current?.stopHostSource('microphoneAudio'),
+    toggleDeviceSound: () => void handleToggleHostDeviceSound(),
+    startScreen: () => void handleStartOrRestartHostScreen(),
+    stopScreen: () => void handleStopHostScreen(),
+    selectSource: (sourceId: string) => void handleSelectHostSource(sourceId),
+    refreshSources: () => void handleRefreshSources(),
+    endSession: () => void handleDisconnectSession(),
+    focusMain: () => void window.elmDesktop.restoreAndFocusMainWindow(),
+  };
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    const unsub = window.elmDesktop.onHostToolbarAction((action) => {
+      switch (action.type) {
+        case 'toggle-mic':
+          hostActionHandlersRef.current.toggleMic();
+          break;
+        case 'stop-mic':
+          hostActionHandlersRef.current.stopMic();
+          break;
+        case 'toggle-device-sound':
+          hostActionHandlersRef.current.toggleDeviceSound();
+          break;
+        case 'start-screen':
+          hostActionHandlersRef.current.startScreen();
+          break;
+        case 'stop-screen':
+          hostActionHandlersRef.current.stopScreen();
+          break;
+        case 'select-source':
+          hostActionHandlersRef.current.selectSource(action.sourceId);
+          break;
+        case 'refresh-sources':
+          hostActionHandlersRef.current.refreshSources();
+          break;
+        case 'end-session':
+          hostActionHandlersRef.current.endSession();
+          break;
+        case 'focus-main':
+          hostActionHandlersRef.current.focusMain();
+          break;
+        default:
+          break;
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, [metadata?.windowRole]);
 
   const handleSendChatFromAnyWindow = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1709,19 +2074,6 @@ export function App(): React.ReactElement {
 
     const text =
       rawText || `[In-memory image: ${imageName ?? 'image'}]`;
-
-    if (metadata?.windowRole === 'chat') {
-      setChatInputText('');
-      setPendingImageDataUrl(null);
-      setPendingImageName(null);
-      setPendingImageMimeType(null);
-      setPendingImageByteLength(0);
-      await window.elmDesktop.sendChatFromChatWindow({
-        text,
-        senderOverride: chatSenderRole,
-      });
-      return;
-    }
 
     const ctrl = webrtcControllerRef.current;
     if (!ctrl) {
@@ -1838,229 +2190,86 @@ export function App(): React.ReactElement {
   }
 
   // ============================================================================
-  // SEPARATE EPHEMERAL CHAT WINDOW (windowRole === 'chat')
+  // INDEPENDENT HOST FLOATING TOOLBAR WINDOW (windowRole === 'host-toolbar')
+  // ============================================================================
+  if (metadata.windowRole === 'host-toolbar') {
+    if (!hostOverlayState) {
+      return (
+        <main className="overlay-toolbar-shell">
+          <div className="overlay-toolbar-bar muted">Connecting toolbar…</div>
+        </main>
+      );
+    }
+    return (
+      <HostFloatingToolbarWindow
+        overlay={hostOverlayState}
+        themeState={themeState}
+      />
+    );
+  }
+
+  // ============================================================================
+  // INDEPENDENT HOST SOURCE PICKER POPUP (windowRole === 'host-source-picker')
+  // ============================================================================
+  if (metadata.windowRole === 'host-source-picker') {
+    if (!hostOverlayState) {
+      return <main className="overlay-popup-shell muted">Loading sources…</main>;
+    }
+    return (
+      <HostSourcePickerPopup
+        overlay={hostOverlayState}
+        themeState={themeState}
+      />
+    );
+  }
+
+  // ============================================================================
+  // INDEPENDENT HOST SETTINGS POPUP (windowRole === 'host-settings')
+  // ============================================================================
+  if (metadata.windowRole === 'host-settings') {
+    if (!hostOverlayState) {
+      return <main className="overlay-popup-shell muted">Loading settings…</main>;
+    }
+    return (
+      <HostSettingsPopup
+        overlay={hostOverlayState}
+        themeState={themeState}
+        onToggleTheme={() => void handleToggleTheme()}
+      />
+    );
+  }
+
+  // ============================================================================
+  // SEPARATE MOVABLE PRIVATE CHAT POPUP (windowRole === 'chat')
   // ============================================================================
   if (metadata.windowRole === 'chat') {
-    const activeSession = volatileChatState?.session ?? null;
-    const hostMedia = volatileChatState?.hostMediaState ?? null;
-    const messages = volatileChatState?.messages ?? [];
-    const anySourceActive =
-      Boolean(hostMedia?.screenVideo.active) ||
-      Boolean(hostMedia?.microphoneAudio.active) ||
-      Boolean(hostMedia?.deviceAudio.active);
-
     return (
-      <main className="app-shell">
-        <header className="top-bar">
-          <div className="top-bar-left">
-            <div className="top-bar-eyebrow">
-              <span className="badge">
-                Separate 1:1 Chat Window — Volatile DataChannel Only
-              </span>
-              <span className="badge badge-neutral">
-                Theme: {themeState.mode.toUpperCase()}
-              </span>
-            </div>
-            <h1>Elm-AnyDesk — Private Session Chat</h1>
-            <p className="muted">
-              Message previews disabled by default. Zero OS toast notifications.
-              Zero disk/database persistence. Standard OS window (not hidden
-              from entire-display capture).
-            </p>
-          </div>
-          <div className="top-bar-right">
-            {activeSession && (
-              <button
-                type="button"
-                data-testid="top-bar-disconnect-button"
-                className="danger-btn"
-                onClick={handleDisconnectSession}
-              >
-                Disconnect Session
-              </button>
-            )}
-            <ThemeToggleButton
-              themeState={themeState}
-              onToggle={() => void handleToggleTheme()}
-            />
-          </div>
-        </header>
-
-        {/* ACTIVE-SHARING INDICATORS & VISIBLE STOP CONTROL FOR HOST A IN CHAT WINDOW */}
-        <section className="card card-full">
-          <div className="subcard-header">
-            <div>
-              <h2>
-                Active-Sharing Indicators (Host A){' '}
-                <span
-                  className={`presence-pill ${
-                    anySourceActive ? 'online' : 'offline'
-                  }`}
-                >
-                  {anySourceActive ? 'SHARING LIVE' : 'NO ACTIVE MEDIA TRACKS'}
-                </span>
-              </h2>
-              <p className="muted">
-                DataChannel State:{' '}
-                <code>{volatileChatState?.dataChannelState ?? 'closed'}</code> |
-                Session:{' '}
-                <code>{activeSession?.sessionId ?? 'No active session'}</code>
-              </p>
-            </div>
-            {activeSession && (
-              <div className="actions-row">
-                <button
-                  type="button"
-                  className="danger-btn"
-                  disabled={!anySourceActive}
-                  onClick={() =>
-                    window.elmDesktop.requestHostStopSharingFromChatWindow(
-                      'all'
-                    )
-                  }
-                >
-                  Stop All Sharing (Host A)
-                </button>
-              </div>
-            )}
-          </div>
-
-          {hostMedia && (
-            <div className="telemetry-grid">
-              {(
-                ['screenVideo', 'microphoneAudio', 'deviceAudio'] as const
-              ).map((src) => {
-                const desc = hostMedia[src];
-                return (
-                  <div key={src} className="subcard">
-                    <h3>{src}</h3>
-                    <p>
-                      Status: <code>{desc.status}</code> | Active:{' '}
-                      <code>{String(desc.active)}</code>
-                    </p>
-                    <p className="muted">{desc.message}</p>
-                    {desc.active && (
-                      <button
-                        type="button"
-                        className="small-secondary-btn"
-                        onClick={() =>
-                          window.elmDesktop.requestHostStopSharingFromChatWindow(
-                            src
-                          )
-                        }
-                      >
-                        Stop {src}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        {/* EPHEMERAL BIDIRECTIONAL CHAT PANEL */}
-        <section className="card card-full">
-          <div className="subcard-header">
-            <div>
-              <h2>Bidirectional Reliable DataChannel Chat</h2>
-              <p className="muted">
-                Message Previews: <strong>OFF by default</strong> (messages are
-                masked until you toggle reveal below, and wiped immediately on
-                disconnect).
-              </p>
-            </div>
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={revealChatContentInWindow}
-                onChange={(e) =>
-                  setRevealChatContentInWindow(e.target.checked)
-                }
-              />
-              <span>Reveal Message Text in Chat Window</span>
-            </label>
-          </div>
-
-          {!activeSession ? (
-            <p className="muted">
-              No active 1:1 session. Accept an invite in the Main Window to
-              connect the WebRTC DataChannel.
-            </p>
-          ) : (
-            <>
-              <div className="subcard">
-                {messages.length === 0 ? (
-                  <p className="muted">
-                    DataChannel is{' '}
-                    <code>{volatileChatState?.dataChannelState}</code>. No
-                    messages sent in this session yet.
-                  </p>
-                ) : (
-                  <ul className="feature-list">
-                    {messages.map((m) => (
-                      <li key={m.messageId}>
-                        <strong>{m.senderDisplayName}</strong> (
-                        <code>{new Date(m.sentAt).toLocaleTimeString()}</code>
-                        ):{' '}
-                        {revealChatContentInWindow ? (
-                          <span>{m.text}</span>
-                        ) : (
-                          <code>
-                            [Message preview hidden by default — check
-                            &quot;Reveal Message Text&quot; above]
-                          </code>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-
-              <form
-                className="invite-form"
-                onSubmit={handleSendChatFromAnyWindow}
-              >
-                <select
-                  className="code-input"
-                  style={{ maxWidth: '190px' }}
-                  value={chatSenderRole}
-                  onChange={(e) =>
-                    setChatSenderRole(e.target.value as 'host' | 'guest')
-                  }
-                >
-                  <option value="host">
-                    Send as Host A ({activeSession.hostDisplayName})
-                  </option>
-                  <option value="guest">
-                    Send as Guest B ({activeSession.guestDisplayName})
-                  </option>
-                </select>
-                <input
-                  type="text"
-                  className="code-input"
-                  placeholder="Type private message over WebRTC DataChannel..."
-                  value={chatInputText}
-                  onChange={(e) => setChatInputText(e.target.value)}
-                />
-                <button type="submit" className="primary-btn">
-                  Send Over DataChannel
-                </button>
-              </form>
-            </>
-          )}
-        </section>
-      </main>
+      <PrivateChatPopupWindow
+        volatileState={volatileChatState}
+        appearance={hostOverlayState?.appearance ?? panelAppearance}
+        themeState={themeState}
+        onToggleTheme={() => void handleToggleTheme()}
+      />
     );
   }
 
   // ============================================================================
   // MAIN APPLICATION WINDOW (windowRole === 'main')
   // ============================================================================
-  const anyHostMediaActive =
-    Boolean(webrtcSnap?.hostMediaState.screenVideo.active) ||
-    Boolean(webrtcSnap?.hostMediaState.microphoneAudio.active) ||
-    Boolean(webrtcSnap?.hostMediaState.deviceAudio.active);
+  const hasGuestMicTrack = Boolean(
+    webrtcSnap?.guestReceivedTracks.some(
+      (t) => t.source === 'microphoneAudio' && t.readyState === 'live'
+    )
+  );
+  const hasGuestDeviceAudioTrack = Boolean(
+    webrtcSnap?.guestReceivedTracks.some(
+      (t) => t.source === 'deviceAudio' && t.readyState === 'live'
+    )
+  );
+  const updateViewerAppearance = (patch: Partial<FloatingPanelAppearance>) => {
+    setPanelAppearance((prev) => sanitizeFloatingPanelAppearance({ ...prev, ...patch }));
+    void window.elmDesktop.setFloatingAppearance(patch);
+  };
   const isLocalHost =
     Boolean(snapshot?.activeSession) &&
     snapshot?.activeSession?.hostAccountId === account?.accountId;
@@ -2087,7 +2296,7 @@ export function App(): React.ReactElement {
 
   return (
     <main className="app-shell">
-      {/* SIMPLE CUSTOM ELECTRON TITLE BAR (NO SESSION TABS) */}
+      {/* SIMPLE CUSTOM ELECTRON TITLE BAR */}
       <header className="top-bar chrome-titlebar" data-testid="chrome-titlebar">
         <div className="titlebar-brand">
           <svg
@@ -2587,19 +2796,87 @@ export function App(): React.ReactElement {
             </section>
           )}
 
-          {/* FULL-AREA ACTIVE SESSION VIEWER + ONE FLOATING PANEL */}
-          {snapshot?.activeSession && webrtcSnap && (
+          {/* COMPACT HOST ACTIVE-SESSION STATUS CARD (CONTROLS LIVE IN INDEPENDENT FLOATING TOOLBAR) */}
+          {snapshot?.activeSession && webrtcSnap && isLocalHost && (
+            <section
+              className="card card-full"
+              data-testid="host-active-session-card"
+            >
+              <div className="subcard-header">
+                <div>
+                  <span
+                    className={`presence-pill ${
+                      webrtcSnap.hostMediaState.screenVideo.active
+                        ? 'online'
+                        : transportStatus?.tone ?? 'pending'
+                    }`}
+                  >
+                    {webrtcSnap.hostMediaState.screenVideo.active
+                      ? 'Sharing via Floating Toolbar'
+                      : 'Host Session Connected'}
+                  </span>
+                  <h2 style={{ marginTop: '6px' }}>
+                    Peer: {snapshot.activeSession.guestDisplayName}
+                  </h2>
+                  <p className="muted">
+                    Use the independent floating toolbar for screen, mic,
+                    device sound, source selection, and private chat. You can
+                    minimize this window at any time without interrupting your
+                    session.
+                  </p>
+                </div>
+                <div className="actions-row">
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={() =>
+                      void window.elmDesktop.toggleHostToolbarWindow(true)
+                    }
+                  >
+                    Show Floating Toolbar
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={() =>
+                      void window.elmDesktop.openSeparateChatWindow()
+                    }
+                  >
+                    Open Private Chat
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={() => void window.elmDesktop.minimizeWindow()}
+                  >
+                    Minimize Window
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="host-card-end-session"
+                    className="danger-btn"
+                    onClick={handleDisconnectSession}
+                  >
+                    End Session
+                  </button>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* FULL-AREA ACTIVE SESSION VIEWER (VIEWER / GUEST ONLY) */}
+          {snapshot?.activeSession && webrtcSnap && !isLocalHost && (
             <section
               ref={viewerViewportRef}
               className="active-viewer-viewport"
               data-testid="active-viewer-stage"
             >
-              <div
-                ref={viewerContainerRef}
-                className={`viewer-stage-container ${
-                  viewerMode === 'fit' ? 'fit-mode' : 'actual-mode'
-                }`}
-              >
+                <div
+                  ref={viewerContainerRef}
+                  className={`viewer-stage-container ${
+                    viewerMode === 'fit' ? 'fit-mode' : 'actual-mode'
+                  }`}
+                >
                   <video
                     ref={guestVideoRef}
                     autoPlay
@@ -2613,7 +2890,8 @@ export function App(): React.ReactElement {
                         : 'stage-video-actual'
                     }
                     style={
-                      webrtcSnap.guestVideoTracksCount === 0
+                      webrtcSnap.guestVideoTracksCount === 0 ||
+                      webrtcSnap.guestPlayback.videoPausedLocally
                         ? { display: 'none' }
                         : viewerMode === 'actual' &&
                           renderedDimensions &&
@@ -2631,122 +2909,34 @@ export function App(): React.ReactElement {
                         : undefined
                     }
                   />
-                  {isLocalHost && stageStatus && (
+                  {webrtcSnap.guestVideoTracksCount === 0 && stageStatus && (
                     <div
-                      className="host-session-stage-card"
-                      data-testid="host-session-stage"
+                      className="viewer-stage-empty-placeholder muted"
+                      data-testid="guest-session-placeholder"
+                      style={{ padding: '40px 20px', textAlign: 'center' }}
                     >
-                      <div className="host-stage-status-row">
-                        <span
-                          className={`presence-pill ${
-                            stageStatus.state === 'sharing' ||
-                            stageStatus.state === 'sharing_audio'
-                              ? 'online'
-                              : stageStatus.state === 'error'
-                              ? 'offline'
-                              : 'pending'
-                          }`}
-                          data-testid="host-stage-status-pill"
-                        >
-                          {stageStatus.headline}
-                        </span>
-                        <span className="muted" style={{ fontSize: '0.8rem' }}>
-                          {transportStatus?.label} · {chatStatus?.label}
-                        </span>
-                      </div>
-                      {stageStatus.detail && (
-                        <p
-                          className={
-                            stageStatus.state === 'error'
-                              ? 'host-stage-error'
-                              : 'muted'
-                          }
-                        >
-                          {stageStatus.detail}
-                        </p>
-                      )}
-                      {stageStatus.showHostControls && (
-                        <div className="host-stage-controls">
-                          {webrtcSnap.hostMediaState.screenVideo.approved && (
-                            <div className="host-source-picker-row">
-                              <select
-                                className="code-input"
-                                aria-label="Select window or display to share"
-                                value={selectedSourceId ?? ''}
-                                onChange={(e) =>
-                                  setSelectedSourceId(e.target.value || null)
-                                }
-                              >
-                                {shareableSources.map((src) => (
-                                  <option key={src.id} value={src.id}>
-                                    [{src.surfaceType.toUpperCase()}] {src.name}
-                                  </option>
-                                ))}
-                              </select>
-                              <button
-                                type="button"
-                                className="secondary-btn"
-                                onClick={handleRefreshSources}
-                              >
-                                Refresh Sources
-                              </button>
-                            </div>
-                          )}
-                          <div className="actions-row">
-                            <button
-                              type="button"
-                              data-testid="host-start-sharing-button"
-                              className="primary-btn"
-                              disabled={isStartingShare}
-                              onClick={handleExplicitStartSharing}
-                            >
-                              {isStartingShare
-                                ? 'Starting...'
-                                : webrtcSnap.hostMediaState.screenVideo.active
-                                ? 'Restart Sharing'
-                                : 'Start Sharing'}
-                            </button>
-                            {anyHostMediaActive && (
-                              <button
-                                type="button"
-                                className="danger-btn"
-                                onClick={handleStopAllSharing}
-                              >
-                                Stop All Sharing
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      )}
+                      <strong style={{ display: 'block', marginBottom: '6px' }}>
+                        {stageStatus.headline}
+                      </strong>
+                      <span>{stageStatus.detail}</span>
                     </div>
                   )}
-                  {!isLocalHost &&
-                    webrtcSnap.guestVideoTracksCount === 0 &&
-                    stageStatus && (
-                      <div
-                        className="viewer-stage-empty-placeholder muted"
-                        data-testid="guest-session-placeholder"
-                        style={{ padding: '40px 20px', textAlign: 'center' }}
-                      >
-                        <strong style={{ display: 'block', marginBottom: '6px' }}>
-                          {stageStatus.headline}
-                        </strong>
-                        <span>{stageStatus.detail}</span>
-                      </div>
-                    )}
                   {webrtcSnap.guestVideoTracksCount > 0 &&
                     webrtcSnap.guestPlayback.videoPausedLocally && (
-                      <div className="viewer-paused-overlay">
-                        Local video display paused
+                      <div
+                        className="viewer-paused-overlay"
+                        data-testid="viewer-screen-hidden-overlay"
+                      >
+                        Remote screen hidden locally. Host sharing and chat remain active.
                       </div>
                     )}
                 </div>
 
-              {/* Hidden audio elements for remote mic & device sound */}
+              {/* Hidden audio elements for remote mic & device sound (Viewer only) */}
               <audio ref={guestMicAudioRef} autoPlay />
               <audio ref={guestDeviceAudioRef} autoPlay />
 
-              {/* ONE FLOATING PANEL ASSEMBLY OVER THE VIDEO */}
+              {/* ONE FLOATING PANEL ASSEMBLY (VIEWER) */}
               <div
                 className="floating-panel-assembly"
                 data-testid="floating-viewer-panel"
@@ -2771,56 +2961,54 @@ export function App(): React.ReactElement {
                       fontSize: `${panelAppearance.barTextSizePx}px`,
                     }}
                   >
-                    <button
-                      type="button"
-                      className="floating-drag-handle"
-                      data-testid="floating-panel-drag-handle"
-                      aria-label="Drag floating panel"
-                      title="Drag panel"
-                      onPointerDown={(e) => {
-                        e.preventDefault();
-                        panelInteractionRef.current = {
-                          kind: 'drag',
-                          startX: e.clientX,
-                          startY: e.clientY,
-                          initial: panelLayout,
-                        };
-                      }}
-                    >
-                      ⋮⋮
-                    </button>
+                      <button
+                        type="button"
+                        className="floating-drag-handle"
+                        data-testid="floating-panel-drag-handle"
+                        aria-label="Drag floating panel"
+                        title="Drag panel"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          panelInteractionRef.current = {
+                            kind: 'drag',
+                            startX: e.clientX,
+                            startY: e.clientY,
+                            initial: panelLayout,
+                          };
+                        }}
+                      >
+                        ⋮⋮
+                      </button>
 
                     <span
-                      className={`presence-pill ${
-                        transportStatus?.tone ?? 'pending'
-                      }`}
+                      className={`presence-pill ${transportStatus?.tone ?? 'pending'}`}
                       data-testid="floating-transport-status"
                     >
                       {transportStatus?.label ?? 'Connecting'}
                     </span>
 
-                    <button
-                      type="button"
-                      className={
-                        viewerMode === 'fit'
-                          ? 'mode-toggle-btn active'
-                          : 'mode-toggle-btn'
-                      }
-                      onClick={() => setViewerMode('fit')}
-                    >
-                      Fit
-                    </button>
-                    <button
-                      type="button"
-                      className={
-                        viewerMode === 'actual'
-                          ? 'mode-toggle-btn active'
-                          : 'mode-toggle-btn'
-                      }
-                      onClick={() => setViewerMode('actual')}
-                    >
-                      1:1
-                    </button>
+                        <button
+                          type="button"
+                          className={
+                            viewerMode === 'fit'
+                              ? 'mode-toggle-btn active'
+                              : 'mode-toggle-btn'
+                          }
+                          onClick={() => setViewerMode('fit')}
+                        >
+                          Fit
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            viewerMode === 'actual'
+                              ? 'mode-toggle-btn active'
+                              : 'mode-toggle-btn'
+                          }
+                          onClick={() => setViewerMode('actual')}
+                        >
+                          1:1
+                        </button>
 
                     <button
                       type="button"
@@ -2830,12 +3018,22 @@ export function App(): React.ReactElement {
                           ? 'small-secondary-btn active'
                           : 'small-secondary-btn'
                       }
-                      onClick={() => setFloatingChatOpen((prev) => !prev)}
+                      onClick={() =>
+                        setFloatingChatOpen((prev) => {
+                          const next = !prev;
+                          if (next) {
+                            setFloatingSettingsOpen(false);
+                            setHostSourcePickerOpen(false);
+                          }
+                          return next;
+                        })
+                      }
                     >
                       Chat
                     </button>
 
                     <button
+                      ref={floatingSettingsToggleRef}
                       type="button"
                       data-testid="floating-settings-toggle"
                       className={
@@ -2843,15 +3041,238 @@ export function App(): React.ReactElement {
                           ? 'small-secondary-btn active'
                           : 'small-secondary-btn'
                       }
-                      onClick={() => setFloatingSettingsOpen((prev) => !prev)}
+                      onClick={() =>
+                        setFloatingSettingsOpen((prev) => {
+                          const next = !prev;
+                          if (next) {
+                            setHostSourcePickerOpen(false);
+                          }
+                          return next;
+                        })
+                      }
                     >
                       Settings
                     </button>
+
+                    {!isLocalHost && (
+                      <>
+                        <span
+                          className="floating-toolbar-divider"
+                          aria-hidden="true"
+                        />
+                        <button
+                          type="button"
+                          data-testid="toolbar-my-mic-btn"
+                          className="toolbar-icon-btn"
+                          disabled
+                          title="Microphone sharing is available only to the Host"
+                          aria-label="My microphone (Host only)"
+                        >
+                          <svg
+                            width="15"
+                            height="15"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <line x1="2" y1="2" x2="22" y2="22" />
+                            <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
+                            <path d="M5 10v2a7 7 0 0 0 12 5" />
+                            <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
+                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
+                            <line x1="12" y1="19" x2="12" y2="22" />
+                          </svg>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="toolbar-peer-mic-btn"
+                          className={
+                            hasGuestMicTrack &&
+                            !webrtcSnap.guestPlayback.micMutedLocally
+                              ? 'toolbar-icon-btn active'
+                              : hasGuestMicTrack
+                              ? 'toolbar-icon-btn muted-state'
+                              : 'toolbar-icon-btn'
+                          }
+                          disabled={!hasGuestMicTrack}
+                          title={
+                            !hasGuestMicTrack
+                              ? 'Peer microphone not shared'
+                              : webrtcSnap.guestPlayback.micMutedLocally
+                              ? 'Unmute peer microphone'
+                              : 'Mute peer microphone'
+                          }
+                          aria-label="Peer microphone"
+                          onClick={() =>
+                            webrtcControllerRef.current?.updateGuestLocalPlayback(
+                              {
+                                micMutedLocally:
+                                  !webrtcSnap.guestPlayback.micMutedLocally,
+                              }
+                            )
+                          }
+                        >
+                          {hasGuestMicTrack &&
+                          !webrtcSnap.guestPlayback.micMutedLocally ? (
+                            <svg
+                              width="15"
+                              height="15"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                            </svg>
+                          ) : (
+                            <svg
+                              width="15"
+                              height="15"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                              <line x1="22" y1="9" x2="16" y2="15" />
+                              <line x1="16" y1="9" x2="22" y2="15" />
+                            </svg>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="toolbar-peer-sound-btn"
+                          className={
+                            hasGuestDeviceAudioTrack &&
+                            !webrtcSnap.guestPlayback.deviceAudioMutedLocally
+                              ? 'toolbar-icon-btn active'
+                              : hasGuestDeviceAudioTrack
+                              ? 'toolbar-icon-btn muted-state'
+                              : 'toolbar-icon-btn'
+                          }
+                          disabled={!hasGuestDeviceAudioTrack}
+                          title={
+                            !hasGuestDeviceAudioTrack
+                              ? 'Peer device sound not shared'
+                              : webrtcSnap.guestPlayback.deviceAudioMutedLocally
+                              ? 'Unmute peer device sound'
+                              : 'Mute peer device sound'
+                          }
+                          aria-label="Peer device sound"
+                          onClick={() =>
+                            webrtcControllerRef.current?.updateGuestLocalPlayback(
+                              {
+                                deviceAudioMutedLocally:
+                                  !webrtcSnap.guestPlayback
+                                    .deviceAudioMutedLocally,
+                              }
+                            )
+                          }
+                        >
+                          <svg
+                            width="15"
+                            height="15"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                            <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                          </svg>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="toolbar-peer-screen-btn"
+                          className={
+                            webrtcSnap.guestVideoTracksCount > 0 &&
+                            !webrtcSnap.guestPlayback.videoPausedLocally
+                              ? 'toolbar-icon-btn active'
+                              : webrtcSnap.guestVideoTracksCount > 0
+                              ? 'toolbar-icon-btn muted-state'
+                              : 'toolbar-icon-btn'
+                          }
+                          disabled={webrtcSnap.guestVideoTracksCount === 0}
+                          title={
+                            webrtcSnap.guestVideoTracksCount === 0
+                              ? 'Waiting for Host to share screen'
+                              : webrtcSnap.guestPlayback.videoPausedLocally
+                              ? 'Show remote screen'
+                              : 'Hide remote screen locally'
+                          }
+                          aria-label="Peer screen"
+                          onClick={() =>
+                            webrtcControllerRef.current?.updateGuestLocalPlayback(
+                              {
+                                videoPausedLocally:
+                                  !webrtcSnap.guestPlayback.videoPausedLocally,
+                              }
+                            )
+                          }
+                        >
+                          {webrtcSnap.guestVideoTracksCount > 0 &&
+                          !webrtcSnap.guestPlayback.videoPausedLocally ? (
+                            <svg
+                              width="15"
+                              height="15"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <rect x="2" y="3" width="20" height="14" rx="2" />
+                              <line x1="8" y1="21" x2="16" y2="21" />
+                              <line x1="12" y1="17" x2="12" y2="21" />
+                            </svg>
+                          ) : (
+                            <svg
+                              width="15"
+                              height="15"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M17 17H4a2 2 0 0 1-2-2V5c0-1.5 1-2 1-2" />
+                              <path d="M22 15V5a2 2 0 0 0-2-2H9" />
+                              <path d="M8 21h8" />
+                              <path d="M12 17v4" />
+                              <path d="m2 2 20 20" />
+                            </svg>
+                          )}
+                        </button>
+                      </>
+                    )}
 
                     <button
                       type="button"
                       data-testid="floating-end-session"
                       className="danger-btn"
+                      title="End session"
                       onClick={handleDisconnectSession}
                     >
                       End Session
@@ -3017,9 +3438,10 @@ export function App(): React.ReactElement {
                   />
                 </div>
 
-                {/* ATTACHED RIGHT SIDEBAR (OPENS EVEN IF CHAT IS COLLAPSED) */}
+                {/* ATTACHED RIGHT SIDEBAR (CLOSES ON OUTSIDE CLICK OR ESCAPE) */}
                 {floatingSettingsOpen && (
                   <aside
+                    ref={floatingSettingsSidebarRef}
                     className="floating-settings-sidebar"
                     data-testid="floating-settings-sidebar"
                     style={{
@@ -3051,12 +3473,9 @@ export function App(): React.ReactElement {
                           step={0.05}
                           value={panelAppearance.barBgOpacity}
                           onChange={(e) =>
-                            setPanelAppearance((prev) =>
-                              sanitizeFloatingPanelAppearance({
-                                ...prev,
-                                barBgOpacity: Number(e.target.value),
-                              })
-                            )
+                            updateViewerAppearance({
+                              barBgOpacity: Number(e.target.value),
+                            })
                           }
                         />
                       </label>
@@ -3073,12 +3492,9 @@ export function App(): React.ReactElement {
                           step={0.05}
                           value={panelAppearance.chatBgOpacity}
                           onChange={(e) =>
-                            setPanelAppearance((prev) =>
-                              sanitizeFloatingPanelAppearance({
-                                ...prev,
-                                chatBgOpacity: Number(e.target.value),
-                              })
-                            )
+                            updateViewerAppearance({
+                              chatBgOpacity: Number(e.target.value),
+                            })
                           }
                         />
                       </label>
@@ -3094,12 +3510,9 @@ export function App(): React.ReactElement {
                           step={1}
                           value={panelAppearance.barTextSizePx}
                           onChange={(e) =>
-                            setPanelAppearance((prev) =>
-                              sanitizeFloatingPanelAppearance({
-                                ...prev,
-                                barTextSizePx: Number(e.target.value),
-                              })
-                            )
+                            updateViewerAppearance({
+                              barTextSizePx: Number(e.target.value),
+                            })
                           }
                         />
                       </label>
@@ -3115,12 +3528,9 @@ export function App(): React.ReactElement {
                           step={1}
                           value={panelAppearance.chatTextSizePx}
                           onChange={(e) =>
-                            setPanelAppearance((prev) =>
-                              sanitizeFloatingPanelAppearance({
-                                ...prev,
-                                chatTextSizePx: Number(e.target.value),
-                              })
-                            )
+                            updateViewerAppearance({
+                              chatTextSizePx: Number(e.target.value),
+                            })
                           }
                         />
                       </label>
@@ -3143,121 +3553,6 @@ export function App(): React.ReactElement {
                         selected Presentation View window. Normal viewer or
                         entire-display shares include the panel.
                       </p>
-                    </div>
-
-                    {isLocalHost && (
-                      <div className="sidebar-section">
-                        <strong>Host Share Controls</strong>
-                        {webrtcSnap.hostMediaState.screenVideo.approved && (
-                          <button
-                            type="button"
-                            className="secondary-btn"
-                            onClick={handleRefreshSources}
-                          >
-                            Choose Window / Display
-                          </button>
-                        )}
-                        {shareableSources.length > 0 && (
-                          <select
-                            className="code-input"
-                            value={selectedSourceId ?? ''}
-                            onChange={(e) =>
-                              setSelectedSourceId(e.target.value || null)
-                            }
-                          >
-                            {shareableSources.map((src) => (
-                              <option key={src.id} value={src.id}>
-                                [{src.surfaceType.toUpperCase()}] {src.name}
-                              </option>
-                            ))}
-                          </select>
-                        )}
-                        {(webrtcSnap.hostMediaState.screenVideo.approved ||
-                          webrtcSnap.hostMediaState.microphoneAudio.approved ||
-                          webrtcSnap.hostMediaState.deviceAudio.approved) && (
-                          <button
-                            type="button"
-                            className="primary-btn"
-                            onClick={handleExplicitStartSharing}
-                          >
-                            Start Sharing
-                          </button>
-                        )}
-                        {anyHostMediaActive && (
-                          <button
-                            type="button"
-                            className="danger-btn"
-                            onClick={handleStopAllSharing}
-                          >
-                            Stop All Sharing
-                          </button>
-                        )}
-                        {(
-                          [
-                            'screenVideo',
-                            'microphoneAudio',
-                            'deviceAudio',
-                          ] as const
-                        ).map((src) => {
-                          const st = webrtcSnap.hostMediaState[src];
-                          if (!st.active) return null;
-                          const label =
-                            src === 'screenVideo'
-                              ? 'Screen'
-                              : src === 'microphoneAudio'
-                                ? 'Mic'
-                                : 'Device Sound';
-                          return (
-                            <button
-                              key={src}
-                              type="button"
-                              className="small-secondary-btn"
-                              onClick={() => handleStopIndividualSource(src)}
-                            >
-                              Stop {label}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    <div className="sidebar-section">
-                      <strong>Remote Audio</strong>
-                      <div className="actions-row">
-                        <button
-                          type="button"
-                          className="small-secondary-btn"
-                          onClick={() =>
-                            webrtcControllerRef.current?.updateGuestLocalPlayback(
-                              {
-                                micMutedLocally:
-                                  !webrtcSnap.guestPlayback.micMutedLocally,
-                              }
-                            )
-                          }
-                        >
-                          {webrtcSnap.guestPlayback.micMutedLocally
-                            ? 'Unmute Mic'
-                            : 'Mute Mic'}
-                        </button>
-                        <button
-                          type="button"
-                          className="small-secondary-btn"
-                          onClick={() =>
-                            webrtcControllerRef.current?.updateGuestLocalPlayback(
-                              {
-                                deviceAudioMutedLocally:
-                                  !webrtcSnap.guestPlayback
-                                    .deviceAudioMutedLocally,
-                              }
-                            )
-                          }
-                        >
-                          {webrtcSnap.guestPlayback.deviceAudioMutedLocally
-                            ? 'Unmute Sound'
-                            : 'Mute Sound'}
-                        </button>
-                      </div>
                     </div>
 
                     {metadata.devModeEnabled && (

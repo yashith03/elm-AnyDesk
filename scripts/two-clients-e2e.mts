@@ -108,8 +108,39 @@ class CdpClient {
   }
 
   static async connect(debugPort: number): Promise<CdpClient> {
+    return CdpClient.connectTarget(
+      debugPort,
+      `Electron main CDP target on port ${debugPort}`,
+      (t) =>
+        t.type === 'page' &&
+        t.url.includes('index.html') &&
+        (!t.url.includes('role=') || t.url.includes('role=main')) &&
+        Boolean(t.webSocketDebuggerUrl)
+    );
+  }
+
+  static async connectByRole(debugPort: number, role: string): Promise<CdpClient> {
+    return CdpClient.connectTarget(
+      debugPort,
+      `Electron ${role} CDP target on port ${debugPort}`,
+      (t) =>
+        t.type === 'page' &&
+        t.url.includes(`role=${role}`) &&
+        Boolean(t.webSocketDebuggerUrl)
+    );
+  }
+
+  private static async connectTarget(
+    debugPort: number,
+    label: string,
+    predicate: (target: {
+      type: string;
+      url: string;
+      webSocketDebuggerUrl?: string;
+    }) => boolean
+  ): Promise<CdpClient> {
     const target = await waitForCondition(
-      `Electron CDP target on port ${debugPort}`,
+      label,
       async () => {
         const res = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
         if (!res.ok) return null;
@@ -118,14 +149,7 @@ class CdpClient {
           url: string;
           webSocketDebuggerUrl?: string;
         }>;
-        return (
-          list.find(
-            (t) =>
-              t.type === 'page' &&
-              t.url.includes('index.html') &&
-              t.webSocketDebuggerUrl
-          ) ?? null
-        );
+        return list.find(predicate) ?? null;
       },
       20_000,
       200
@@ -458,11 +482,13 @@ try {
     incomingRequesterCode: incomingAtB.requesterCode,
   });
 
-  // 3. Accept Connection (B enables Screen Video checkbox and clicks Accept)
+  // 3. Accept Connection (B enables Screen Video, Mic, and Device Sound checkboxes and clicks Accept)
   await cdpB.eval(`(() => {
     const dlg = document.querySelector('[data-testid="incoming-request-dialog"]');
-    const firstCheckbox = dlg?.querySelector('input[type="checkbox"]');
-    if (firstCheckbox && !firstCheckbox.checked) firstCheckbox.click();
+    const checkboxes = dlg?.querySelectorAll('input[type="checkbox"]') ?? [];
+    for (const cb of checkboxes) {
+      if (!cb.checked) cb.click();
+    }
   })()`);
   await cdpB.click('[data-testid="incoming-accept-button"]');
 
@@ -502,119 +528,408 @@ try {
     dataChannelStateB: connectedPair.probeB.dataChannelState,
   });
 
-  // 4. Real Screen Sharing (try each available [DISPLAY] source, record real getStats honestly, and continue suite if OS capture yields 0 frames)
+  // 3b. Verify Independent Host Floating Toolbar, Capture Protection, & Main Window Minimize
+  const hostToolbarCdp = await CdpClient.connectByRole(clientB.debugPort!, 'host-toolbar');
+  const toolbarUiCheck = await waitForCondition(
+    'Host floating toolbar controls & Test ON toggle ready',
+    () =>
+      hostToolbarCdp.eval<Record<string, unknown> | null>(`(() => {
+        const bar = document.querySelector('[data-testid="floating-panel-bar"]');
+        if (!bar) return null;
+        const buttons = Array.from(bar.querySelectorAll('button')).map((b) => ({
+          testId: b.getAttribute('data-testid'),
+          text: (b.textContent || '').trim(),
+          disabled: b.disabled,
+        }));
+        const toggle = document.querySelector('[data-testid="capture-protection-test-toggle"]');
+        const hasFit = buttons.some((b) => b.text === 'Fit' || b.text === '1:1');
+        const micBtn = document.querySelector('[data-testid="toolbar-my-mic-btn"]');
+        const soundBtn = document.querySelector('[data-testid="toolbar-device-sound-btn"]');
+        const startBtn = document.querySelector('[data-testid="host-start-sharing-button"]');
+        if (!toggle || !micBtn || !soundBtn || !startBtn) return null;
+        return {
+          firstButtonTestId: buttons[0]?.testId ?? null,
+          toggleText: (toggle.textContent || '').trim(),
+          hasFitOr1to1: hasFit,
+          buttonTestIds: buttons.map((b) => b.testId),
+        };
+      })()`),
+    10_000
+  );
+  assert.equal(
+    toolbarUiCheck.firstButtonTestId,
+    'capture-protection-test-toggle',
+    'Dev Capture Protection toggle must be at the far left of the Host toolbar'
+  );
+  assert.equal(toolbarUiCheck.toggleText, 'Test ON');
+  assert.equal(toolbarUiCheck.hasFitOr1to1, false, 'Host toolbar must not include Fit or 1:1 viewer buttons');
+
+  const initialProt = await cdpB.eval<Record<string, unknown>>(
+    `window.elmDesktop.getCaptureProtectionState()`
+  );
+  assert.equal(initialProt.enabled, true);
+  assert.equal(initialProt.toggleAllowed, true);
+
+  await cdpB.eval(`window.elmDesktop.minimizeWindow()`);
+  await sleep(350);
+  const afterMinimizeProbe = await getProbe(cdpB);
+  const toolbarStillVisible = await hostToolbarCdp.eval<boolean>(
+    `Boolean(document.querySelector('[data-testid="floating-panel-bar"]')) && document.visibilityState === 'visible'`
+  );
+  assert.equal(toolbarStillVisible, true, 'Host floating toolbar must remain visible when mainWindow is minimized');
+  assert.equal(afterMinimizeProbe?.connectionState, 'connected', 'WebRTC must stay connected when mainWindow is minimized');
+  assert.equal(afterMinimizeProbe?.dataChannelState, 'open', 'DataChannel must stay open when mainWindow is minimized');
+  recordStep('host_overlay_and_minimize', 'PASSED', {
+    toolbarUiCheck,
+    initialCaptureProtection: initialProt,
+    postMinimizeConnectionState: afterMinimizeProbe?.connectionState,
+    toolbarStillVisible,
+  });
+
+  // 4. Real Screen Sharing via Host Floating Toolbar + Source Picker Popup
   const tryScreenShare = async (
     hostCdp: CdpClient,
+    hostDebugPort: number,
     guestCdp: CdpClient,
     hostLabel: string
   ): Promise<{ passed: boolean; stats: Record<string, unknown> }> => {
-    await hostCdp.eval(`(() => {
-      if (document.getElementById('elm-e2e-live-counter')) return;
-      const badge = document.createElement('div');
-      badge.id = 'elm-e2e-live-counter';
-      badge.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:9999;padding:6px 10px;background:#2563eb;color:#fff;font-family:monospace;font-size:13px;border-radius:4px;';
-      document.body.appendChild(badge);
-      let n = 0;
-      setInterval(() => {
-        n += 1;
-        badge.textContent = '${hostLabel} FRAME #' + n + ' ' + new Date().toISOString().slice(11, 23);
-      }, 100);
-    })()`);
-
-    await waitForCondition(
-      `${hostLabel} Start Sharing button & shareable sources ready`,
-      () =>
-        hostCdp.eval<boolean>(`(() => {
-          const btn = document.querySelector('[data-testid="host-start-sharing-button"]');
-          const sel = document.querySelector('select[aria-label="Select window or display to share"]');
-          return Boolean(btn && !btn.disabled && sel && sel.options.length > 0);
-        })()`),
-      10_000
-    );
-
-    const displayOptions = await hostCdp.eval<Array<{ value: string; text: string }>>(`(() => {
-      const sel = document.querySelector('select[aria-label="Select window or display to share"]');
-      if (!sel) return [];
-      const opts = Array.from(sel.options).map((o) => ({ value: o.value, text: o.text }));
-      const displays = opts.filter((o) => o.text.startsWith('[DISPLAY]'));
-      return displays.length > 0 ? displays : opts.slice(0, 1);
-    })()`);
-
-    let lastStats: Record<string, unknown> = {};
-    for (const opt of displayOptions) {
+    const toolbarCdp = await CdpClient.connectByRole(hostDebugPort, 'host-toolbar');
+    try {
       await hostCdp.eval(`(() => {
-        const sel = document.querySelector('select[aria-label="Select window or display to share"]');
-        if (!sel) return;
-        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
-        if (setter) setter.call(sel, ${JSON.stringify(opt.value)});
-        else sel.value = ${JSON.stringify(opt.value)};
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        if (document.getElementById('elm-e2e-live-counter')) return;
+        const badge = document.createElement('div');
+        badge.id = 'elm-e2e-live-counter';
+        badge.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:9999;padding:6px 10px;background:#2563eb;color:#fff;font-family:monospace;font-size:13px;border-radius:4px;';
+        document.body.appendChild(badge);
+        let n = 0;
+        setInterval(() => {
+          n += 1;
+          badge.textContent = '${hostLabel} FRAME #' + n + ' ' + new Date().toISOString().slice(11, 23);
+        }, 100);
       })()`);
-      await sleep(150);
-      await hostCdp.click('[data-testid="host-start-sharing-button"]');
 
-      const deadline = Date.now() + 6_000;
-      while (Date.now() < deadline) {
-        const [probeGuest, probeHost] = await Promise.all([
-          getProbe(guestCdp),
-          getProbe(hostCdp),
-        ]);
-        const diagGuest = probeGuest?.diagnostics as Record<string, unknown> | undefined;
-        const diagHost = probeHost?.diagnostics as Record<string, unknown> | undefined;
-        const sent = Number(diagHost?.outboundFramesSent ?? 0);
-        const decoded = Number(diagGuest?.inboundFramesDecoded ?? 0);
-        const bytes = Number(diagGuest?.inboundBytesReceived ?? 0);
-        const videoTracks = Number(probeGuest?.guestVideoTracksCount ?? 0);
-        lastStats = {
-          selectedSourceName: opt.text,
-          sharingStartedByHost: probeHost?.sharingStartedByHost,
-          hostCaptureWidth: diagHost?.captureWidth,
-          hostCaptureHeight: diagHost?.captureHeight,
-          hostCaptureFps: diagHost?.captureFps,
-          hostOutboundFramesSent: sent,
-          guestDecodedWidth: diagGuest?.decodedWidth,
-          guestDecodedHeight: diagGuest?.decodedHeight,
-          guestInboundFramesDecoded: decoded,
-          guestInboundBytesReceived: bytes,
-          guestVideoTracksCount: videoTracks,
-          rttMs: diagGuest?.rttMs ?? diagHost?.rttMs,
-        };
-        if (sent > 0 && decoded > 0 && bytes > 0 && videoTracks >= 1) {
-          return { passed: true, stats: lastStats };
-        }
-        await sleep(350);
+      await waitForCondition(
+        `${hostLabel} toolbar Start Sharing & Source Picker buttons ready`,
+        () =>
+          toolbarCdp.eval<boolean>(`(() => {
+            const btn = document.querySelector('[data-testid="host-start-sharing-button"]');
+            const srcBtn = document.querySelector('[data-testid="host-source-picker-toggle"]');
+            return Boolean(btn && !btn.disabled && srcBtn && !srcBtn.disabled);
+          })()`),
+        10_000
+      );
+
+      await toolbarCdp.click('[data-testid="host-source-picker-toggle"]');
+      const sourcePickerCdp = await CdpClient.connectByRole(
+        hostDebugPort,
+        'host-source-picker'
+      );
+      let allSourcesList: Array<{ id: string; text: string }> = [];
+      let displaySources: Array<{ id: string; text: string }> = [];
+      try {
+        const res = await waitForCondition(
+          `${hostLabel} source picker options populated`,
+          () =>
+            sourcePickerCdp.eval<{
+              all: Array<{ id: string; text: string }>;
+              picked: Array<{ id: string; text: string }>;
+            } | null>(`(() => {
+              const btns = Array.from(document.querySelectorAll('[data-source-id]'));
+              if (btns.length === 0) return null;
+              const opts = btns.map((b) => ({
+                id: b.getAttribute('data-source-id') || '',
+                text: (b.textContent || '').trim(),
+              }));
+              const displays = opts.filter((o) => o.text.startsWith('DISPLAY'));
+              return { all: opts, picked: displays.length > 0 ? displays : opts.slice(0, 1) };
+            })()`),
+          10_000
+        );
+        allSourcesList = res.all;
+        displaySources = res.picked;
+        const sourcePickerProt = await hostCdp.eval<{
+          windows: Record<string, boolean>;
+          windowDisplayAffinities?: Record<string, number | null>;
+        }>(`window.elmDesktop.getCaptureProtectionState()`);
+        assert.equal(sourcePickerProt.windows.sourcePicker, true);
+        assert.equal(sourcePickerProt.windowDisplayAffinities?.sourcePicker, 1);
+        await sourcePickerCdp.click(
+          `[data-source-id="${displaySources[0].id}"]`
+        );
+      } finally {
+        sourcePickerCdp.close();
       }
-      // Stop before trying next display source
-      await hostCdp.eval(`(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        const stopBtn = btns.find((b) => (b.textContent || '').includes('Stop All Sharing'));
-        stopBtn?.click();
-      })()`);
-      await sleep(300);
+      await sleep(200);
+
+      let lastStats: Record<string, unknown> = {};
+      for (let idx = 0; idx < displaySources.length; idx += 1) {
+        const opt = displaySources[idx];
+        if (idx > 0) {
+          await toolbarCdp.eval(
+            `window.elmDesktop.dispatchHostToolbarAction({ type: 'select-source', sourceId: ${JSON.stringify(
+              opt.id
+            )} })`
+          );
+          await sleep(200);
+        }
+        await toolbarCdp.click('[data-testid="host-start-sharing-button"]');
+
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          const [probeGuest, probeHost, protState, nonBlankFrame] =
+            await Promise.all([
+              getProbe(guestCdp),
+              getProbe(hostCdp),
+              hostCdp.eval<Record<string, unknown>>(
+                `window.elmDesktop.getCaptureProtectionState()`
+              ),
+              guestCdp.eval<{
+                width: number;
+                height: number;
+                nonZeroPixels: number;
+              } | null>(`(() => {
+                const video = document.querySelector('.active-viewer-viewport video');
+                if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) return null;
+                const c = document.createElement('canvas');
+                c.width = 16;
+                c.height = 16;
+                const ctx = c.getContext('2d');
+                if (!ctx) return null;
+                ctx.drawImage(video, 0, 0, 16, 16);
+                const data = ctx.getImageData(0, 0, 16, 16).data;
+                let nonZeroPixels = 0;
+                for (let i = 0; i < data.length; i += 4) {
+                  if (data[i] + data[i + 1] + data[i + 2] > 0) nonZeroPixels += 1;
+                }
+                return { width: video.videoWidth, height: video.videoHeight, nonZeroPixels };
+              })()`),
+            ]);
+          const diagGuest = probeGuest?.diagnostics as Record<string, unknown> | undefined;
+          const diagHost = probeHost?.diagnostics as Record<string, unknown> | undefined;
+          const sent = Number(diagHost?.outboundFramesSent ?? 0);
+          const decoded = Number(diagGuest?.inboundFramesDecoded ?? 0);
+          const bytes = Number(diagGuest?.inboundBytesReceived ?? 0);
+          const videoTracks = Number(probeGuest?.guestVideoTracksCount ?? 0);
+          lastStats = {
+            selectedSourceName: opt.text,
+            sharingStartedByHost: probeHost?.sharingStartedByHost,
+            hostCaptureWidth: diagHost?.captureWidth,
+            hostCaptureHeight: diagHost?.captureHeight,
+            hostCaptureFps: diagHost?.captureFps,
+            hostOutboundFramesSent: sent,
+            guestDecodedWidth: diagGuest?.decodedWidth,
+            guestDecodedHeight: diagGuest?.decodedHeight,
+            guestInboundFramesDecoded: decoded,
+            guestInboundBytesReceived: bytes,
+            guestVideoTracksCount: videoTracks,
+            nonBlankFrame,
+            captureProtection: protState,
+            rttMs: diagGuest?.rttMs ?? diagHost?.rttMs,
+          };
+          if (sent > 0 && decoded > 0 && bytes > 0 && videoTracks >= 1) {
+            return { passed: true, stats: lastStats };
+          }
+          await sleep(350);
+        }
+        await toolbarCdp.eval(`(() => {
+          const btn = document.querySelector('[data-testid="host-stop-sharing-button"]');
+          if (btn) btn.click();
+        })()`);
+        await sleep(300);
+      }
+      return { passed: false, stats: lastStats };
+    } finally {
+      toolbarCdp.close();
     }
-    return { passed: false, stats: lastStats };
   };
 
-  const shareResultBtoA = await tryScreenShare(cdpB, cdpA, 'HOST B');
+  const shareResultBtoA = await tryScreenShare(
+    cdpB,
+    clientB.debugPort!,
+    cdpA,
+    'HOST B'
+  );
   recordStep(
     'screen_sharing_b_to_a',
     shareResultBtoA.passed ? 'PASSED' : 'BLOCKED_OS_CAPTURE_ZERO_FRAMES',
     shareResultBtoA.stats
   );
 
-  // 5. Bidirectional Private Chat (A <-> B over real WebRTC DataChannel)
+  // 4b. Test Capture Protection Test Toggle (ON -> OFF -> ON), Mic, Device Sound, Settings Popup, & Stop/Restart Screen
+  await hostToolbarCdp.click('[data-testid="capture-protection-test-toggle"]');
+  const protAfterOff = await waitForCondition(
+    'Capture protection toggled OFF for verification',
+    async () => {
+      const st = await cdpB.eval<{
+        enabled: boolean;
+        windowDisplayAffinities?: Record<string, number | null>;
+      }>(`window.elmDesktop.getCaptureProtectionState()`);
+      return st.enabled === false ? st : null;
+    },
+    5_000
+  );
+  assert.equal(protAfterOff.windowDisplayAffinities?.main, 0);
+  assert.equal(protAfterOff.windowDisplayAffinities?.hostToolbar, 0);
+
+  await hostToolbarCdp.click('[data-testid="capture-protection-test-toggle"]');
+  const protAfterOn = await waitForCondition(
+    'Capture protection toggled back ON',
+    async () => {
+      const st = await cdpB.eval<{
+        enabled: boolean;
+        windowDisplayAffinities?: Record<string, number | null>;
+      }>(`window.elmDesktop.getCaptureProtectionState()`);
+      return st.enabled === true ? st : null;
+    },
+    5_000
+  );
+  assert.equal(protAfterOn.windowDisplayAffinities?.main, 1);
+  assert.equal(protAfterOn.windowDisplayAffinities?.hostToolbar, 1);
+
+  await hostToolbarCdp.click('[data-testid="toolbar-my-mic-btn"]');
+  await hostToolbarCdp.click('[data-testid="toolbar-device-sound-btn"]');
+  const mediaStatesAfterClicks = await waitForCondition(
+    'Host Mic and Device Sound transitions settle',
+    async () => {
+      const st = await hostToolbarCdp.eval<{
+        micState: string | null;
+        soundState: string | null;
+      }>(
+        `({
+          micState: document.querySelector('[data-testid="toolbar-my-mic-btn"]')?.getAttribute('data-state') || null,
+          soundState: document.querySelector('[data-testid="toolbar-device-sound-btn"]')?.getAttribute('data-state') || null,
+        })`
+      );
+      return st.micState !== 'stopped' && st.soundState !== 'stopped' ? st : null;
+    },
+    8_000
+  );
+  let micStateAfterMuteToggle: string | null = null;
+  if (mediaStatesAfterClicks.micState === 'active') {
+    await hostToolbarCdp.click('[data-testid="toolbar-my-mic-btn"]');
+    micStateAfterMuteToggle = await waitForCondition(
+      'Host Mic locally muted',
+      () =>
+        hostToolbarCdp.eval<string | null>(
+          `(() => {
+            const s = document.querySelector('[data-testid="toolbar-my-mic-btn"]')?.getAttribute('data-state');
+            return s === 'muted' ? s : null;
+          })()`
+        ),
+      5_000
+    );
+  }
+
+  await hostToolbarCdp.click('[data-testid="floating-settings-toggle"]');
+  const hostSettingsCdp = await CdpClient.connectByRole(
+    clientB.debugPort!,
+    'host-settings'
+  );
+  const settingsRendered = await waitForCondition(
+    'Host Settings popup rendered',
+    () =>
+      hostSettingsCdp.eval<boolean>(
+        `Boolean(document.querySelector('[data-testid="floating-settings-sidebar"] input[type="range"]'))`
+      ),
+    5_000
+  );
+  assert.equal(settingsRendered, true);
+  const settingsProt = await cdpB.eval<{
+    windows: Record<string, boolean>;
+    windowDisplayAffinities?: Record<string, number | null>;
+  }>(`window.elmDesktop.getCaptureProtectionState()`);
+  assert.equal(settingsProt.windows.settings, true);
+  assert.equal(settingsProt.windowDisplayAffinities?.settings, 1);
+
+  await hostSettingsCdp.eval(
+    `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`
+  );
+  hostSettingsCdp.close();
+
+  const wasSharingBefore4b = await hostToolbarCdp.eval<boolean>(
+    `Boolean(document.querySelector('[data-testid="host-stop-sharing-button"]'))`
+  );
+  if (wasSharingBefore4b) {
+    await hostToolbarCdp.click('[data-testid="host-stop-sharing-button"]');
+    await waitForCondition(
+      'Host screen share stopped via toolbar',
+      () =>
+        hostToolbarCdp.eval<boolean>(
+          `Boolean(document.querySelector('[data-testid="host-start-sharing-button"]'))`
+        ),
+      8_000
+    );
+  }
+  await hostToolbarCdp.eval(
+    `window.elmDesktop.dispatchHostToolbarAction({ type: 'select-source', sourceId: 'screen:0:0' })`
+  );
+  await sleep(250);
+  await hostToolbarCdp.click('[data-testid="host-start-sharing-button"]');
+  const restartOutcome = await waitForCondition(
+    'Host screen share restart settles via toolbar',
+    async () => {
+      const [hasStopBtn, probeNow, overlayNow] = await Promise.all([
+        hostToolbarCdp.eval<boolean>(
+          `Boolean(document.querySelector('[data-testid="host-stop-sharing-button"]'))`
+        ),
+        getProbe(cdpB),
+        cdpB.eval<{ isStartingShare: boolean }>(
+          `window.elmDesktop.getHostOverlayState()`
+        ),
+      ]);
+      if (hasStopBtn) {
+        return { started: true, status: 'active' };
+      }
+      const sv = (probeNow?.hostMediaState as Record<string, { status?: string; message?: string }>)
+        ?.screenVideo;
+      if (
+        !overlayNow.isStartingShare &&
+        (sv?.status === 'source_disappeared' ||
+          sv?.status === 'permission_denied' ||
+          sv?.status === 'unsupported')
+      ) {
+        return { started: false, status: sv.status, message: sv.message };
+      }
+      return null;
+    },
+    15_000
+  );
+  recordStep('host_toolbar_controls_and_protection_toggle', 'PASSED', {
+    protAfterOff,
+    protAfterOn,
+    settingsProt,
+    mediaStatesAfterClicks,
+    micStateAfterMuteToggle,
+    wasSharingBefore4b,
+    restartOutcome,
+  });
+
+  // 5. Bidirectional Private Chat (Viewer A panel <-> Host B Independent Chat Popup over real WebRTC DataChannel)
   await cdpA.click('[data-testid="floating-chat-toggle"]');
-  await cdpB.click('[data-testid="floating-chat-toggle"]');
+  await hostToolbarCdp.click('[data-testid="floating-chat-toggle"]');
+  const hostChatCdp = await CdpClient.connectByRole(clientB.debugPort!, 'chat');
+  const chatProt = await waitForCondition(
+    'Host Chat popup capture protection active',
+    async () => {
+      const st = await cdpB.eval<{
+        windows: Record<string, boolean>;
+        windowDisplayAffinities?: Record<string, number | null>;
+      }>(`window.elmDesktop.getCaptureProtectionState()`);
+      return st.windows.chat ? st : null;
+    },
+    5_000
+  );
+  assert.equal(chatProt.windowDisplayAffinities?.chat, 1);
   const msgAtoB = 'Hello Friend B, this is a two-device simulation test.';
   const msgBtoA = 'Hello Friend A, I received your message successfully.';
 
   await waitForCondition(
-    'Chat input visible on A and B',
+    'Chat input visible on Viewer A and Host B popup',
     async () =>
       (await cdpA.eval<boolean>(
         `Boolean(document.querySelector('[data-testid="floating-panel-chat"] input[type="text"]'))`
       )) &&
-      (await cdpB.eval<boolean>(
+      (await hostChatCdp.eval<boolean>(
         `Boolean(document.querySelector('[data-testid="floating-panel-chat"] input[type="text"]'))`
       )),
     8_000
@@ -627,9 +942,9 @@ try {
   await cdpA.click('[data-testid="floating-panel-chat"] button[type="submit"]');
 
   await waitForCondition(
-    'Friend B receives A->B message',
+    'Host B Chat Popup receives A->B message',
     () =>
-      cdpB.eval<boolean>(
+      hostChatCdp.eval<boolean>(
         `(document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '').includes(${JSON.stringify(
           msgAtoB
         )})`
@@ -637,14 +952,14 @@ try {
     8_000
   );
 
-  await cdpB.setInputValue(
+  await hostChatCdp.setInputValue(
     '[data-testid="floating-panel-chat"] input[type="text"]',
     msgBtoA
   );
-  await cdpB.click('[data-testid="floating-panel-chat"] button[type="submit"]');
+  await hostChatCdp.click('[data-testid="floating-panel-chat"] button[type="submit"]');
 
   await waitForCondition(
-    'Friend A receives B->A message',
+    'Viewer A receives B->A message from Host Chat Popup',
     () =>
       cdpA.eval<boolean>(
         `(document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '').includes(${JSON.stringify(
@@ -655,10 +970,16 @@ try {
   );
   recordStep('bidirectional_chat', 'PASSED', { msgAtoB, msgBtoA });
 
-  // 6. Chat Image Transfer (A -> B and B -> A via real DataChannel chunking)
-  const attachAndSendTestPng = async (cdp: CdpClient, filename: string) => {
+  // 6. Chat Image Transfer (Viewer A <-> Host B Chat Popup via real DataChannel chunking)
+  const attachAndSendTestPng = async (
+    cdp: CdpClient,
+    containerSelector: string,
+    filename: string
+  ) => {
     const ok = await cdp.eval<boolean>(`(() => {
-      const fileInput = document.querySelector('[data-testid="floating-panel-chat"] input[type="file"]');
+      const fileInput = document.querySelector(${JSON.stringify(
+        `${containerSelector} input[type="file"]`
+      )});
       if (!fileInput) return false;
       const canvas = document.createElement('canvas');
       canvas.width = 24;
@@ -681,28 +1002,68 @@ try {
     })()`);
     assert.equal(ok, true, 'Chat file input must accept synthetic PNG');
     await sleep(250);
-    await cdp.click('[data-testid="floating-panel-chat"] button[type="submit"]');
+    await cdp.click(`${containerSelector} button[type="submit"]`);
   };
 
-  await attachAndSendTestPng(cdpA, 'from-a.png');
+  await attachAndSendTestPng(
+    cdpA,
+    '[data-testid="floating-panel-chat"]',
+    'from-a.png'
+  );
   await waitForCondition(
-    'Friend B renders image from A',
+    'Host B Chat Popup renders image from A',
     () =>
-      cdpB.eval<boolean>(
+      hostChatCdp.eval<boolean>(
         `document.querySelectorAll('[data-testid="floating-panel-chat"] img').length >= 1`
       ),
     10_000
   );
-  await attachAndSendTestPng(cdpB, 'from-b.png');
+  await attachAndSendTestPng(
+    hostChatCdp,
+    '[data-testid="floating-panel-chat"]',
+    'from-b.png'
+  );
   await waitForCondition(
-    'Friend A renders both images (own + from B)',
+    'Viewer A renders both images (own + from B)',
     () =>
       cdpA.eval<boolean>(
         `document.querySelectorAll('[data-testid="floating-panel-chat"] img').length >= 2`
       ),
     10_000
   );
-  recordStep('chat_image_transfer', 'PASSED', { imagesRenderedOnBoth: true });
+
+  // Verify closing Host Chat Popup does NOT end the WebRTC session, and reopening retains volatile in-memory messages
+  await hostChatCdp.click('[data-testid="chat-popup-close-button"]');
+  hostChatCdp.close();
+  await sleep(300);
+  const afterChatCloseProbe = await getProbe(cdpB);
+  assert.equal(
+    afterChatCloseProbe?.connectionState,
+    'connected',
+    'Closing Host Chat Popup must keep active WebRTC session connected'
+  );
+  await hostToolbarCdp.click('[data-testid="floating-chat-toggle"]');
+  const reopenedHostChatCdp = await CdpClient.connectByRole(
+    clientB.debugPort!,
+    'chat'
+  );
+  const retainedText = await waitForCondition(
+    'Reopened Host Chat Popup retains in-memory messages during active session',
+    () =>
+      reopenedHostChatCdp.eval<boolean>(
+        `(document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '').includes(${JSON.stringify(
+          msgAtoB
+        )})`
+      ),
+    5_000
+  );
+  assert.equal(retainedText, true);
+  reopenedHostChatCdp.close();
+  recordStep('chat_image_transfer', 'PASSED', {
+    imagesRenderedOnBoth: true,
+    chatPopupCloseDoesNotEndSession: true,
+    inMemoryHistoryRetainedWhileActive: true,
+  });
 
   // 7. Audio hardware probe (honest status — no fake playback claim)
   const wasapiProbe = await cdpB.eval<Record<string, unknown>>(
@@ -713,14 +1074,32 @@ try {
     note: 'Live cross-process speaker playback not asserted on single PC to avoid same-endpoint feedback loop.',
   });
 
-  // 8. Disconnect from Friend A & verify Recent Sessions P2P contact + green dot
-  await cdpA.click('[data-testid="floating-end-session"]');
+  // 8. End Session from Host B Floating Toolbar & verify cleanup + Home return
+  await hostToolbarCdp.click('[data-testid="floating-end-session"]');
+  hostToolbarCdp.close();
   await waitForCondition(
-    'Both clients return to Home after Disconnect',
+    'Both clients return to Home after Host End Session',
     async () =>
       (await cdpA.eval<boolean>(`Boolean(document.querySelector('[data-testid="home-dashboard"]'))`)) &&
       (await cdpB.eval<boolean>(`Boolean(document.querySelector('[data-testid="home-dashboard"]'))`)),
     10_000
+  );
+  const overlayClosedCheck = await fetch(
+    `http://127.0.0.1:${clientB.debugPort}/json/list`
+  ).then(async (r) => {
+    const list = (await r.json()) as Array<{ url: string }>;
+    return list.filter(
+      (t) =>
+        t.url.includes('role=host-toolbar') ||
+        t.url.includes('role=chat') ||
+        t.url.includes('role=host-source-picker') ||
+        t.url.includes('role=host-settings')
+    );
+  });
+  assert.equal(
+    overlayClosedCheck.length,
+    0,
+    'Host overlay & chat popup windows must close on End Session'
   );
 
   // Verify P2P contact exchange (name, email, phone) + Online green dot on Recent Sessions cards
@@ -896,7 +1275,12 @@ try {
     300
   );
 
-  const shareResultAtoB = await tryScreenShare(cdpA, cdpB, 'HOST A');
+  const shareResultAtoB = await tryScreenShare(
+    cdpA,
+    clientA.debugPort!,
+    cdpB,
+    'HOST A'
+  );
 
   // Reverse disconnect initiated by Friend B
   await cdpB.click('[data-testid="floating-end-session"]');
@@ -957,5 +1341,14 @@ try {
     await stopClientProcess(c);
   }
   await backend.close();
-  fs.rmSync(tempRoot, { recursive: true, force: true });
+  try {
+    fs.rmSync(tempRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 6,
+      retryDelay: 200,
+    });
+  } catch {
+    // Ignore locked temp profile files after process termination on Windows
+  }
 }

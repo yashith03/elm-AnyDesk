@@ -21,8 +21,16 @@ import type {
 } from '@elm/protocol';
 import type { ThemeMode, ThemeStateSnapshot } from './theme';
 import type { RecentPeerEntry } from './recent-peers';
+import type { FloatingPanelAppearance } from './floating-panel';
+import type { CaptureProtectionState } from './capture-protection';
 
-export type DesktopWindowRole = 'main' | 'chat' | 'presentation';
+export type DesktopWindowRole =
+  | 'main'
+  | 'chat'
+  | 'presentation'
+  | 'host-toolbar'
+  | 'host-source-picker'
+  | 'host-settings';
 
 export interface DesktopSecurityPosture {
   readonly sandbox: true;
@@ -132,8 +140,43 @@ export interface VolatileSessionUiState {
   readonly dataChannelState: 'closed' | 'connecting' | 'open';
   readonly messagePreviewsEnabled: boolean;
   readonly messages: readonly EphemeralChatMessage[];
+  readonly imageAttachmentsByMessageId: Record<string, string>;
   readonly hostMediaState: HostMediaRuntimeState | null;
 }
+
+export interface HostOverlayUiState {
+  readonly sessionActive: boolean;
+  readonly sessionId: string | null;
+  readonly peerDisplayName: string;
+  readonly connectionState: string;
+  readonly iceConnectionState: string;
+  readonly dataChannelState: 'closed' | 'connecting' | 'open';
+  readonly hostMediaState: HostMediaRuntimeState | null;
+  readonly hostMicMutedLocally: boolean;
+  readonly isStartingShare: boolean;
+  readonly isStartingMic: boolean;
+  readonly isStartingDeviceSound: boolean;
+  readonly shareableSources: readonly ShareableSourceDescriptor[];
+  readonly selectedSourceId: string | null;
+  readonly playWasapiTestTone: boolean;
+  readonly chatOpen: boolean;
+  readonly sourcePickerOpen: boolean;
+  readonly settingsOpen: boolean;
+  readonly appearance: FloatingPanelAppearance;
+  readonly captureProtection: CaptureProtectionState;
+}
+
+export type HostToolbarActionPayload =
+  | { type: 'toggle-mic' }
+  | { type: 'stop-mic' }
+  | { type: 'toggle-device-sound' }
+  | { type: 'start-screen' }
+  | { type: 'stop-screen' }
+  | { type: 'select-source'; sourceId: string }
+  | { type: 'refresh-sources' }
+  | { type: 'set-wasapi-test-tone'; enabled: boolean }
+  | { type: 'end-session' }
+  | { type: 'focus-main' };
 
 /**
  * Narrow preload bridge contract exposed on `window.elmDesktop`.
@@ -343,6 +386,10 @@ export interface ElmDesktopBridge {
   sendChatFromChatWindow: (params: {
     text: string;
     senderOverride?: 'host' | 'guest';
+    imageDataUrl?: string;
+    imageMimeType?: string;
+    imageName?: string;
+    imageByteLength?: number;
   }) => Promise<{ queued: boolean }>;
   requestHostStopSharingFromChatWindow: (
     target: MediaSourceKind | 'all'
@@ -354,10 +401,48 @@ export interface ElmDesktopBridge {
     listener: (params: {
       text: string;
       senderOverride?: 'host' | 'guest';
+      imageDataUrl?: string;
+      imageMimeType?: string;
+      imageName?: string;
+      imageByteLength?: number;
     }) => void
   ) => () => void;
   onHostStopSharingRequest: (
     listener: (target: MediaSourceKind | 'all') => void
+  ) => () => void;
+
+  // Independent Host Floating Toolbar, Source Picker, Settings, Appearance & Capture Protection
+  getHostOverlayState: () => Promise<HostOverlayUiState>;
+  syncHostOverlayState: (
+    patch: Partial<HostOverlayUiState>
+  ) => Promise<HostOverlayUiState>;
+  onHostOverlayStateUpdated: (
+    listener: (state: HostOverlayUiState) => void
+  ) => () => void;
+  dispatchHostToolbarAction: (
+    action: HostToolbarActionPayload
+  ) => Promise<{ dispatched: boolean }>;
+  onHostToolbarAction: (
+    listener: (action: HostToolbarActionPayload) => void
+  ) => () => void;
+  toggleHostToolbarWindow: (open: boolean) => Promise<{ open: boolean }>;
+  toggleHostSourcePickerPopup: (open?: boolean) => Promise<{ open: boolean }>;
+  toggleHostSettingsPopup: (open?: boolean) => Promise<{ open: boolean }>;
+  closeSeparateChatWindow: () => Promise<{ closed: boolean }>;
+  restoreAndFocusMainWindow: () => Promise<void>;
+  getFloatingAppearance: () => Promise<FloatingPanelAppearance>;
+  setFloatingAppearance: (
+    patch: Partial<FloatingPanelAppearance>
+  ) => Promise<FloatingPanelAppearance>;
+  onFloatingAppearanceUpdated: (
+    listener: (appearance: FloatingPanelAppearance) => void
+  ) => () => void;
+  getCaptureProtectionState: () => Promise<CaptureProtectionState>;
+  setCaptureProtectionTestEnabled: (
+    enabled: boolean
+  ) => Promise<CaptureProtectionState>;
+  onCaptureProtectionUpdated: (
+    listener: (state: CaptureProtectionState) => void
   ) => () => void;
 
   // Centralized Theme State (Single Source of Truth across Main & Chat Windows)

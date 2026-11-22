@@ -1,28 +1,28 @@
 {
-  "timestamp": "2026-11-22T00:27:47.659Z",
-  "backendUrl": "http://127.0.0.1:60556",
+  "timestamp": "2026-11-22T10:52:53.182Z",
+  "backendUrl": "http://127.0.0.1:59129",
   "passed": true,
   "results": {
     "registration_and_presence": {
       "status": "PASSED",
       "details": {
-        "pidA": 16820,
-        "pidB": 31160,
-        "codeA": "ELM-9H7G-DF2R",
-        "codeB": "ELM-6ZTH-4MN2"
+        "pidA": 27348,
+        "pidB": 8020,
+        "codeA": "ELM-CC76-EM8F",
+        "codeB": "ELM-3ZSP-AV97"
       }
     },
     "send_and_receive_request": {
       "status": "PASSED",
       "details": {
         "waitingCountdown": "02:00",
-        "incomingRequesterCode": "ELM-9H7G-DF2R"
+        "incomingRequesterCode": "ELM-CC76-EM8F"
       }
     },
     "accept_and_webrtc_connect": {
       "status": "PASSED",
       "details": {
-        "sessionId": "102f21f8-5a39-429e-983c-b8b709d41f15",
+        "sessionId": "2db53faa-8bee-43c6-be23-6d41f587aa2d",
         "roleA": "guest",
         "roleB": "host",
         "connectionStateA": "connected",
@@ -33,10 +33,47 @@
         "dataChannelStateB": "open"
       }
     },
+    "host_overlay_and_minimize": {
+      "status": "PASSED",
+      "details": {
+        "toolbarUiCheck": {
+          "firstButtonTestId": "capture-protection-test-toggle",
+          "toggleText": "Test ON",
+          "hasFitOr1to1": false,
+          "buttonTestIds": [
+            "capture-protection-test-toggle",
+            "toolbar-my-mic-btn",
+            "toolbar-device-sound-btn",
+            "host-start-sharing-button",
+            "host-source-picker-toggle",
+            "floating-chat-toggle",
+            "floating-settings-toggle",
+            "floating-end-session"
+          ]
+        },
+        "initialCaptureProtection": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 1,
+            "hostToolbar": 1
+          }
+        },
+        "postMinimizeConnectionState": "connected",
+        "toolbarStillVisible": true
+      }
+    },
     "screen_sharing_b_to_a": {
       "status": "BLOCKED_OS_CAPTURE_ZERO_FRAMES",
       "details": {
-        "selectedSourceName": "[DISPLAY] Screen 2",
+        "selectedSourceName": "DISPLAYScreen 2",
         "sharingStartedByHost": true,
         "hostCaptureWidth": null,
         "hostCaptureHeight": null,
@@ -47,7 +84,85 @@
         "guestInboundFramesDecoded": 0,
         "guestInboundBytesReceived": 0,
         "guestVideoTracksCount": 1,
+        "nonBlankFrame": null,
+        "captureProtection": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 1,
+            "hostToolbar": 1
+          }
+        },
         "rttMs": 2
+      }
+    },
+    "host_toolbar_controls_and_protection_toggle": {
+      "status": "PASSED",
+      "details": {
+        "protAfterOff": {
+          "enabled": false,
+          "toggleAllowed": true,
+          "windows": {
+            "main": false,
+            "hostToolbar": false,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 0,
+            "hostToolbar": 0
+          }
+        },
+        "protAfterOn": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 1,
+            "hostToolbar": 1
+          }
+        },
+        "settingsProt": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": true
+          },
+          "windowDisplayAffinities": {
+            "main": 1,
+            "hostToolbar": 1,
+            "settings": 1
+          }
+        },
+        "mediaStatesAfterClicks": {
+          "micState": "active",
+          "soundState": "active"
+        },
+        "micStateAfterMuteToggle": "muted",
+        "wasSharingBefore4b": false,
+        "restartOutcome": {
+          "started": false,
+          "status": "source_disappeared",
+          "message": "Screen Video could not start (Timeout starting video source). Other approved features and chat remain active."
+        }
       }
     },
     "bidirectional_chat": {
@@ -60,7 +175,9 @@
     "chat_image_transfer": {
       "status": "PASSED",
       "details": {
-        "imagesRenderedOnBoth": true
+        "imagesRenderedOnBoth": true,
+        "chatPopupCloseDoesNotEndSession": true,
+        "inMemoryHistoryRetainedWhileActive": true
       }
     },
     "audio_probe": {
@@ -80,13 +197,13 @@
       "status": "PASSED",
       "details": {
         "cardOnA": {
-          "text": "☆Test Friend BOnlineELM-6ZTH-4MN2friend.b@example.com+1 555-0202ConnectInvite⋮",
+          "text": "☆Test Friend BOnlineELM-3ZSP-AV97friend.b@example.com+1 555-0202ConnectInvite⋮",
           "email": "friend.b@example.com",
           "phone": "+1 555-0202",
           "status": "Online"
         },
         "cardOnB": {
-          "text": "☆Test Friend AOnlineELM-9H7G-DF2Rfriend.a@example.com+1 555-0101ConnectInvite⋮",
+          "text": "☆Test Friend AOnlineELM-CC76-EM8Ffriend.a@example.com+1 555-0101ConnectInvite⋮",
           "email": "friend.a@example.com",
           "phone": "+1 555-0101",
           "status": "Online"
@@ -103,11 +220,11 @@
     "reverse_roles_a_to_b": {
       "status": "PASSED_SIGNALING_AND_CHAT_CAPTURE_BLOCKED",
       "details": {
-        "sessionId": "6a975ed3-e3a4-4dbe-9016-c88be38a371d",
+        "sessionId": "826b5498-fd89-432a-a2a4-73fecbff7704",
         "roleA": "host",
         "roleB": "guest",
         "videoCapturePassed": false,
-        "selectedSourceName": "[DISPLAY] Screen 2",
+        "selectedSourceName": "DISPLAYScreen 2",
         "sharingStartedByHost": true,
         "hostCaptureWidth": null,
         "hostCaptureHeight": null,
@@ -118,13 +235,29 @@
         "guestInboundFramesDecoded": 0,
         "guestInboundBytesReceived": 0,
         "guestVideoTracksCount": 1,
-        "rttMs": 0
+        "nonBlankFrame": null,
+        "captureProtection": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 1,
+            "hostToolbar": 1
+          }
+        },
+        "rttMs": 1
       }
     },
     "backend_privacy_audit": {
       "status": "PASSED",
       "details": {
-        "totalBackendRequests": 336,
+        "totalBackendRequests": 520,
         "leaksFound": 0
       }
     }
