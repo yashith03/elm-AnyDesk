@@ -14,6 +14,8 @@
     "build:installer": "npm run build --workspace=@elm/protocol && npm run build --workspace=@elm/desktop && npm run build:installer --workspace=@elm/desktop",
     "dist:win": "npm run build:installer",
     "test": "npm run build --workspace=@elm/protocol && npm run test --workspaces --if-present",
+    "test:e2e:two-clients": "node --experimental-strip-types scripts/two-clients-e2e.mts",
+    "dev:two-clients": "node --experimental-strip-types scripts/two-clients-e2e.mts --interactive",
     "dev:desktop": "npm run dev --workspace=@elm/desktop",
     "start:desktop": "npm run start --workspace=@elm/desktop",
     "dev:api": "npm run dev --workspace=@elm/api",

@@ -13,16 +13,20 @@ const GENERIC_BACKEND_DEVICE_NAMES = new Set([
  * "Device <code> wants to connect".
  */
 export function formatIncomingRequestHeadline(
-  invite: Pick<InviteSummary, 'requesterDisplayName' | 'requesterFriendCode'>
+  invite: Pick<
+    InviteSummary,
+    'requesterDisplayName' | 'requesterFriendCode'
+  > & { readonly intent?: InviteSummary['intent'] }
 ): string {
   const rawName = (invite.requesterDisplayName ?? '').trim();
   const normalized = rawName.toLowerCase();
-  if (
+  const hasRealName =
     rawName.length > 0 &&
     !GENERIC_BACKEND_DEVICE_NAMES.has(normalized) &&
-    !rawName.includes('@')
-  ) {
-    return `${rawName} wants to connect`;
+    !rawName.includes('@');
+  const actor = hasRealName ? rawName : `Device ${invite.requesterFriendCode}`;
+  if (invite.intent === 'invite') {
+    return `${actor} invited you to view their screen`;
   }
-  return `Device ${invite.requesterFriendCode} wants to connect`;
+  return `${actor} wants to connect`;
 }

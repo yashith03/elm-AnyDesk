@@ -22,6 +22,11 @@ import {
   validateChatImageAttachment,
   type ChatImageChunkFrame,
 } from '../shared/chat-attachments';
+import {
+  sanitizePeerContactFrame,
+  type PeerContactCardFrame,
+  type PeerContactCardPayload,
+} from '../shared/recent-peers';
 
 export interface GuestReceivedTrackInfo {
   readonly source: MediaSourceKind;
@@ -50,11 +55,14 @@ export interface WebRtcReadabilityDiagnostics {
   readonly encodedWidth: number | null;
   readonly encodedHeight: number | null;
   readonly encodedFps: number | null;
+  readonly outboundFramesSent: number | null;
   readonly outboundBitrateKbps: number | null;
   readonly qualityLimitationReason: string | null;
   readonly decodedWidth: number | null;
   readonly decodedHeight: number | null;
   readonly decodedFps: number | null;
+  readonly inboundFramesDecoded: number | null;
+  readonly inboundBytesReceived: number | null;
   readonly inboundBitrateKbps: number | null;
   readonly packetsLost: number | null;
   readonly packetLossPercent: number | null;
@@ -97,6 +105,8 @@ export interface WebRtcControllerOptions {
   readonly livenessTimeoutMs?: number;
   readonly enableBackgroundLivenessTimer?: boolean;
   readonly onGuestViewerCleared?: () => void;
+  readonly localContactCard?: PeerContactCardPayload;
+  readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
 }
 
 interface ActiveHostSenderEntry {
@@ -160,6 +170,9 @@ export class ApprovedWebRtcSessionController {
 
   private hostAfterSeq = 0;
   private guestAfterSeq = 0;
+  private readonly pendingHostIceCandidates: RTCIceCandidateInit[] = [];
+  private readonly pendingGuestIceCandidates: RTCIceCandidateInit[] = [];
+  private remoteLivenessArmed = false;
   private negotiationQueue: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -270,6 +283,8 @@ export class ApprovedWebRtcSessionController {
   private readonly livenessTimeoutMs: number;
   private readonly enableBackgroundLivenessTimer: boolean;
   private readonly onGuestViewerCleared?: () => void;
+  private localContactCard: PeerContactCardPayload | null = null;
+  private readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
   private livenessTimerId: ReturnType<typeof setInterval> | null = null;
   private lastHostHeartbeatPerfMs = performance.now();
   private lastGuestHeartbeatPerfMs = performance.now();
@@ -299,6 +314,8 @@ export class ApprovedWebRtcSessionController {
     this.enableBackgroundLivenessTimer =
       options?.enableBackgroundLivenessTimer ?? true;
     this.onGuestViewerCleared = options?.onGuestViewerCleared;
+    this.localContactCard = options?.localContactCard ?? null;
+    this.onPeerContactReceived = options?.onPeerContactReceived;
 
     this.hostMediaState = {
       ...createInitialHostMediaState(session.hostMediaSelection),
@@ -439,11 +456,61 @@ export class ApprovedWebRtcSessionController {
     }
   }
 
+  public sendPeerContactCard(contact: PeerContactCardPayload): boolean {
+    this.localContactCard = contact;
+    if (this.closed) {
+      return false;
+    }
+    const channel =
+      this.localRole === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (!channel || channel.readyState !== 'open') {
+      return false;
+    }
+    const frame: PeerContactCardFrame = {
+      __elmControl: 'peer-contact-card',
+      sender: this.localRole,
+      name: contact.name,
+      email: contact.email,
+      phone: contact.phone,
+    };
+    try {
+      channel.send(JSON.stringify(frame));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private attachDataChannelHandlers(
     channel: RTCDataChannel,
     side: 'host' | 'guest'
   ): void {
     channel.onopen = () => {
+      if (this.mode === 'remote') {
+        const nowPerf = performance.now();
+        this.lastHostHeartbeatPerfMs = nowPerf;
+        this.lastGuestHeartbeatPerfMs = nowPerf;
+        this.remoteLivenessArmed = true;
+      }
+      if (
+        !this.closed &&
+        this.localContactCard &&
+        side === this.localRole &&
+        channel.readyState === 'open'
+      ) {
+        const frame: PeerContactCardFrame = {
+          __elmControl: 'peer-contact-card',
+          sender: this.localRole,
+          name: this.localContactCard.name,
+          email: this.localContactCard.email,
+          phone: this.localContactCard.phone,
+        };
+        try {
+          channel.send(JSON.stringify(frame));
+        } catch {
+          // Ignore transient send error on open
+        }
+      }
       this.emitChange();
     };
     channel.onclose = () => {
@@ -456,12 +523,24 @@ export class ApprovedWebRtcSessionController {
       if (this.closed) return;
       try {
         const parsed = JSON.parse(String(event.data)) as (EphemeralChatMessage | ChatImageChunkFrame) & {
-          __elmControl?: 'liveness-heartbeat' | 'teardown-notice';
+          __elmControl?: 'liveness-heartbeat' | 'teardown-notice' | 'peer-contact-card';
           __elmImageChunk?: true;
           sender?: 'host' | 'guest';
           reason?: SessionTerminationReason;
           subReason?: string;
         };
+
+        if (parsed && parsed.__elmControl === 'peer-contact-card') {
+          const validated = sanitizePeerContactFrame(parsed);
+          if (!validated) {
+            return;
+          }
+          if (validated.sender === side) {
+            return;
+          }
+          this.onPeerContactReceived?.(validated.contact);
+          return;
+        }
 
         if (parsed.__elmControl === 'liveness-heartbeat') {
           const nowPerf = performance.now();
@@ -601,8 +680,15 @@ export class ApprovedWebRtcSessionController {
     const nowPerf = performance.now();
     const nowEpoch = Date.now();
 
-    // 1. Send heartbeats for any non-suppressed peer
-    if (!this.hostHeartbeatSuppressed) {
+    // 1. Send heartbeats for local peer(s)
+    const shouldSendHost =
+      (this.mode === 'loopback' || this.localRole === 'host') &&
+      !this.hostHeartbeatSuppressed;
+    const shouldSendGuest =
+      (this.mode === 'loopback' || this.localRole === 'guest') &&
+      !this.guestHeartbeatSuppressed;
+
+    if (shouldSendHost) {
       this.lastHostHeartbeatPerfMs = nowPerf;
       if (this.hostDataChannel?.readyState === 'open') {
         try {
@@ -624,7 +710,7 @@ export class ApprovedWebRtcSessionController {
       });
     }
 
-    if (!this.guestHeartbeatSuppressed) {
+    if (shouldSendGuest) {
       this.lastGuestHeartbeatPerfMs = nowPerf;
       if (this.guestDataChannel?.readyState === 'open') {
         try {
@@ -646,11 +732,19 @@ export class ApprovedWebRtcSessionController {
       });
     }
 
-    // 2. Check local peer-to-peer liveness silence against threshold
+    // 2. Check peer-to-peer liveness silence against threshold
+    // In remote mode, wait until DataChannel has opened once so initial ICE/DTLS setup never prematurely disconnects.
+    if (this.mode === 'remote' && !this.remoteLivenessArmed) {
+      return;
+    }
     const hostSilenceMs = Math.max(0, nowPerf - this.lastHostHeartbeatPerfMs);
     const guestSilenceMs = Math.max(0, nowPerf - this.lastGuestHeartbeatPerfMs);
-    const hostExpired = hostSilenceMs > this.livenessTimeoutMs;
-    const guestExpired = guestSilenceMs > this.livenessTimeoutMs;
+    const hostExpired =
+      (this.mode === 'loopback' || this.localRole === 'guest') &&
+      hostSilenceMs > this.livenessTimeoutMs;
+    const guestExpired =
+      (this.mode === 'loopback' || this.localRole === 'host') &&
+      guestSilenceMs > this.livenessTimeoutMs;
 
     if (hostExpired || guestExpired) {
       const defaultSub =
@@ -816,6 +910,14 @@ export class ApprovedWebRtcSessionController {
         type: 'offer',
         sdp: payload.sdp,
       });
+      while (this.pendingGuestIceCandidates.length > 0 && !this.closed) {
+        const queued = this.pendingGuestIceCandidates.shift()!;
+        try {
+          await this.pcGuest.addIceCandidate(queued);
+        } catch {
+          // Ignore stale/duplicate queued ICE candidates
+        }
+      }
       const answer = await this.pcGuest.createAnswer();
       await this.pcGuest.setLocalDescription(answer);
       await window.elmDesktop.sendSessionSignal({
@@ -829,12 +931,17 @@ export class ApprovedWebRtcSessionController {
       this.pumpAgainRequested = true;
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
+      const candidateInit: RTCIceCandidateInit = {
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid,
+        sdpMLineIndex: payload.sdpMLineIndex,
+      };
+      if (!this.pcGuest.remoteDescription) {
+        this.pendingGuestIceCandidates.push(candidateInit);
+        return;
+      }
       try {
-        await this.pcGuest.addIceCandidate({
-          candidate: payload.candidate,
-          sdpMid: payload.sdpMid,
-          sdpMLineIndex: payload.sdpMLineIndex,
-        });
+        await this.pcGuest.addIceCandidate(candidateInit);
       } catch {
         // Ignore late ICE candidates
       }
@@ -852,15 +959,28 @@ export class ApprovedWebRtcSessionController {
           type: 'answer',
           sdp: payload.sdp,
         });
+        while (this.pendingHostIceCandidates.length > 0 && !this.closed) {
+          const queued = this.pendingHostIceCandidates.shift()!;
+          try {
+            await this.pcHost.addIceCandidate(queued);
+          } catch {
+            // Ignore stale/duplicate queued ICE candidates
+          }
+        }
       }
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
+      const candidateInit: RTCIceCandidateInit = {
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid,
+        sdpMLineIndex: payload.sdpMLineIndex,
+      };
+      if (!this.pcHost.remoteDescription) {
+        this.pendingHostIceCandidates.push(candidateInit);
+        return;
+      }
       try {
-        await this.pcHost.addIceCandidate({
-          candidate: payload.candidate,
-          sdpMid: payload.sdpMid,
-          sdpMLineIndex: payload.sdpMLineIndex,
-        });
+        await this.pcHost.addIceCandidate(candidateInit);
       } catch {
         // Ignore late ICE candidates
       }
@@ -1723,12 +1843,15 @@ export class ApprovedWebRtcSessionController {
     let encodedWidth: number | null = null;
     let encodedHeight: number | null = null;
     let encodedFps: number | null = null;
+    let outboundFramesSent: number | null = null;
     let outboundBitrateKbps: number | null = null;
     let qualityLimitationReason: string | null = null;
 
     let decodedWidth: number | null = null;
     let decodedHeight: number | null = null;
     let decodedFps: number | null = null;
+    let inboundFramesDecoded: number | null = null;
+    let inboundBytesReceived: number | null = null;
     let inboundBitrateKbps: number | null = null;
     let packetsLost: number | null = null;
     let packetLossPercent: number | null = null;
@@ -1750,6 +1873,7 @@ export class ApprovedWebRtcSessionController {
             if (typeof stat.frameWidth === 'number') encodedWidth = stat.frameWidth;
             if (typeof stat.frameHeight === 'number') encodedHeight = stat.frameHeight;
             if (typeof stat.framesPerSecond === 'number') encodedFps = Math.round(stat.framesPerSecond);
+            if (typeof stat.framesSent === 'number') outboundFramesSent = stat.framesSent;
             if (typeof stat.qualityLimitationReason === 'string') {
               qualityLimitationReason = stat.qualityLimitationReason;
             }
@@ -1783,6 +1907,8 @@ export class ApprovedWebRtcSessionController {
             if (typeof stat.frameWidth === 'number') decodedWidth = stat.frameWidth;
             if (typeof stat.frameHeight === 'number') decodedHeight = stat.frameHeight;
             if (typeof stat.framesPerSecond === 'number') decodedFps = Math.round(stat.framesPerSecond);
+            if (typeof stat.framesDecoded === 'number') inboundFramesDecoded = stat.framesDecoded;
+            if (typeof stat.bytesReceived === 'number') inboundBytesReceived = stat.bytesReceived;
             if (typeof stat.packetsLost === 'number') packetsLost = stat.packetsLost;
             if (
               typeof stat.packetsLost === 'number' &&
@@ -1829,11 +1955,14 @@ export class ApprovedWebRtcSessionController {
       encodedWidth,
       encodedHeight,
       encodedFps,
+      outboundFramesSent,
       outboundBitrateKbps,
       qualityLimitationReason,
       decodedWidth,
       decodedHeight,
       decodedFps,
+      inboundFramesDecoded,
+      inboundBytesReceived,
       inboundBitrateKbps,
       packetsLost,
       packetLossPercent,
@@ -3430,11 +3559,14 @@ export async function runReadabilityAndStageVerificationSuite(): Promise<Readabi
     encodedWidth: 1920,
     encodedHeight: 1080,
     encodedFps: 30,
+    outboundFramesSent: 300,
     outboundBitrateKbps: 2450,
     qualityLimitationReason: 'none',
     decodedWidth: 1920,
     decodedHeight: 1080,
     decodedFps: 30,
+    inboundFramesDecoded: 298,
+    inboundBytesReceived: 1250000,
     inboundBitrateKbps: 2420,
     packetsLost: 0,
     packetLossPercent: 0,

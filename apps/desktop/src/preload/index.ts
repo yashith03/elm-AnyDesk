@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type {
   HostMediaSelection,
+  InviteIntent,
   MediaSourceKind,
   SessionTerminationReason,
   WebRtcSignalPayload,
@@ -8,6 +9,7 @@ import type {
 import type {
   DesktopRuntimeMetadata,
   ElmDesktopBridge,
+  PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
@@ -28,8 +30,13 @@ const bridge: ElmDesktopBridge = Object.freeze({
 
   // Device Setup & Anonymous Registration (On-device profile, zero login)
   getDeviceSetupState: () => ipcRenderer.invoke('elm:device-get-setup-state'),
-  saveLocalProfile: (input: { name: string; email?: string; phone?: string }) =>
-    ipcRenderer.invoke('elm:device-save-local-profile', input),
+  saveLocalProfile: (input: {
+    name: string;
+    email?: string;
+    phone?: string;
+    shareEmailWithPeers?: boolean;
+    sharePhoneWithPeers?: boolean;
+  }) => ipcRenderer.invoke('elm:device-save-local-profile', input),
   retryDeviceRegistration: () =>
     ipcRenderer.invoke('elm:device-retry-registration'),
 
@@ -45,6 +52,24 @@ const bridge: ElmDesktopBridge = Object.freeze({
     ipcRenderer.invoke('elm:auth-switch-persona', personaKey),
   signOut: () => ipcRenderer.invoke('elm:auth-sign-out'),
   getPresenceSnapshot: () => ipcRenderer.invoke('elm:presence-get-snapshot'),
+  getPresenceRuntimeStatus: (): Promise<PresenceRuntimeStatus> =>
+    ipcRenderer.invoke('elm:presence-get-runtime-status'),
+  triggerPresenceReconnect: (): Promise<PresenceRuntimeStatus> =>
+    ipcRenderer.invoke('elm:presence-trigger-reconnect'),
+  onPresenceStatusUpdated: (
+    listener: (status: PresenceRuntimeStatus) => void
+  ): (() => void) => {
+    const wrapped = (
+      _event: IpcRendererEvent,
+      status: PresenceRuntimeStatus
+    ) => {
+      listener(status);
+    };
+    ipcRenderer.on('elm:presence-status-updated', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:presence-status-updated', wrapped);
+    };
+  },
   setPresenceOnline: (
     online: boolean,
     options?: {
@@ -53,8 +78,38 @@ const bridge: ElmDesktopBridge = Object.freeze({
       subReason?: string;
     }
   ) => ipcRenderer.invoke('elm:presence-set-online', online, options),
-  sendFriendCodeInvite: (friendCode: string) =>
-    ipcRenderer.invoke('elm:invites-send', friendCode),
+  sendFriendCodeInvite: (
+    input:
+      | string
+      | {
+          friendCode: string;
+          intent?: InviteIntent;
+          hostMediaSelection?: HostMediaSelection;
+        }
+  ) => ipcRenderer.invoke('elm:invites-send', input),
+  cancelOutgoingInvite: (inviteId: string) =>
+    ipcRenderer.invoke('elm:invites-cancel', inviteId),
+  lookupDevicePresence: (friendCodes: string[]) =>
+    ipcRenderer.invoke('elm:presence-lookup', friendCodes),
+  getRecentPeers: () => ipcRenderer.invoke('elm:recent-peers-get'),
+  recordConnectedPeer: (params: {
+    friendCode: string;
+    defaultAlias?: string;
+    connectedAt?: string;
+  }) => ipcRenderer.invoke('elm:recent-peers-record', params),
+  updateRecentPeerContact: (params: {
+    friendCode: string;
+    peerName?: string;
+    email?: string;
+    phone?: string;
+    connectedAt?: string;
+  }) => ipcRenderer.invoke('elm:recent-peers-update-contact', params),
+  toggleFavoritePeer: (friendCode: string) =>
+    ipcRenderer.invoke('elm:recent-peers-toggle-favorite', friendCode),
+  renameRecentPeer: (params: { friendCode: string; alias: string }) =>
+    ipcRenderer.invoke('elm:recent-peers-rename', params),
+  removeRecentPeer: (friendCode: string) =>
+    ipcRenderer.invoke('elm:recent-peers-remove', friendCode),
   respondToInvite: (params: {
     inviteId: string;
     action: 'accept' | 'decline';
@@ -179,7 +234,25 @@ const bridge: ElmDesktopBridge = Object.freeze({
     };
   },
 
-  // Windows 11 Taskbar & DWM Preview Prototype
+  // Windows 11 Custom Titlebar Window Controls & DWM Preview Prototype
+  minimizeWindow: (): Promise<void> =>
+    ipcRenderer.invoke('elm:window-minimize'),
+  toggleMaximizeWindow: (): Promise<{ maximized: boolean }> =>
+    ipcRenderer.invoke('elm:window-toggle-maximize'),
+  closeWindow: (): Promise<void> => ipcRenderer.invoke('elm:window-close'),
+  isWindowMaximized: (): Promise<boolean> =>
+    ipcRenderer.invoke('elm:window-is-maximized'),
+  onWindowMaximizedChanged: (
+    listener: (maximized: boolean) => void
+  ): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, maximized: boolean) => {
+      listener(Boolean(maximized));
+    };
+    ipcRenderer.on('elm:window-maximized-changed', wrapped);
+    return () => {
+      ipcRenderer.removeListener('elm:window-maximized-changed', wrapped);
+    };
+  },
   getTaskbarDwmTelemetry: (): Promise<TaskbarDwmTelemetry> =>
     ipcRenderer.invoke('elm:get-taskbar-dwm-telemetry'),
   minimizeMainWindow: (): Promise<TaskbarDwmTelemetry> =>

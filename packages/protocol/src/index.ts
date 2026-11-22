@@ -17,6 +17,29 @@ export const DEFAULT_LIVENESS_CONFIG = Object.freeze({
 });
 
 /**
+ * Server-owned connection request deadline (120 seconds).
+ * Does not apply once a request is accepted and a session starts.
+ */
+export const INVITE_TIMEOUT_MS = 120_000 as const;
+
+/**
+ * Presence heartbeat interval (10 seconds) and server-authoritative expiry timeout (30 seconds).
+ * Presence freshness is always evaluated using server-generated timestamps.
+ */
+export const PRESENCE_HEARTBEAT_INTERVAL_MS = 10_000 as const;
+export const PRESENCE_STALE_TIMEOUT_MS = 30_000 as const;
+export const PRESENCE_LOOKUP_MAX_BATCH_SIZE = 50 as const;
+export const PRESENCE_LOOKUP_RATE_LIMIT_MAX_REQUESTS = 30 as const;
+export const PRESENCE_LOOKUP_RATE_LIMIT_WINDOW_MS = 60_000 as const;
+
+export type DevicePresenceConnectionState =
+  | 'connecting'
+  | 'online'
+  | 'reconnecting'
+  | 'offline'
+  | 'unknown';
+
+/**
  * Free-tier STUN-only ICE server configuration for WebRTC peer connections.
  * Media and private chat flow peer-to-peer (media A -> B, chat bidirectional via reliable DataChannel).
  * The Cloudflare Worker only coordinates signaling and session state.
@@ -187,7 +210,9 @@ export type ProtocolErrorCode =
   | 'USER_ALREADY_IN_ACTIVE_SESSION'
   | 'INVITE_NOT_FOUND'
   | 'INVITE_ALREADY_RESOLVED'
+  | 'INVITE_EXPIRED'
   | 'NOT_INVITE_OWNER'
+  | 'NOT_INVITE_SENDER'
   | 'UNAUTHORIZED_SESSION_PARTICIPANT'
   | 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE'
   | 'SESSION_ALREADY_ENDED'
@@ -195,15 +220,20 @@ export type ProtocolErrorCode =
   | 'RESTRICTIVE_NETWORK_STUN_ONLY_LIMITATION'
   | 'MEDIA_AND_CHAT_DEFERRED_IN_PHASE2'
   | 'INVALID_DEVICE_CREDENTIAL'
-  | 'DEVICE_SECRET_MISMATCH';
+  | 'DEVICE_SECRET_MISMATCH'
+  | 'INVALID_REQUEST'
+  | 'RATE_LIMITED';
 
 /**
  * Local-only user/device profile stored on-device and never transmitted to the backend.
+ * Optional email/phone P2P sharing flags default to OFF (false).
  */
 export interface LocalDeviceProfile {
   readonly name: string;
   readonly email: string;
   readonly phone: string;
+  readonly shareEmailWithPeers?: boolean;
+  readonly sharePhoneWithPeers?: boolean;
   readonly updatedAt: string;
 }
 
@@ -356,11 +386,14 @@ export interface EphemeralChatMessage {
   readonly sentAt: string;
 }
 
+export type InviteIntent = 'connect' | 'invite';
+
 export type InviteStatus =
   | 'pending'
   | 'accepted'
   | 'declined'
-  | 'cancelled';
+  | 'cancelled'
+  | 'expired';
 
 export interface InviteSummary {
   readonly inviteId: string;
@@ -370,8 +403,11 @@ export interface InviteSummary {
   readonly targetAccountId: string;
   readonly targetFriendCode: string;
   readonly targetDisplayName: string;
+  readonly intent: InviteIntent;
+  readonly hostMediaSelection?: HostMediaSelection;
   readonly status: InviteStatus;
   readonly createdAt: string;
+  readonly expiresAt: string;
   readonly resolvedAt: string | null;
 }
 
@@ -393,6 +429,7 @@ export interface PresenceStateSnapshot {
   readonly account: AccountProfile;
   readonly incomingInvites: readonly InviteSummary[];
   readonly outgoingInvite: InviteSummary | null;
+  readonly recentExpiredOutgoingInvite?: InviteSummary | null;
   readonly activeSession: ApprovedSessionSummary | null;
 }
 

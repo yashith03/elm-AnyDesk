@@ -6,14 +6,18 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_LIVENESS_CONFIG,
+  INVITE_TIMEOUT_MS,
+  PRESENCE_HEARTBEAT_INTERVAL_MS,
   isValidFriendCode,
   normalizeFriendCode,
   sanitizeHostMediaSelection,
   type AccountProfile,
   type AnonymousDeviceRegistrationResponse,
   type ApprovedSessionSummary,
+  type DevicePresenceConnectionState,
   type DeviceRegistrationStatus,
   type HostMediaSelection,
+  type InviteIntent,
   type InviteStatus,
   type InviteSummary,
   type LocalDeviceProfile,
@@ -24,7 +28,20 @@ import {
   type WebRtcSignalEnvelope,
   type WebRtcSignalPayload,
 } from '@elm/protocol';
-import type { ApiActionResult, DeviceSetupState } from '../shared/bridge';
+import type {
+  ApiActionResult,
+  DeviceSetupState,
+  PresenceRuntimeStatus,
+} from '../shared/bridge';
+import {
+  removeRecentPeerEntry,
+  renameRecentPeerEntry,
+  sortRecentPeers,
+  toggleFavoritePeerEntry,
+  upsertRecentPeerContact,
+  upsertSuccessfulPeerConnection,
+  type RecentPeerEntry,
+} from '../shared/recent-peers';
 
 interface PersistedDesktopState {
   activeToken: string | null;
@@ -37,6 +54,7 @@ interface PersistedDesktopState {
   } | null;
   registeredAccount: AccountProfile | null;
   registeredToken: string | null;
+  recentPeers: RecentPeerEntry[];
   d1Accounts: Array<{
     account_id: string;
     provider: string;
@@ -56,8 +74,11 @@ interface InMemoryInvite {
   targetAccountId: string;
   targetFriendCode: string;
   targetDisplayName: string;
+  intent: InviteIntent;
+  hostMediaSelection?: HostMediaSelection;
   status: InviteStatus;
   createdAt: string;
+  expiresAt: string;
   resolvedAt: string | null;
 }
 
@@ -84,9 +105,25 @@ const TEST_DOUBLE_PERSONAS: Record<
 
 declare const __ELM_DEFAULT_API_BASE_URL__: string | undefined;
 
+export interface DesktopAuthControllerOptions {
+  readonly stateFilePath?: string;
+  readonly heartbeatIntervalMs?: number;
+  readonly initialBackoffMs?: number;
+  readonly maxBackoffMs?: number;
+  readonly requestTimeoutMs?: number;
+  readonly onPresenceStatusChanged?: (status: PresenceRuntimeStatus) => void;
+}
+
 export class DesktopAuthAndInviteController {
   public readonly apiBaseUrl: string;
   private readonly stateFilePath: string;
+  private readonly heartbeatIntervalMs: number;
+  private readonly initialBackoffMs: number;
+  private readonly maxBackoffMs: number;
+  private readonly requestTimeoutMs: number;
+  private readonly onPresenceStatusChanged?: (
+    status: PresenceRuntimeStatus
+  ) => void;
   private persisted: PersistedDesktopState;
 
   // Coordinator state for local test-double evaluation when Worker/OAuth secrets are unavailable
@@ -113,7 +150,19 @@ export class DesktopAuthAndInviteController {
   private registrationStatus: DeviceRegistrationStatus = 'unregistered';
   private registrationMessage: string | null = null;
 
-  constructor(apiBaseUrl?: string) {
+  // Automatic presence heartbeat, reconnect backoff, and shutdown coordination
+  private presenceConnectionState: DevicePresenceConnectionState = 'offline';
+  private serverConfirmedOnline = false;
+  private lastPresenceConfirmedAt: string | null = null;
+  private presenceConsecutiveFailures = 0;
+  private lastPresenceSnapshot: PresenceStateSnapshot | null = null;
+  private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private activePresenceRequest: Promise<PresenceRuntimeStatus> | null = null;
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private readonly activeAbortControllers = new Set<AbortController>();
+
+  constructor(apiBaseUrl?: string, options?: DesktopAuthControllerOptions) {
     const buildTimeDefaultApiBaseUrl =
       typeof __ELM_DEFAULT_API_BASE_URL__ === 'string' &&
       __ELM_DEFAULT_API_BASE_URL__.trim().length > 0
@@ -124,10 +173,15 @@ export class DesktopAuthAndInviteController {
       process.env.ELM_API_BASE_URL ||
       buildTimeDefaultApiBaseUrl ||
       'http://127.0.0.1:8787';
-    this.stateFilePath = path.join(
-      app.getPath('userData'),
-      'elm-phase2-auth-state.json'
-    );
+    this.stateFilePath =
+      options?.stateFilePath ||
+      path.join(app.getPath('userData'), 'elm-phase2-auth-state.json');
+    this.heartbeatIntervalMs =
+      options?.heartbeatIntervalMs ?? PRESENCE_HEARTBEAT_INTERVAL_MS;
+    this.initialBackoffMs = options?.initialBackoffMs ?? 2000;
+    this.maxBackoffMs = options?.maxBackoffMs ?? 30_000;
+    this.requestTimeoutMs = options?.requestTimeoutMs ?? 8000;
+    this.onPresenceStatusChanged = options?.onPresenceStatusChanged;
     this.persisted = this.loadPersistedState();
     this.rebuildTokenIndex();
   }
@@ -159,6 +213,9 @@ export class DesktopAuthAndInviteController {
           deviceCredential: parsed.deviceCredential ?? null,
           registeredAccount: parsed.registeredAccount ?? null,
           registeredToken: parsed.registeredToken ?? null,
+          recentPeers: Array.isArray(parsed.recentPeers)
+            ? sortRecentPeers(parsed.recentPeers)
+            : [],
           d1Accounts: Array.isArray(parsed.d1Accounts)
             ? parsed.d1Accounts
             : [],
@@ -176,6 +233,7 @@ export class DesktopAuthAndInviteController {
       deviceCredential: null,
       registeredAccount: null,
       registeredToken: null,
+      recentPeers: [],
       d1Accounts: [],
     };
   }
@@ -192,6 +250,7 @@ export class DesktopAuthAndInviteController {
         deviceCredential: this.persisted.deviceCredential,
         registeredAccount: this.persisted.registeredAccount,
         registeredToken: this.persisted.registeredToken,
+        recentPeers: this.persisted.recentPeers,
         d1Accounts: this.persisted.d1Accounts,
       };
 
@@ -546,10 +605,11 @@ export class DesktopAuthAndInviteController {
   private async fetchRemoteApi<T>(
     pathname: string,
     init?: RequestInit,
-    retriedAuth = false
+    retriedAuth = false,
+    timeoutMs?: number
   ): Promise<ApiActionResult<T>> {
-    if (!this.persisted.registeredToken) {
-      await this.registerDeviceWithBackend();
+    if (!this.persisted.registeredToken && !this.shuttingDown) {
+      await this.registerDeviceWithBackend(true);
     }
     const token = this.persisted.registeredToken;
     if (!token) {
@@ -563,9 +623,15 @@ export class DesktopAuthAndInviteController {
       };
     }
 
+    const controller = new AbortController();
+    const effectiveTimeout = timeoutMs ?? this.requestTimeoutMs;
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+    this.activeAbortControllers.add(controller);
+
     try {
       const response = await fetch(`${this.apiBaseUrl}${pathname}`, {
         ...init,
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -573,10 +639,10 @@ export class DesktopAuthAndInviteController {
         },
       });
 
-      if (response.status === 401 && !retriedAuth) {
-        await this.registerDeviceWithBackend();
+      if (response.status === 401 && !retriedAuth && !this.shuttingDown) {
+        await this.registerDeviceWithBackend(true);
         if (this.persisted.registeredToken) {
-          return this.fetchRemoteApi<T>(pathname, init, true);
+          return this.fetchRemoteApi<T>(pathname, init, true, timeoutMs);
         }
       }
 
@@ -609,7 +675,181 @@ export class DesktopAuthAndInviteController {
         errorMessage:
           'Could not reach the Elm signaling server. Check your internet connection.',
       };
+    } finally {
+      clearTimeout(timeoutId);
+      this.activeAbortControllers.delete(controller);
     }
+  }
+
+  public getPresenceRuntimeStatus(): PresenceRuntimeStatus {
+    return {
+      connectionState: this.presenceConnectionState,
+      serverConfirmedOnline: this.serverConfirmedOnline,
+      lastConfirmedAt: this.lastPresenceConfirmedAt,
+      consecutiveFailures: this.presenceConsecutiveFailures,
+      snapshot: this.lastPresenceSnapshot,
+    };
+  }
+
+  private emitPresenceStatus(): void {
+    this.onPresenceStatusChanged?.(this.getPresenceRuntimeStatus());
+  }
+
+  public stopPresenceHeartbeat(): void {
+    if (this.presenceTimer !== null) {
+      clearTimeout(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+  }
+
+  private scheduleNextPresenceTick(delayMs: number): void {
+    this.stopPresenceHeartbeat();
+    if (
+      this.shuttingDown ||
+      !this.isRemoteDeviceMode() ||
+      !this.persisted.registeredAccount
+    ) {
+      return;
+    }
+    this.presenceTimer = setTimeout(() => {
+      this.presenceTimer = null;
+      void this.establishRemotePresence(
+        this.serverConfirmedOnline ? 'heartbeat' : 'connect'
+      );
+    }, delayMs);
+    if (typeof this.presenceTimer.unref === 'function') {
+      this.presenceTimer.unref();
+    }
+  }
+
+  private computeRetryBackoffMs(failures: number): number {
+    const exp = Math.min(Math.max(0, failures - 1), 4);
+    return Math.min(
+      this.maxBackoffMs,
+      this.initialBackoffMs * Math.pow(2, exp)
+    );
+  }
+
+  public async establishRemotePresence(
+    mode: 'connect' | 'heartbeat' = 'connect'
+  ): Promise<PresenceRuntimeStatus> {
+    if (this.shuttingDown) {
+      this.serverConfirmedOnline = false;
+      this.presenceConnectionState = 'offline';
+      this.emitPresenceStatus();
+      return this.getPresenceRuntimeStatus();
+    }
+
+    if (!this.isRemoteDeviceMode()) {
+      const acct = this.getCurrentAccount();
+      const online = acct ? this.onlineAccounts.has(acct.accountId) : false;
+      this.serverConfirmedOnline = online;
+      this.presenceConnectionState = online ? 'online' : 'offline';
+      this.lastPresenceSnapshot = acct ? this.buildSnapshot(acct) : null;
+      this.emitPresenceStatus();
+      return this.getPresenceRuntimeStatus();
+    }
+
+    if (!this.persisted.registeredAccount || !this.persisted.registeredToken) {
+      this.serverConfirmedOnline = false;
+      this.presenceConnectionState =
+        this.registrationStatus === 'registering' ? 'connecting' : 'offline';
+      this.emitPresenceStatus();
+      return this.getPresenceRuntimeStatus();
+    }
+
+    if (this.activePresenceRequest) {
+      return this.activePresenceRequest;
+    }
+
+    if (!this.serverConfirmedOnline) {
+      this.presenceConnectionState =
+        this.lastPresenceConfirmedAt || this.presenceConsecutiveFailures > 0
+          ? 'reconnecting'
+          : 'connecting';
+      this.emitPresenceStatus();
+    }
+
+    const endpoint =
+      mode === 'heartbeat' ? '/presence/heartbeat' : '/presence/connect';
+
+    const task = (async (): Promise<PresenceRuntimeStatus> => {
+      const res = await this.fetchRemoteApi<{
+        snapshot: PresenceStateSnapshot;
+        serverTime?: string;
+      }>(endpoint, { method: 'POST', body: '{}' });
+
+      if (this.shuttingDown) {
+        this.serverConfirmedOnline = false;
+        this.presenceConnectionState = 'offline';
+        this.emitPresenceStatus();
+        return this.getPresenceRuntimeStatus();
+      }
+
+      if (res.ok && res.data?.snapshot?.online === true) {
+        this.presenceConsecutiveFailures = 0;
+        this.serverConfirmedOnline = true;
+        this.presenceConnectionState = 'online';
+        this.lastPresenceConfirmedAt =
+          res.data.serverTime ?? new Date().toISOString();
+        this.lastPresenceSnapshot = res.data.snapshot;
+        this.emitPresenceStatus();
+        this.scheduleNextPresenceTick(this.heartbeatIntervalMs);
+      } else {
+        this.presenceConsecutiveFailures += 1;
+        this.serverConfirmedOnline = false;
+        this.presenceConnectionState =
+          this.presenceConsecutiveFailures >= 2 ? 'offline' : 'reconnecting';
+        if (this.lastPresenceSnapshot) {
+          this.lastPresenceSnapshot = {
+            ...this.lastPresenceSnapshot,
+            online: false,
+          };
+        }
+        this.emitPresenceStatus();
+        this.scheduleNextPresenceTick(
+          this.computeRetryBackoffMs(this.presenceConsecutiveFailures)
+        );
+      }
+      return this.getPresenceRuntimeStatus();
+    })();
+
+    this.activePresenceRequest = task;
+    try {
+      return await task;
+    } finally {
+      if (this.activePresenceRequest === task) {
+        this.activePresenceRequest = null;
+      }
+    }
+  }
+
+  public async triggerPresenceReconnect(): Promise<PresenceRuntimeStatus> {
+    if (this.shuttingDown) {
+      return this.getPresenceRuntimeStatus();
+    }
+    this.stopPresenceHeartbeat();
+    if (
+      this.persisted.localProfile?.name &&
+      !this.persisted.registeredAccount
+    ) {
+      await this.registerDeviceWithBackend();
+      return this.getPresenceRuntimeStatus();
+    }
+    return this.establishRemotePresence('connect');
+  }
+
+  public pausePresenceForSuspend(): void {
+    this.stopPresenceHeartbeat();
+    this.serverConfirmedOnline = false;
+    this.presenceConnectionState = 'offline';
+    if (this.lastPresenceSnapshot) {
+      this.lastPresenceSnapshot = {
+        ...this.lastPresenceSnapshot,
+        online: false,
+      };
+    }
+    this.emitPresenceStatus();
   }
 
   private buildDeviceSetupState(): DeviceSetupState {
@@ -622,14 +862,27 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  private async registerDeviceWithBackend(): Promise<DeviceSetupState> {
+  private async registerDeviceWithBackend(
+    skipPresenceEstablish: boolean = false
+  ): Promise<DeviceSetupState> {
+    if (this.shuttingDown) {
+      return this.buildDeviceSetupState();
+    }
     const credential = this.ensureDeviceCredential();
     this.registrationStatus = 'registering';
     this.registrationMessage = 'Registering device with Elm registry...';
+    this.presenceConnectionState = 'connecting';
+    this.serverConfirmedOnline = false;
+    this.emitPresenceStatus();
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    this.activeAbortControllers.add(controller);
 
     try {
       const response = await fetch(`${this.apiBaseUrl}/devices/register`, {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           deviceId: credential.deviceId,
@@ -645,6 +898,9 @@ export class DesktopAuthAndInviteController {
         this.registrationMessage =
           errPayload.message ||
           `Device registration failed (HTTP ${response.status}). Check your connection and retry.`;
+        this.presenceConnectionState = 'offline';
+        this.serverConfirmedOnline = false;
+        this.emitPresenceStatus();
         return this.buildDeviceSetupState();
       }
 
@@ -688,17 +944,33 @@ export class DesktopAuthAndInviteController {
         payload.token,
         accountWithLocalDisplay.accountId
       );
-      this.onlineAccounts.add(accountWithLocalDisplay.accountId);
       this.registrationStatus = 'registered';
       this.registrationMessage = null;
       this.savePersistedState();
+
+      if (!skipPresenceEstablish) {
+        if (this.isRemoteDeviceMode()) {
+          await this.establishRemotePresence('connect');
+        } else {
+          this.onlineAccounts.add(accountWithLocalDisplay.accountId);
+          this.serverConfirmedOnline = true;
+          this.presenceConnectionState = 'online';
+          this.emitPresenceStatus();
+        }
+      }
 
       return this.buildDeviceSetupState();
     } catch {
       this.registrationStatus = 'offline';
       this.registrationMessage =
         'Offline before registration: could not reach the Elm registry to assign a device code. Check your connection and click Retry.';
+      this.presenceConnectionState = 'offline';
+      this.serverConfirmedOnline = false;
+      this.emitPresenceStatus();
       return this.buildDeviceSetupState();
+    } finally {
+      clearTimeout(timeoutId);
+      this.activeAbortControllers.delete(controller);
     }
   }
 
@@ -711,12 +983,13 @@ export class DesktopAuthAndInviteController {
     } else if (this.persisted.registeredAccount) {
       this.registrationStatus = 'registered';
       this.registrationMessage = null;
-      this.onlineAccounts.add(this.persisted.registeredAccount.accountId);
       if (this.isRemoteDeviceMode()) {
-        void this.fetchRemoteApi<{ snapshot: PresenceStateSnapshot }>(
-          '/presence/connect',
-          { method: 'POST', body: '{}' }
-        );
+        await this.establishRemotePresence('connect');
+      } else {
+        this.onlineAccounts.add(this.persisted.registeredAccount.accountId);
+        this.serverConfirmedOnline = true;
+        this.presenceConnectionState = 'online';
+        this.emitPresenceStatus();
       }
     }
 
@@ -731,6 +1004,8 @@ export class DesktopAuthAndInviteController {
     name: string;
     email?: string;
     phone?: string;
+    shareEmailWithPeers?: boolean;
+    sharePhoneWithPeers?: boolean;
   }): Promise<ApiActionResult<DeviceSetupState>> {
     const cleanedName = String(input.name ?? '').trim().slice(0, 60);
     if (!cleanedName) {
@@ -742,10 +1017,19 @@ export class DesktopAuthAndInviteController {
       };
     }
 
+    const prev = this.persisted.localProfile;
     this.persisted.localProfile = {
       name: cleanedName,
       email: String(input.email ?? '').trim().slice(0, 120),
       phone: String(input.phone ?? '').trim().slice(0, 40),
+      shareEmailWithPeers:
+        input.shareEmailWithPeers !== undefined
+          ? Boolean(input.shareEmailWithPeers)
+          : Boolean(prev?.shareEmailWithPeers),
+      sharePhoneWithPeers:
+        input.sharePhoneWithPeers !== undefined
+          ? Boolean(input.sharePhoneWithPeers)
+          : Boolean(prev?.sharePhoneWithPeers),
       updatedAt: new Date().toISOString(),
     };
 
@@ -835,10 +1119,12 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public getStoredAuthSession(): ApiActionResult<{
-    account: AccountProfile;
-    snapshot: PresenceStateSnapshot;
-  }> {
+  public async getStoredAuthSession(): Promise<
+    ApiActionResult<{
+      account: AccountProfile;
+      snapshot: PresenceStateSnapshot;
+    }>
+  > {
     const account = this.getCurrentAccount();
     if (!account) {
       return {
@@ -847,6 +1133,28 @@ export class DesktopAuthAndInviteController {
         errorCode: 'UNAUTHORIZED',
         errorMessage:
           this.registrationMessage ?? 'Device has not been registered yet.',
+      };
+    }
+    if (this.isRemoteDeviceMode()) {
+      const runtime = this.serverConfirmedOnline
+        ? this.getPresenceRuntimeStatus()
+        : await this.establishRemotePresence('connect');
+      const serverSnapshot: PresenceStateSnapshot =
+        runtime.snapshot ?? {
+          online: false,
+          account,
+          incomingInvites: [],
+          outgoingInvite: null,
+          recentExpiredOutgoingInvite: null,
+          activeSession: null,
+        };
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          account,
+          snapshot: serverSnapshot,
+        },
       };
     }
     this.onlineAccounts.add(account.accountId);
@@ -1079,10 +1387,65 @@ export class DesktopAuthAndInviteController {
     }>
   > {
     if (this.isRemoteDeviceMode()) {
-      return this.fetchRemoteApi<{ snapshot: PresenceStateSnapshot }>(
-        '/presence/state',
-        { method: 'GET' }
-      );
+      if (this.shuttingDown) {
+        return {
+          ok: false,
+          status: 503,
+          errorCode: 'NETWORK_ERROR',
+          errorMessage: 'Application is closing.',
+        };
+      }
+      const res = await this.fetchRemoteApi<{
+        snapshot: PresenceStateSnapshot;
+        serverTime?: string;
+      }>('/presence/state', { method: 'GET' });
+
+      if (this.shuttingDown) {
+        return res;
+      }
+
+      if (!res.ok) {
+        this.presenceConsecutiveFailures += 1;
+        this.serverConfirmedOnline = false;
+        this.presenceConnectionState =
+          this.presenceConsecutiveFailures >= 2 ? 'offline' : 'reconnecting';
+        if (this.lastPresenceSnapshot) {
+          this.lastPresenceSnapshot = {
+            ...this.lastPresenceSnapshot,
+            online: false,
+          };
+        }
+        this.emitPresenceStatus();
+        if (!this.presenceTimer && !this.activePresenceRequest) {
+          this.scheduleNextPresenceTick(
+            this.computeRetryBackoffMs(this.presenceConsecutiveFailures)
+          );
+        }
+        return res;
+      }
+
+      if (res.data?.snapshot) {
+        if (res.data.snapshot.online) {
+          this.presenceConsecutiveFailures = 0;
+          this.serverConfirmedOnline = true;
+          this.presenceConnectionState = 'online';
+          this.lastPresenceConfirmedAt =
+            res.data.serverTime ?? new Date().toISOString();
+          this.lastPresenceSnapshot = res.data.snapshot;
+          this.emitPresenceStatus();
+        } else {
+          // Server marked presence offline/stale; automatically re-establish presence
+          const reconnected = await this.establishRemotePresence('connect');
+          if (reconnected.snapshot) {
+            return {
+              ok: true,
+              status: 200,
+              data: { snapshot: reconnected.snapshot },
+            };
+          }
+        }
+      }
+      return res;
     }
     const account = this.getCurrentAccount();
     if (!account) {
@@ -1201,18 +1564,198 @@ export class DesktopAuthAndInviteController {
     };
   }
 
+  public getRecentPeers(): RecentPeerEntry[] {
+    return sortRecentPeers(this.persisted.recentPeers);
+  }
+
+  public recordConnectedPeer(params: {
+    friendCode: string;
+    defaultAlias?: string;
+    connectedAt?: string;
+  }): RecentPeerEntry[] {
+    this.persisted.recentPeers = upsertSuccessfulPeerConnection(
+      this.persisted.recentPeers,
+      params
+    );
+    this.savePersistedState();
+    return this.getRecentPeers();
+  }
+
+  public updateRecentPeerContact(params: {
+    friendCode: string;
+    peerName?: string;
+    email?: string;
+    phone?: string;
+    connectedAt?: string;
+  }): RecentPeerEntry[] {
+    this.persisted.recentPeers = upsertRecentPeerContact(
+      this.persisted.recentPeers,
+      params
+    );
+    this.savePersistedState();
+    return this.getRecentPeers();
+  }
+
+  public toggleFavoritePeer(friendCode: string): RecentPeerEntry[] {
+    this.persisted.recentPeers = toggleFavoritePeerEntry(
+      this.persisted.recentPeers,
+      friendCode
+    );
+    this.savePersistedState();
+    return this.getRecentPeers();
+  }
+
+  public renameRecentPeer(params: {
+    friendCode: string;
+    alias: string;
+  }): RecentPeerEntry[] {
+    this.persisted.recentPeers = renameRecentPeerEntry(
+      this.persisted.recentPeers,
+      params.friendCode,
+      params.alias
+    );
+    this.savePersistedState();
+    return this.getRecentPeers();
+  }
+
+  public removeRecentPeer(friendCode: string): RecentPeerEntry[] {
+    this.persisted.recentPeers = removeRecentPeerEntry(
+      this.persisted.recentPeers,
+      friendCode
+    );
+    this.savePersistedState();
+    return this.getRecentPeers();
+  }
+
+  public async lookupDevicePresence(
+    friendCodes: string[]
+  ): Promise<ApiActionResult<{ statuses: Record<string, boolean> }>> {
+    const normalized = Array.from(
+      new Set(
+        friendCodes
+          .map((c) => normalizeFriendCode(String(c ?? '')))
+          .filter((c) => isValidFriendCode(c))
+      )
+    );
+    if (normalized.length === 0) {
+      return { ok: true, status: 200, data: { statuses: {} } };
+    }
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{ statuses: Record<string, boolean> }>(
+        '/presence/lookup',
+        {
+          method: 'POST',
+          body: JSON.stringify({ friendCodes: normalized }),
+        }
+      );
+    }
+    const statuses: Record<string, boolean> = {};
+    for (const code of normalized) {
+      const acct = this.persisted.d1Accounts.find(
+        (a) => a.friend_code === code
+      );
+      statuses[code] = acct ? this.onlineAccounts.has(acct.account_id) : false;
+    }
+    return { ok: true, status: 200, data: { statuses } };
+  }
+
+  public async cleanupOnAppQuit(): Promise<void> {
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
+    }
+    this.shuttingDown = true;
+    this.stopPresenceHeartbeat();
+    for (const ac of this.activeAbortControllers) {
+      try {
+        ac.abort();
+      } catch {
+        // Ignore abort error
+      }
+    }
+    this.activeAbortControllers.clear();
+    this.serverConfirmedOnline = false;
+    this.presenceConnectionState = 'offline';
+    if (this.lastPresenceSnapshot) {
+      this.lastPresenceSnapshot = {
+        ...this.lastPresenceSnapshot,
+        online: false,
+      };
+    }
+    this.emitPresenceStatus();
+
+    const task = (async () => {
+      if (this.isRemoteDeviceMode()) {
+        try {
+          // Single bounded request: DO markAccountOffline cancels pending invites AND tears down active sessions.
+          await this.fetchRemoteApi<{ ok: boolean }>(
+            '/presence/disconnect',
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                reason: 'app_closed',
+                subReason: 'app_before_quit',
+              }),
+            },
+            true,
+            2000
+          );
+        } catch {
+          // Best-effort offline disconnect on quit
+        }
+        return;
+      }
+      await this.disconnectActiveSession({
+        reason: 'app_closed',
+        subReason: 'app_before_quit',
+      });
+      await this.setPresenceOnline(false, {
+        reason: 'app_closed',
+        subReason: 'app_before_quit',
+      });
+    })();
+
+    this.shutdownPromise = task;
+    return task;
+  }
+
   public async sendFriendCodeInvite(
-    rawFriendCode: string
+    input:
+      | string
+      | {
+          friendCode: string;
+          intent?: InviteIntent;
+          hostMediaSelection?: HostMediaSelection;
+        }
   ): Promise<
     ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
   > {
+    const rawFriendCode = typeof input === 'string' ? input : input.friendCode;
+    const intent: InviteIntent =
+      typeof input === 'string'
+        ? 'connect'
+        : input.intent === 'invite'
+        ? 'invite'
+        : 'connect';
+    const hostMediaSelection =
+      intent === 'invite'
+        ? sanitizeHostMediaSelection(
+            typeof input === 'string'
+              ? { screenVideo: true }
+              : input.hostMediaSelection ?? { screenVideo: true }
+          )
+        : undefined;
+
     if (this.isRemoteDeviceMode()) {
       return this.fetchRemoteApi<{
         invite: InviteSummary;
         snapshot: PresenceStateSnapshot;
       }>('/invites', {
         method: 'POST',
-        body: JSON.stringify({ friendCode: rawFriendCode }),
+        body: JSON.stringify({
+          friendCode: rawFriendCode,
+          intent,
+          hostMediaSelection,
+        }),
       });
     }
     const requester = this.getCurrentAccount();
@@ -1316,6 +1859,7 @@ export class DesktopAuthAndInviteController {
       }
     }
 
+    const nowMs = Date.now();
     const invite: InMemoryInvite = {
       inviteId: crypto.randomUUID(),
       requesterAccountId: requester.accountId,
@@ -1324,8 +1868,11 @@ export class DesktopAuthAndInviteController {
       targetAccountId: target.accountId,
       targetFriendCode: target.friendCode,
       targetDisplayName: target.displayName,
+      intent,
+      ...(hostMediaSelection ? { hostMediaSelection } : {}),
       status: 'pending',
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + INVITE_TIMEOUT_MS).toISOString(),
       resolvedAt: null,
     };
 
@@ -1337,6 +1884,69 @@ export class DesktopAuthAndInviteController {
       data: {
         invite: { ...invite },
         snapshot: this.buildSnapshot(requester),
+      },
+    };
+  }
+
+  public async cancelOutgoingInvite(
+    inviteId: string
+  ): Promise<
+    ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      return this.fetchRemoteApi<{
+        invite: InviteSummary;
+        snapshot: PresenceStateSnapshot;
+      }>(`/invites/${encodeURIComponent(inviteId)}/cancel`, {
+        method: 'POST',
+        body: '{}',
+      });
+    }
+    const caller = this.getCurrentAccount();
+    if (!caller) {
+      return {
+        ok: false,
+        status: 401,
+        errorCode: 'UNAUTHORIZED',
+        errorMessage: 'Not signed in.',
+      };
+    }
+    const invite = this.invites.get(inviteId);
+    if (!invite) {
+      return {
+        ok: false,
+        status: 404,
+        errorCode: 'INVITE_NOT_FOUND',
+        errorMessage: 'Invite not found.',
+      };
+    }
+    if (invite.requesterAccountId !== caller.accountId) {
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'NOT_INVITE_SENDER',
+        errorMessage: 'Only the request sender can cancel a pending request.',
+      };
+    }
+    if (invite.status !== 'pending') {
+      return {
+        ok: false,
+        status: 409,
+        errorCode:
+          invite.status === 'expired'
+            ? 'INVITE_EXPIRED'
+            : 'INVITE_ALREADY_RESOLVED',
+        errorMessage: `Invite has already been ${invite.status}.`,
+      };
+    }
+    invite.status = 'cancelled';
+    invite.resolvedAt = new Date().toISOString();
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        invite: { ...invite },
+        snapshot: this.buildSnapshot(caller),
       },
     };
   }
@@ -1445,7 +2055,12 @@ export class DesktopAuthAndInviteController {
       };
     }
 
-    const mediaSelection = sanitizeHostMediaSelection(params.mediaSelection);
+    const isReverseInvite = invite.intent === 'invite';
+    const mediaSelection = isReverseInvite
+      ? sanitizeHostMediaSelection(
+          invite.hostMediaSelection ?? { screenVideo: true }
+        )
+      : sanitizeHostMediaSelection(params.mediaSelection);
     invite.status = 'accepted';
     invite.resolvedAt = now;
 
@@ -1467,12 +2082,24 @@ export class DesktopAuthAndInviteController {
     const approvedSession: ApprovedSessionSummary = {
       sessionId: crypto.randomUUID(),
       inviteId: invite.inviteId,
-      hostAccountId: invite.targetAccountId,
-      hostFriendCode: invite.targetFriendCode,
-      hostDisplayName: invite.targetDisplayName,
-      guestAccountId: invite.requesterAccountId,
-      guestFriendCode: invite.requesterFriendCode,
-      guestDisplayName: invite.requesterDisplayName,
+      hostAccountId: isReverseInvite
+        ? invite.requesterAccountId
+        : invite.targetAccountId,
+      hostFriendCode: isReverseInvite
+        ? invite.requesterFriendCode
+        : invite.targetFriendCode,
+      hostDisplayName: isReverseInvite
+        ? invite.requesterDisplayName
+        : invite.targetDisplayName,
+      guestAccountId: isReverseInvite
+        ? invite.targetAccountId
+        : invite.requesterAccountId,
+      guestFriendCode: isReverseInvite
+        ? invite.targetFriendCode
+        : invite.requesterFriendCode,
+      guestDisplayName: isReverseInvite
+        ? invite.targetDisplayName
+        : invite.requesterDisplayName,
       hostMediaSelection: mediaSelection,
       createdAt: now,
     };

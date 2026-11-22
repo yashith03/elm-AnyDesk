@@ -2,10 +2,12 @@ import type {
   AccountProfile,
   AllowedScreenSurface,
   ApprovedSessionSummary,
+  DevicePresenceConnectionState,
   DeviceRegistrationStatus,
   EphemeralChatMessage,
   HostMediaRuntimeState,
   HostMediaSelection,
+  InviteIntent,
   InviteSummary,
   LocalDeviceProfile,
   MediaSourceKind,
@@ -18,6 +20,7 @@ import type {
   WebRtcSignalPayload,
 } from '@elm/protocol';
 import type { ThemeMode, ThemeStateSnapshot } from './theme';
+import type { RecentPeerEntry } from './recent-peers';
 
 export type DesktopWindowRole = 'main' | 'chat' | 'presentation';
 
@@ -144,6 +147,14 @@ export interface DeviceSetupState {
   readonly registeredAccount: AccountProfile | null;
 }
 
+export interface PresenceRuntimeStatus {
+  readonly connectionState: DevicePresenceConnectionState;
+  readonly serverConfirmedOnline: boolean;
+  readonly lastConfirmedAt: string | null;
+  readonly consecutiveFailures: number;
+  readonly snapshot: PresenceStateSnapshot | null;
+}
+
 export interface ElmDesktopBridge {
   getRuntimeMetadata: () => Promise<DesktopRuntimeMetadata>;
   openSeparateChatWindow: () => Promise<{
@@ -166,6 +177,8 @@ export interface ElmDesktopBridge {
     name: string;
     email?: string;
     phone?: string;
+    shareEmailWithPeers?: boolean;
+    sharePhoneWithPeers?: boolean;
   }) => Promise<ApiActionResult<DeviceSetupState>>;
   retryDeviceRegistration: () => Promise<ApiActionResult<DeviceSetupState>>;
 
@@ -189,6 +202,11 @@ export interface ElmDesktopBridge {
   getPresenceSnapshot: () => Promise<
     ApiActionResult<{ snapshot: PresenceStateSnapshot }>
   >;
+  getPresenceRuntimeStatus: () => Promise<PresenceRuntimeStatus>;
+  triggerPresenceReconnect: () => Promise<PresenceRuntimeStatus>;
+  onPresenceStatusUpdated: (
+    listener: (status: PresenceRuntimeStatus) => void
+  ) => () => void;
   setPresenceOnline: (
     online: boolean,
     options?: {
@@ -202,9 +220,42 @@ export interface ElmDesktopBridge {
       receipt?: SessionTeardownReceipt | null;
     }>
   >;
-  sendFriendCodeInvite: (friendCode: string) => Promise<
+  sendFriendCodeInvite: (
+    input:
+      | string
+      | {
+          friendCode: string;
+          intent?: InviteIntent;
+          hostMediaSelection?: HostMediaSelection;
+        }
+  ) => Promise<
     ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
   >;
+  cancelOutgoingInvite: (inviteId: string) => Promise<
+    ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
+  >;
+  lookupDevicePresence: (friendCodes: string[]) => Promise<
+    ApiActionResult<{ statuses: Record<string, boolean> }>
+  >;
+  getRecentPeers: () => Promise<RecentPeerEntry[]>;
+  recordConnectedPeer: (params: {
+    friendCode: string;
+    defaultAlias?: string;
+    connectedAt?: string;
+  }) => Promise<RecentPeerEntry[]>;
+  updateRecentPeerContact: (params: {
+    friendCode: string;
+    peerName?: string;
+    email?: string;
+    phone?: string;
+    connectedAt?: string;
+  }) => Promise<RecentPeerEntry[]>;
+  toggleFavoritePeer: (friendCode: string) => Promise<RecentPeerEntry[]>;
+  renameRecentPeer: (params: {
+    friendCode: string;
+    alias: string;
+  }) => Promise<RecentPeerEntry[]>;
+  removeRecentPeer: (friendCode: string) => Promise<RecentPeerEntry[]>;
   respondToInvite: (params: {
     inviteId: string;
     action: 'accept' | 'decline';
@@ -318,7 +369,14 @@ export interface ElmDesktopBridge {
     listener: (themeState: ThemeStateSnapshot) => void
   ) => () => void;
 
-  // Windows 11 Taskbar & DWM Preview Prototype
+  // Windows 11 Custom Titlebar Window Controls & DWM Preview Prototype
+  minimizeWindow: () => Promise<void>;
+  toggleMaximizeWindow: () => Promise<{ maximized: boolean }>;
+  closeWindow: () => Promise<void>;
+  isWindowMaximized: () => Promise<boolean>;
+  onWindowMaximizedChanged: (
+    listener: (maximized: boolean) => void
+  ) => () => void;
   getTaskbarDwmTelemetry: () => Promise<TaskbarDwmTelemetry>;
   minimizeMainWindow: () => Promise<TaskbarDwmTelemetry>;
   restoreMainWindow: () => Promise<TaskbarDwmTelemetry>;

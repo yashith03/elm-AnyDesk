@@ -1,7 +1,10 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
+import { installBrowserPreviewBridgeIfNeeded } from './browser-preview-shim';
 import './styles.css';
+
+installBrowserPreviewBridgeIfNeeded();
 
 const container = document.getElementById('root');
 if (!container) {

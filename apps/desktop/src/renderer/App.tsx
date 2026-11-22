@@ -1,14 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type {
-  AccountProfile,
-  HostMediaSelection,
-  InviteSummary,
-  MediaSourceKind,
-  PresenceStateSnapshot,
+import {
+  INVITE_TIMEOUT_MS,
+  type AccountProfile,
+  type HostMediaSelection,
+  type InviteIntent,
+  type InviteSummary,
+  type MediaSourceKind,
+  type PresenceStateSnapshot,
 } from '@elm/protocol';
 import type {
   DesktopRuntimeMetadata,
   DeviceSetupState,
+  PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
@@ -20,6 +23,21 @@ import {
   validateChatImageAttachment,
 } from '../shared/chat-attachments';
 import { formatIncomingRequestHeadline } from '../shared/incoming-request';
+import {
+  buildOutgoingPeerContactCard,
+  resolveRecentPeerDisplayName,
+  type PeerOnlineStatus,
+  type RecentPeerEntry,
+} from '../shared/recent-peers';
+import {
+  formatCountdownMmSs,
+  resolveWaitingPeerName,
+} from '../shared/request-ui';
+import {
+  getChatStatusDisplay,
+  getSessionStageStatus,
+  getTransportStatusDisplay,
+} from '../shared/session-ui-status';
 import {
   buildBackgroundRgba,
   clampFloatingPanelLayout,
@@ -106,15 +124,49 @@ export function App(): React.ReactElement {
   const [metadata, setMetadata] = useState<DesktopRuntimeMetadata | null>(null);
   const [account, setAccount] = useState<AccountProfile | null>(null);
   const [snapshot, setSnapshot] = useState<PresenceStateSnapshot | null>(null);
+  const [presenceRuntime, setPresenceRuntime] = useState<PresenceRuntimeStatus>({
+    connectionState: 'connecting',
+    serverConfirmedOnline: false,
+    lastConfirmedAt: null,
+    consecutiveFailures: 0,
+    snapshot: null,
+  });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
 
-  // Copy Friend Code feedback
+  // Copy Friend Code feedback & transient bottom-center toast
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
+  const [toastState, setToastState] = useState<{
+    message: string;
+    variant: 'info' | 'error';
+  } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
-  // Enter Friend Code input
+  // Home Connection Input & Request Modals
   const [enteredFriendCode, setEnteredFriendCode] = useState<string>('');
+  const [inviteDialogOpen, setInviteDialogOpen] = useState<boolean>(false);
+  const [inviteTargetCode, setInviteTargetCode] = useState<string>('');
+  const [inviteHostMedia, setInviteHostMedia] = useState<HostMediaSelection>({
+    screenVideo: true,
+    microphoneAudio: false,
+    deviceAudio: false,
+  });
+  const [requestOutcomeModal, setRequestOutcomeModal] = useState<{
+    kind: 'offline' | 'expired';
+    friendCode: string;
+    intent: InviteIntent;
+    hostMediaSelection?: HostMediaSelection;
+    inviteId?: string;
+  } | null>(null);
+
+  // Settings Modal Draft State & Focus Management
+  const [settingsDraftName, setSettingsDraftName] = useState<string>('');
+  const [settingsDraftEmail, setSettingsDraftEmail] = useState<string>('');
+  const [settingsDraftPhone, setSettingsDraftPhone] = useState<string>('');
+  const [settingsDraftTheme, setSettingsDraftTheme] = useState<ThemeMode>('dark');
+  const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const settingsModalRef = useRef<HTMLDivElement | null>(null);
 
   // Pre-Accept Media Controls chosen independently by User A (Both audio options default OFF)
   const [preAcceptMedia, setPreAcceptMedia] = useState<HostMediaSelection>({
@@ -128,6 +180,7 @@ export function App(): React.ReactElement {
     ShareableSourceDescriptor[]
   >([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [isStartingShare, setIsStartingShare] = useState<boolean>(false);
   const [playWasapiTestTone] = useState<boolean>(false);
 
   // On-device first-launch profile & anonymous device registration state
@@ -200,6 +253,31 @@ export function App(): React.ReactElement {
   const [floatingChatOpen, setFloatingChatOpen] = useState<boolean>(false);
   const [floatingSettingsOpen, setFloatingSettingsOpen] =
     useState<boolean>(false);
+
+  // Window Controls & Request Lifecycle State
+  const [isWindowMaximized, setIsWindowMaximized] = useState<boolean>(false);
+  const [recentViewMode, setRecentViewMode] = useState<'grid' | 'list'>('grid');
+  const [submittingRequest, setSubmittingRequest] = useState<boolean>(false);
+  const [cancellingInviteId, setCancellingInviteId] = useState<string | null>(
+    null
+  );
+  const [dismissedExpiredInviteIds, setDismissedExpiredInviteIds] = useState<
+    Record<string, true>
+  >({});
+  const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
+  const snapshotEpochRef = useRef<number>(0);
+
+  // External Invitation Copy Feedback
+  const [copiedInvitation, setCopiedInvitation] = useState<boolean>(false);
+
+  // Unified Recent Sessions + Favorites + Server Presence Dots
+  const [recentPeers, setRecentPeers] = useState<RecentPeerEntry[]>([]);
+  const [peerOnlineMap, setPeerOnlineMap] = useState<
+    Record<string, PeerOnlineStatus>
+  >({});
+  const [openPeerMenuCode, setOpenPeerMenuCode] = useState<string | null>(null);
+  const [renamingPeerCode, setRenamingPeerCode] = useState<string | null>(null);
+  const [renameAliasInput, setRenameAliasInput] = useState<string>('');
   const [panelAppearance, setPanelAppearance] =
     useState<FloatingPanelAppearance>(() => {
       try {
@@ -253,6 +331,8 @@ export function App(): React.ReactElement {
     setPendingImageByteLength(0);
     setChatAttachmentError(null);
     setInMemoryImagesByMsgId({});
+    setSelectedSourceId(null);
+    setIsStartingShare(false);
   };
 
   // Prototype drawer state
@@ -281,23 +361,40 @@ export function App(): React.ReactElement {
 
   useEffect(() => {
     let mounted = true;
+
+    // Resolve fast local state immediately so the shell renders without waiting on network calls.
     Promise.all([
       window.elmDesktop.getRuntimeMetadata(),
-      window.elmDesktop.getDeviceSetupState(),
-      window.elmDesktop.getStoredAuthSession(),
       window.elmDesktop.getVolatileSessionUiState(),
       window.elmDesktop.getTaskbarDwmTelemetry().catch(() => null),
       window.elmDesktop.getThemeState().catch(() => null),
+      window.elmDesktop.getRecentPeers().catch(() => [] as RecentPeerEntry[]),
+      window.elmDesktop.isWindowMaximized().catch(() => false),
     ])
-      .then(([meta, setupRes, storedRes, volatileState, dwm, initialTheme]) => {
+      .then(([meta, volatileState, dwm, initialTheme, peers, maximized]) => {
         if (!mounted) return;
         setMetadata(meta);
         setVolatileChatState(volatileState);
+        setRecentPeers(Array.isArray(peers) ? peers : []);
+        setIsWindowMaximized(Boolean(maximized));
         if (dwm) setDwmTelemetry(dwm);
         if (initialTheme) {
           setThemeState(initialTheme);
           applyThemeToDom(initialTheme.mode);
         }
+      })
+      .catch((err: unknown) => {
+        if (mounted) {
+          setErrorMessage(err instanceof Error ? err.message : String(err));
+        }
+      });
+
+    // Hydrate registration & server-confirmed presence sequentially (single-flight in main)
+    // without blocking initial render or racing GET /presence/state against POST /presence/connect.
+    (async () => {
+      try {
+        const setupRes = await window.elmDesktop.getDeviceSetupState();
+        if (!mounted) return;
         if (setupRes.ok && setupRes.data) {
           setDeviceSetupState(setupRes.data);
           if (setupRes.data.localProfile) {
@@ -309,16 +406,40 @@ export function App(): React.ReactElement {
             setAccount(setupRes.data.registeredAccount);
           }
         }
+        const [storedRes, runtimeRes] = await Promise.all([
+          window.elmDesktop.getStoredAuthSession(),
+          window.elmDesktop.getPresenceRuntimeStatus(),
+        ]);
+        if (!mounted) return;
+        setPresenceRuntime(runtimeRes);
         if (storedRes.ok && storedRes.data) {
           setAccount(storedRes.data.account);
           setSnapshot(storedRes.data.snapshot);
+        } else if (runtimeRes.snapshot) {
+          setSnapshot(runtimeRes.snapshot);
         }
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         if (mounted) {
           setErrorMessage(err instanceof Error ? err.message : String(err));
         }
-      });
+      }
+    })();
+
+    const unsubPresence = window.elmDesktop.onPresenceStatusUpdated(
+      (nextRuntime) => {
+        if (!mounted) return;
+        setPresenceRuntime(nextRuntime);
+        if (nextRuntime.snapshot) {
+          setSnapshot(nextRuntime.snapshot);
+        }
+      }
+    );
+
+    const handleNetworkChange = () => {
+      void window.elmDesktop.triggerPresenceReconnect();
+    };
+    window.addEventListener('online', handleNetworkChange);
+    window.addEventListener('offline', handleNetworkChange);
 
     const unsubVolatile = window.elmDesktop.onVolatileSessionUiStateUpdated(
       (nextState) => {
@@ -335,10 +456,22 @@ export function App(): React.ReactElement {
       }
     });
 
+    const unsubMaximized = window.elmDesktop.onWindowMaximizedChanged(
+      (maximized) => {
+        if (mounted) {
+          setIsWindowMaximized(maximized);
+        }
+      }
+    );
+
     return () => {
       mounted = false;
+      unsubPresence();
+      window.removeEventListener('online', handleNetworkChange);
+      window.removeEventListener('offline', handleNetworkChange);
       unsubVolatile();
       unsubTheme();
+      unsubMaximized();
     };
   }, []);
 
@@ -350,34 +483,160 @@ export function App(): React.ReactElement {
     applyThemeToDom(updated.mode);
   };
 
-  // Background remote presence/invite/session polling in Main Window for real registered devices
+  const applyAuthoritativeSnapshot = (nextSnapshot: PresenceStateSnapshot) => {
+    snapshotEpochRef.current += 1;
+    setSnapshot(nextSnapshot);
+  };
+
+  // Background remote invite/session state polling while server-confirmed online
+  // (offline/reconnecting backoff is driven by the main-process presence heartbeat loop)
   useEffect(() => {
     if (
       !metadata ||
       metadata.windowRole !== 'main' ||
       !account ||
-      account.provider === 'test-double'
+      account.provider === 'test-double' ||
+      presenceRuntime.connectionState !== 'online'
     ) {
       return;
     }
 
     let cancelled = false;
     const poll = async () => {
+      const epoch = snapshotEpochRef.current;
       const res = await window.elmDesktop.getPresenceSnapshot();
-      if (!cancelled && res.ok && res.data) {
+      if (!cancelled && epoch === snapshotEpochRef.current && res.ok && res.data) {
         setSnapshot(res.data.snapshot);
       }
     };
 
     const timer = setInterval(() => {
       void poll();
-    }, 1500);
+    }, 2000);
 
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [metadata?.windowRole, account?.accountId, account?.provider]);
+  }, [
+    metadata?.windowRole,
+    account?.accountId,
+    account?.provider,
+    presenceRuntime.connectionState,
+  ]);
+
+  // Countdown & expiry check for outgoing connection request
+  const pendingOutgoingId = snapshot?.outgoingInvite?.inviteId ?? null;
+  const pendingOutgoingExpiresAt = snapshot?.outgoingInvite?.expiresAt ?? null;
+  useEffect(() => {
+    if (!pendingOutgoingId || !pendingOutgoingExpiresAt) return;
+    setNowTickMs(Date.now());
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setNowTickMs(now);
+      if (now >= Date.parse(pendingOutgoingExpiresAt)) {
+        const epoch = snapshotEpochRef.current;
+        void window.elmDesktop.getPresenceSnapshot().then((res) => {
+          if (epoch === snapshotEpochRef.current && res.ok && res.data) {
+            setSnapshot(res.data.snapshot);
+          }
+        });
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [pendingOutgoingId, pendingOutgoingExpiresAt]);
+
+  // Surface Request Expired dialog when server marks latest outgoing invite expired
+  const expiredOutgoingInvite = snapshot?.recentExpiredOutgoingInvite ?? null;
+  useEffect(() => {
+    if (!expiredOutgoingInvite) return;
+    if (dismissedExpiredInviteIds[expiredOutgoingInvite.inviteId]) return;
+    setRequestOutcomeModal((prev) => {
+      if (prev?.inviteId === expiredOutgoingInvite.inviteId) return prev;
+      return {
+        kind: 'expired',
+        friendCode: expiredOutgoingInvite.targetFriendCode,
+        intent: expiredOutgoingInvite.intent,
+        hostMediaSelection: expiredOutgoingInvite.hostMediaSelection,
+        inviteId: expiredOutgoingInvite.inviteId,
+      };
+    });
+  }, [expiredOutgoingInvite?.inviteId, dismissedExpiredInviteIds]);
+
+  // Poll server-confirmed online status for Recent Sessions cards while Home screen is visible
+  const recentPeerCodesKey = recentPeers.map((p) => p.friendCode).join(',');
+  const isHomeScreenVisible = !snapshot?.activeSession;
+  useEffect(() => {
+    if (
+      !metadata ||
+      metadata.windowRole !== 'main' ||
+      !account ||
+      recentPeers.length === 0
+    ) {
+      return;
+    }
+
+    const codes = recentPeers.map((p) => p.friendCode);
+    const setAllUnknown = () => {
+      const unknown: Record<string, PeerOnlineStatus> = {};
+      for (const c of codes) {
+        unknown[c] = 'unknown';
+      }
+      setPeerOnlineMap(unknown);
+    };
+
+    // Never retain stale green dots when local device is not confirmed online
+    if (presenceRuntime.connectionState !== 'online') {
+      setAllUnknown();
+      return;
+    }
+
+    if (!isHomeScreenVisible) {
+      return;
+    }
+
+    let cancelled = false;
+    const refreshPeerPresence = async () => {
+      if (document.visibilityState !== 'visible') {
+        return;
+      }
+      const res = await window.elmDesktop.lookupDevicePresence(codes);
+      if (cancelled) return;
+      if (res.ok && res.data) {
+        const next: Record<string, PeerOnlineStatus> = {};
+        for (const c of codes) {
+          next[c] = res.data.statuses[c] ? 'online' : 'offline';
+        }
+        setPeerOnlineMap(next);
+      } else {
+        setAllUnknown();
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshPeerPresence();
+      }
+    };
+
+    void refreshPeerPresence();
+    const timer = setInterval(() => {
+      void refreshPeerPresence();
+    }, 7000);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [
+    metadata?.windowRole,
+    account?.accountId,
+    recentPeerCodesKey,
+    isHomeScreenVisible,
+    presenceRuntime.connectionState,
+  ]);
 
   // Manage ApprovedWebRtcSessionController lifecycle in Main Window when an approved session starts/ends
   const activeSessionId = snapshot?.activeSession?.sessionId ?? null;
@@ -420,6 +679,44 @@ export function App(): React.ReactElement {
     const localRole: 'host' | 'guest' =
       account?.accountId === currentSession.guestAccountId ? 'guest' : 'host';
 
+    const peerCode =
+      localRole === 'host'
+        ? currentSession.guestFriendCode
+        : currentSession.hostFriendCode;
+    const rawPeerName =
+      localRole === 'host'
+        ? currentSession.guestDisplayName
+        : currentSession.hostDisplayName;
+    const isGenericPeerName =
+      !rawPeerName ||
+      ['elm device', 'windows desktop', 'unknown device'].includes(
+        rawPeerName.trim().toLowerCase()
+      );
+    setRequestOutcomeModal(null);
+    setInviteDialogOpen(false);
+    setShowSettingsPanel(false);
+    void window.elmDesktop
+      .recordConnectedPeer({
+        friendCode: peerCode,
+        defaultAlias: isGenericPeerName ? undefined : rawPeerName,
+        connectedAt: currentSession.createdAt,
+      })
+      .then(setRecentPeers);
+
+    const localContactCard = buildOutgoingPeerContactCard(
+      deviceSetupState?.localProfile ??
+        (account
+          ? {
+              name: account.displayName,
+              email: '',
+              phone: '',
+              shareEmailWithPeers: false,
+              sharePhoneWithPeers: false,
+              updatedAt: '',
+            }
+          : null)
+    );
+
     const controller = new ApprovedWebRtcSessionController(
       currentSession,
       (nextSnap) => {
@@ -437,17 +734,54 @@ export function App(): React.ReactElement {
         mode: isRemoteSession ? 'remote' : 'loopback',
         localRole,
         onGuestViewerCleared: clearGuestMediaElements,
+        localContactCard,
+        onPeerContactReceived: (contact) => {
+          void window.elmDesktop
+            .updateRecentPeerContact({
+              friendCode: peerCode,
+              peerName: contact.name,
+              email: contact.email,
+              phone: contact.phone,
+              connectedAt: currentSession.createdAt,
+            })
+            .then(setRecentPeers);
+        },
       }
     );
 
     webrtcControllerRef.current = controller;
+    (
+      window as unknown as {
+        __elmGetLiveWebRtcProbe?: () => Promise<Record<string, unknown> | null>;
+      }
+    ).__elmGetLiveWebRtcProbe = async () => {
+      const ctrl = webrtcControllerRef.current;
+      if (!ctrl) return null;
+      const snap = ctrl.getSnapshot();
+      const diag = await ctrl.sampleReadabilityDiagnostics();
+      return {
+        sessionId: snap.sessionId,
+        localRole,
+        connectionState: snap.connectionState,
+        iceConnectionState: snap.iceConnectionState,
+        dataChannelState: snap.dataChannelState,
+        sharingStartedByHost: snap.sharingStartedByHost,
+        guestVideoTracksCount: snap.guestVideoTracksCount,
+        guestAudioTracksCount: snap.guestAudioTracksCount,
+        messagesCount: snap.messages.length,
+        imageAttachmentsCount: Object.keys(snap.imageAttachmentsByMessageId).length,
+        diagnostics: diag,
+      };
+    };
 
     // Automatically load shareable sources so Host A can pick one before clicking Start Sharing
     void window.elmDesktop.listShareableSources().then((sources) => {
       setShareableSources(sources);
-      if (sources.length > 0 && !selectedSourceId) {
-        setSelectedSourceId(sources[0].id);
-      }
+      setSelectedSourceId((prev) => {
+        if (sources.length === 0) return null;
+        if (prev && sources.some((s) => s.id === prev)) return prev;
+        return sources[0].id;
+      });
     });
 
     // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance
@@ -802,6 +1136,184 @@ export function App(): React.ReactElement {
     setStatusMessage(null);
   };
 
+  const showToast = (
+    message: string,
+    variant: 'info' | 'error' = 'info'
+  ) => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    setToastState({ message, variant });
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setToastState(null);
+    }, variant === 'error' ? 3000 : 2200);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!openPeerMenuCode) return;
+    const activeCode = openPeerMenuCode;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        setOpenPeerMenuCode(null);
+        return;
+      }
+      const insideMenuOrTrigger = target.closest(
+        `[data-peer-menu="${activeCode}"], [data-peer-menu-trigger="${activeCode}"]`
+      );
+      if (!insideMenuOrTrigger) {
+        setOpenPeerMenuCode(null);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setOpenPeerMenuCode(null);
+        requestAnimationFrame(() => {
+          const trigger = document.querySelector<HTMLButtonElement>(
+            `[data-peer-menu-trigger="${activeCode}"]`
+          );
+          trigger?.focus();
+        });
+      }
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [openPeerMenuCode]);
+
+  const openSettingsModal = () => {
+    const saved = deviceSetupState?.localProfile;
+    setSettingsDraftName(saved?.name ?? setupNameInput ?? account?.displayName ?? '');
+    setSettingsDraftEmail(saved?.email ?? setupEmailInput ?? '');
+    setSettingsDraftPhone(saved?.phone ?? setupPhoneInput ?? '');
+    setSettingsDraftTheme(themeState.mode);
+    setShowSettingsPanel(true);
+  };
+
+  const closeSettingsModal = (restoreFocus: boolean = true) => {
+    applyThemeToDom(themeState.mode);
+    const saved = deviceSetupState?.localProfile;
+    setSettingsDraftName(saved?.name ?? setupNameInput ?? '');
+    setSettingsDraftEmail(saved?.email ?? setupEmailInput ?? '');
+    setSettingsDraftPhone(saved?.phone ?? setupPhoneInput ?? '');
+    setSettingsDraftTheme(themeState.mode);
+    setShowSettingsPanel(false);
+    if (restoreFocus) {
+      requestAnimationFrame(() => {
+        settingsButtonRef.current?.focus();
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!showSettingsPanel) return;
+    const modalEl = settingsModalRef.current;
+    if (!modalEl) return;
+
+    const getFocusable = (): HTMLElement[] =>
+      Array.from(
+        modalEl.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      );
+
+    requestAnimationFrame(() => {
+      const nameInput = modalEl.querySelector<HTMLElement>('#settings-name');
+      (nameInput ?? getFocusable()[0])?.focus();
+    });
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeSettingsModal(true);
+        return;
+      }
+      if (e.key === 'Tab') {
+        const focusables = getFocusable();
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showSettingsPanel, themeState.mode]);
+
+  const handleSaveSettingsModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    clearAlerts();
+    if (!settingsDraftName.trim()) {
+      setErrorCode('INVALID_REQUEST');
+      setErrorMessage('Name is required to set up this device.');
+      return;
+    }
+    setSavingProfile(true);
+    try {
+      const res = await window.elmDesktop.saveLocalProfile({
+        name: settingsDraftName,
+        email: settingsDraftEmail,
+        phone: settingsDraftPhone,
+      });
+      if (!res.ok || !res.data) {
+        setErrorCode(res.errorCode ?? 'INVALID_REQUEST');
+        setErrorMessage(res.errorMessage ?? 'Could not save local profile.');
+        return;
+      }
+      setDeviceSetupState(res.data);
+      setSetupNameInput(settingsDraftName.trim());
+      setSetupEmailInput(settingsDraftEmail.trim());
+      setSetupPhoneInput(settingsDraftPhone.trim());
+      if (webrtcControllerRef.current && res.data.localProfile) {
+        webrtcControllerRef.current.sendPeerContactCard(
+          buildOutgoingPeerContactCard(res.data.localProfile)
+        );
+      }
+      if (res.data.registeredAccount) {
+        setAccount(res.data.registeredAccount);
+        const stored = await window.elmDesktop.getStoredAuthSession();
+        if (stored.ok && stored.data) {
+          setAccount(stored.data.account);
+          applyAuthoritativeSnapshot(stored.data.snapshot);
+        }
+      }
+      if (settingsDraftTheme !== themeState.mode) {
+        const updatedTheme = await window.elmDesktop.setThemeMode(settingsDraftTheme);
+        setThemeState(updatedTheme);
+        applyThemeToDom(updatedTheme.mode);
+      }
+      setShowSettingsPanel(false);
+      requestAnimationFrame(() => {
+        settingsButtonRef.current?.focus();
+      });
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
   const handleSaveLocalProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     clearAlerts();
@@ -825,10 +1337,16 @@ export function App(): React.ReactElement {
       setDeviceSetupState(res.data);
       if (res.data.registeredAccount) {
         setAccount(res.data.registeredAccount);
-        const stored = await window.elmDesktop.getStoredAuthSession();
+        const [stored, runtime] = await Promise.all([
+          window.elmDesktop.getStoredAuthSession(),
+          window.elmDesktop.getPresenceRuntimeStatus(),
+        ]);
+        setPresenceRuntime(runtime);
         if (stored.ok && stored.data) {
           setAccount(stored.data.account);
           setSnapshot(stored.data.snapshot);
+        } else if (runtime.snapshot) {
+          setSnapshot(runtime.snapshot);
         }
       }
       setShowSettingsPanel(false);
@@ -846,10 +1364,16 @@ export function App(): React.ReactElement {
         setDeviceSetupState(res.data);
         if (res.data.registeredAccount) {
           setAccount(res.data.registeredAccount);
-          const stored = await window.elmDesktop.getStoredAuthSession();
+          const [stored, runtime] = await Promise.all([
+            window.elmDesktop.getStoredAuthSession(),
+            window.elmDesktop.getPresenceRuntimeStatus(),
+          ]);
+          setPresenceRuntime(runtime);
           if (stored.ok && stored.data) {
             setAccount(stored.data.account);
             setSnapshot(stored.data.snapshot);
+          } else if (runtime.snapshot) {
+            setSnapshot(runtime.snapshot);
           }
         }
       }
@@ -951,35 +1475,101 @@ export function App(): React.ReactElement {
     await window.elmDesktop.copyTextToClipboard(account.friendCode);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
+    showToast(`Copied ${account.friendCode} to clipboard.`);
   };
 
-  const handleTogglePresence = async (nextOnline: boolean) => {
+  const submitInviteRequest = async (params: {
+    friendCode: string;
+    intent: InviteIntent;
+    hostMediaSelection?: HostMediaSelection;
+  }) => {
+    if (submittingRequest) return;
     clearAlerts();
-    const res = await window.elmDesktop.setPresenceOnline(nextOnline);
-    if (res.ok && res.data) {
-      setSnapshot(res.data.snapshot);
-      setStatusMessage(
-        nextOnline
-          ? 'Presence is now ONLINE (ready to receive invites).'
-          : 'Presence is now OFFLINE (incoming invites will be rejected as TARGET_OFFLINE).'
-      );
+    setRequestOutcomeModal(null);
+    setSubmittingRequest(true);
+    try {
+      const res = await window.elmDesktop.sendFriendCodeInvite({
+        friendCode: params.friendCode,
+        intent: params.intent,
+        hostMediaSelection: params.hostMediaSelection,
+      });
+      if (!res.ok || !res.data) {
+        if (res.errorCode === 'SELF_INVITE_NOT_ALLOWED') {
+          showToast('You cannot connect to your code.', 'error');
+          return;
+        }
+        if (res.errorCode === 'TARGET_OFFLINE') {
+          setRequestOutcomeModal({
+            kind: 'offline',
+            friendCode: params.friendCode.trim().toUpperCase(),
+            intent: params.intent,
+            hostMediaSelection: params.hostMediaSelection,
+          });
+          return;
+        }
+        setErrorCode(res.errorCode ?? 'INVITE_ERROR');
+        setErrorMessage(res.errorMessage ?? 'Could not send invite.');
+        return;
+      }
+      applyAuthoritativeSnapshot(res.data.snapshot);
+      if (params.intent === 'invite') {
+        setInviteDialogOpen(false);
+        setInviteTargetCode('');
+      } else {
+        setEnteredFriendCode('');
+      }
+    } finally {
+      setSubmittingRequest(false);
     }
   };
 
   const handleSendInvite = async (e: React.FormEvent) => {
     e.preventDefault();
+    await submitInviteRequest({
+      friendCode: enteredFriendCode,
+      intent: 'connect',
+    });
+  };
+
+  const handleSendReverseInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await submitInviteRequest({
+      friendCode: inviteTargetCode,
+      intent: 'invite',
+      hostMediaSelection: inviteHostMedia,
+    });
+  };
+
+  const handleCancelOutgoingInvite = async (inviteId: string) => {
+    if (cancellingInviteId) return;
     clearAlerts();
-    const res = await window.elmDesktop.sendFriendCodeInvite(enteredFriendCode);
-    if (!res.ok || !res.data) {
-      setErrorCode(res.errorCode ?? 'INVITE_ERROR');
-      setErrorMessage(res.errorMessage ?? 'Could not send invite.');
-      return;
+    setCancellingInviteId(inviteId);
+    try {
+      const res = await window.elmDesktop.cancelOutgoingInvite(inviteId);
+      if (!res.ok || !res.data) {
+        setErrorCode(res.errorCode ?? 'CANCEL_ERROR');
+        setErrorMessage(res.errorMessage ?? 'Could not cancel request.');
+        const epoch = snapshotEpochRef.current;
+        const fresh = await window.elmDesktop.getPresenceSnapshot();
+        if (epoch === snapshotEpochRef.current && fresh.ok && fresh.data) {
+          applyAuthoritativeSnapshot(fresh.data.snapshot);
+        }
+        return;
+      }
+      applyAuthoritativeSnapshot(res.data.snapshot);
+    } finally {
+      setCancellingInviteId(null);
     }
-    setSnapshot(res.data.snapshot);
-    setStatusMessage(
-      `Invite sent to ${res.data.invite.targetDisplayName} (${res.data.invite.targetFriendCode}). Waiting for owner to Accept or Decline.`
+  };
+
+  const handleCopyInvitationSnippet = async () => {
+    if (!account) return;
+    await window.elmDesktop.copyTextToClipboard(
+      `Connect to my Elm-AnyDesk device using Device Code: ${account.friendCode}`
     );
-    setEnteredFriendCode('');
+    setCopiedInvitation(true);
+    setTimeout(() => setCopiedInvitation(false), 2000);
+    showToast('Copied invitation to clipboard.');
   };
 
   const handleRespondToInvite = async (
@@ -997,10 +1587,10 @@ export function App(): React.ReactElement {
       setErrorMessage(res.errorMessage ?? 'Could not respond to invite.');
       return;
     }
-    setSnapshot(res.data.snapshot);
+    applyAuthoritativeSnapshot(res.data.snapshot);
     if (action === 'accept' && res.data.session) {
       setStatusMessage(
-        `Accepted invite from ${invite.requesterDisplayName}. Reliable DataChannel chat connected. Media will not start until Host A clicks "Start Sharing".`
+        `Accepted invite from ${invite.requesterDisplayName}. Connecting peer session. Media will not start until you click "Start Sharing".`
       );
     } else {
       setStatusMessage(
@@ -1040,7 +1630,7 @@ export function App(): React.ReactElement {
       callerAccountId: account?.accountId,
     });
     if (res.ok && res.data) {
-      setSnapshot(res.data.snapshot);
+      applyAuthoritativeSnapshot(res.data.snapshot);
     }
     setStatusMessage(
       'Session ended via unified idempotent teardown path: A\'s tracks stopped, peer connections & DataChannels closed, B\'s viewer cleared, and session permissions invalidated. Send a fresh invite to connect again.'
@@ -1050,22 +1640,49 @@ export function App(): React.ReactElement {
   const handleRefreshSources = async () => {
     const sources = await window.elmDesktop.listShareableSources();
     setShareableSources(sources);
-    if (sources.length > 0 && !selectedSourceId) {
-      setSelectedSourceId(sources[0].id);
-    }
+    setSelectedSourceId((prev) => {
+      if (sources.length === 0) return null;
+      if (prev && sources.some((s) => s.id === prev)) return prev;
+      return sources[0].id;
+    });
   };
 
   const handleExplicitStartSharing = async () => {
     clearAlerts();
     const ctrl = webrtcControllerRef.current;
     if (!ctrl) return;
-    await ctrl.startHostSharing({
-      selectedSourceId,
-      playWasapiTestTone,
-    });
-    setStatusMessage(
-      'Host A executed explicit "Start Sharing". Only checked media sources were captured and attached as separate tracks.'
-    );
+    setIsStartingShare(true);
+    try {
+      const nextSnap = await ctrl.startHostSharing({
+        selectedSourceId,
+        playWasapiTestTone,
+      });
+      const failedSource = Object.values(nextSnap.hostMediaState).find(
+        (s) =>
+          s.approved &&
+          !s.active &&
+          (s.status === 'permission_denied' ||
+            s.status === 'unsupported' ||
+            s.status === 'source_disappeared')
+      );
+      if (failedSource) {
+        setErrorCode(failedSource.status.toUpperCase());
+        setErrorMessage(failedSource.message);
+        return;
+      }
+      if (nextSnap.hostMediaState.screenVideo.active) {
+        setStatusMessage(nextSnap.hostMediaState.screenVideo.message);
+      } else {
+        setStatusMessage('Approved media sharing started.');
+      }
+    } catch (err) {
+      setErrorCode('CAPTURE_ERROR');
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Failed to start screen sharing.'
+      );
+    } finally {
+      setIsStartingShare(false);
+    }
   };
 
   const handleStopIndividualSource = async (source: MediaSourceKind) => {
@@ -1447,47 +2064,220 @@ export function App(): React.ReactElement {
   const isLocalHost =
     Boolean(snapshot?.activeSession) &&
     snapshot?.activeSession?.hostAccountId === account?.accountId;
+  const transportStatus = webrtcSnap
+    ? getTransportStatusDisplay(webrtcSnap)
+    : null;
+  const chatStatus = webrtcSnap ? getChatStatusDisplay(webrtcSnap) : null;
+  const stageStatus = webrtcSnap
+    ? getSessionStageStatus({
+        isLocalHost,
+        isStartingShare,
+        webrtcSnap,
+      })
+    : null;
+
+  const isSettingsDirty =
+    settingsDraftName.trim() !==
+      (deviceSetupState?.localProfile?.name ?? setupNameInput).trim() ||
+    settingsDraftEmail.trim() !==
+      (deviceSetupState?.localProfile?.email ?? setupEmailInput).trim() ||
+    settingsDraftPhone.trim() !==
+      (deviceSetupState?.localProfile?.phone ?? setupPhoneInput).trim() ||
+    settingsDraftTheme !== themeState.mode;
 
   return (
     <main className="app-shell">
-      <header className="top-bar">
-        <div className="top-bar-left">
-          <div className="brand-lockup">
-            <svg
-              className="brand-mark"
-              width="24"
-              height="24"
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <rect width="24" height="24" rx="4" fill="var(--accent-action-bg)" />
-              <rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="#FFFFFF" strokeWidth="1.75" />
-              <rect x="8" y="8" width="8" height="8" rx="1" fill="#FFFFFF" />
-            </svg>
-            <h1>Elm-AnyDesk</h1>
-            <span
-              className={`presence-pill ${
-                snapshot?.activeSession
-                  ? 'online'
-                  : snapshot?.online
-                  ? 'online'
-                  : 'offline'
-              }`}
-            >
-              {snapshot?.activeSession
-                ? 'IN SESSION'
-                : snapshot?.online
-                ? 'READY'
-                : 'OFFLINE'}
-            </span>
-          </div>
+      {/* SIMPLE CUSTOM ELECTRON TITLE BAR (NO SESSION TABS) */}
+      <header className="top-bar chrome-titlebar" data-testid="chrome-titlebar">
+        <div className="titlebar-brand">
+          <svg
+            className="brand-mark"
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <rect width="24" height="24" rx="4" fill="var(--accent-action-bg)" />
+            <rect
+              x="4"
+              y="4"
+              width="16"
+              height="16"
+              rx="2"
+              fill="none"
+              stroke="#FFFFFF"
+              strokeWidth="1.75"
+            />
+            <rect x="8" y="8" width="8" height="8" rx="1" fill="#FFFFFF" />
+          </svg>
+          <h1>Elm-AnyDesk</h1>
         </div>
-        <div className="top-bar-right">
+
+        <div className="window-controls no-drag" aria-label="Window controls">
+          <button
+            type="button"
+            data-testid="win-minimize-button"
+            className="win-control-btn no-drag"
+            aria-label="Minimize window"
+            title="Minimize"
+            onClick={() => void window.elmDesktop.minimizeWindow()}
+          >
+            <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
+              <line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" strokeWidth="1.4" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            data-testid="win-maximize-button"
+            className="win-control-btn no-drag"
+            aria-label={isWindowMaximized ? 'Restore window' : 'Maximize window'}
+            title={isWindowMaximized ? 'Restore' : 'Maximize'}
+            onClick={() =>
+              void window.elmDesktop
+                .toggleMaximizeWindow()
+                .then((res) => setIsWindowMaximized(res.maximized))
+            }
+          >
+            {isWindowMaximized ? (
+              <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
+                <rect x="3.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.2" />
+                <rect x="1.5" y="3.5" width="7" height="7" fill="var(--surface-elevated)" stroke="currentColor" strokeWidth="1.2" />
+              </svg>
+            ) : (
+              <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
+                <rect x="2" y="2" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.3" />
+              </svg>
+            )}
+          </button>
+          <button
+            type="button"
+            data-testid="win-close-button"
+            className="win-control-btn win-control-close no-drag"
+            aria-label="Close window"
+            title="Close"
+            onClick={() => void window.elmDesktop.closeWindow()}
+          >
+            <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
+              <line x1="2.2" y1="2.2" x2="9.8" y2="9.8" stroke="currentColor" strokeWidth="1.4" />
+              <line x1="9.8" y1="2.2" x2="2.2" y2="9.8" stroke="currentColor" strokeWidth="1.4" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      {/* COMPACT STATUS, DEVICE CODE & CONTROLS BAR */}
+      <section className="device-header-strip" data-testid="device-header-strip">
+        <div className="device-header-left">
+          {(() => {
+            const isConfirmedOnline =
+              Boolean(account) &&
+              presenceRuntime.connectionState === 'online' &&
+              Boolean(snapshot?.online);
+            const isConnecting =
+              deviceSetupState?.registrationStatus === 'registering' ||
+              presenceRuntime.connectionState === 'connecting';
+            const isReconnecting =
+              presenceRuntime.connectionState === 'reconnecting';
+            const pillVariant = isConfirmedOnline
+              ? 'online'
+              : isConnecting || isReconnecting
+                ? 'pending'
+                : 'offline';
+            const pillLabel = isConfirmedOnline
+              ? 'Online'
+              : isReconnecting
+                ? 'Reconnecting...'
+                : isConnecting
+                  ? 'Connecting...'
+                  : presenceRuntime.connectionState === 'unknown'
+                    ? 'Unknown'
+                    : 'Offline';
+            const pillTitle = isConfirmedOnline
+              ? 'Automatically connected to Elm signaling backend'
+              : isReconnecting
+                ? 'Connection interrupted — retrying automatically'
+                : isConnecting
+                  ? 'Connecting to Elm signaling backend...'
+                  : 'Offline — unable to reach Elm signaling backend';
+            return (
+              <div
+                role="status"
+                aria-live="polite"
+                data-testid="presence-status-pill"
+                className={`presence-pill no-drag ${pillVariant}`}
+                title={pillTitle}
+              >
+                <span className="presence-dot-inline" aria-hidden="true" />
+                <span>{pillLabel}</span>
+              </div>
+            );
+          })()}
+
+          {account?.friendCode ? (
+            <div className="device-code-inline">
+              <code
+                data-testid="friend-code-value"
+                aria-label="Your Device Code"
+                className="device-code-inline-value"
+              >
+                {account.friendCode}
+              </code>
+              <button
+                type="button"
+                data-testid="copy-friend-code-button"
+                className="small-secondary-btn"
+                onClick={handleCopyFriendCode}
+              >
+                {copiedCode ? 'Copied!' : 'Copy Code'}
+              </button>
+              <button
+                type="button"
+                data-testid="open-invite-dialog-button"
+                className="small-secondary-btn"
+                disabled={Boolean(snapshot?.activeSession)}
+                onClick={() => {
+                  setInviteTargetCode('');
+                  setInviteHostMedia({
+                    screenVideo: true,
+                    microphoneAudio: false,
+                    deviceAudio: false,
+                  });
+                  setInviteDialogOpen(true);
+                }}
+              >
+                Invite
+              </button>
+            </div>
+          ) : deviceSetupState && (deviceSetupState.profileCompleted || account) ? (
+            <div
+              className="device-code-inline offline"
+              data-testid="offline-registration-status"
+            >
+              <span className="muted">
+                {deviceSetupState.registrationMessage ||
+                  'Offline before registration: unable to assign your device code yet.'}
+              </span>
+              <button
+                type="button"
+                data-testid="retry-registration-button"
+                className="small-secondary-btn"
+                disabled={retryingRegistration}
+                onClick={() => void handleRetryRegistration()}
+              >
+                {retryingRegistration ? 'Retrying...' : 'Retry'}
+              </button>
+            </div>
+          ) : (
+            <span className="muted">Complete local profile setup to receive a Device Code.</span>
+          )}
+        </div>
+
+        <div className="device-header-actions">
           {snapshot?.activeSession && (
             <button
               type="button"
               data-testid="top-bar-disconnect-button"
-              className="danger-btn no-drag"
+              className="danger-btn"
               onClick={handleDisconnectSession}
             >
               Disconnect
@@ -1495,12 +2285,13 @@ export function App(): React.ReactElement {
           )}
           {(deviceSetupState?.profileCompleted || account) && (
             <button
+              ref={settingsButtonRef}
               type="button"
               data-testid="settings-profile-button"
-              className="small-secondary-btn no-drag"
-              onClick={() => setShowSettingsPanel((prev) => !prev)}
+              className="small-secondary-btn"
+              onClick={openSettingsModal}
             >
-              {showSettingsPanel ? 'Close Settings' : 'Settings'}
+              Settings
             </button>
           )}
           <ThemeToggleButton
@@ -1508,7 +2299,7 @@ export function App(): React.ReactElement {
             onToggle={() => void handleToggleTheme()}
           />
         </div>
-      </header>
+      </section>
 
       {errorMessage && (
         <section className="card card-error">
@@ -1543,71 +2334,150 @@ export function App(): React.ReactElement {
       )}
 
       {showSettingsPanel && (deviceSetupState?.profileCompleted || account) && (
-        <section className="card card-full" data-testid="settings-profile-card">
-          <div className="subcard-header">
-            <div>
-              <h2>Settings — My Profile</h2>
-              <p className="muted">
-                Stored only on this device. Never sent to the server.
-              </p>
-            </div>
-            <button
-              type="button"
-              className="small-secondary-btn"
-              onClick={() => setShowSettingsPanel(false)}
-            >
-              Close
-            </button>
-          </div>
-          <form className="setup-form" onSubmit={handleSaveLocalProfile}>
-            <div className="setup-field">
-              <label htmlFor="settings-name">Name *</label>
-              <input
-                id="settings-name"
-                type="text"
-                className="code-input"
-                placeholder="Your name"
-                value={setupNameInput}
-                onChange={(e) => setSetupNameInput(e.target.value)}
-                required
-                maxLength={60}
-              />
-            </div>
-            <div className="setup-field">
-              <label htmlFor="settings-email">Email (optional)</label>
-              <input
-                id="settings-email"
-                type="email"
-                className="code-input"
-                placeholder="name@example.com"
-                value={setupEmailInput}
-                onChange={(e) => setSetupEmailInput(e.target.value)}
-                maxLength={120}
-              />
-            </div>
-            <div className="setup-field">
-              <label htmlFor="settings-phone">Phone number (optional)</label>
-              <input
-                id="settings-phone"
-                type="tel"
-                className="code-input"
-                placeholder="+1 555 0100"
-                value={setupPhoneInput}
-                onChange={(e) => setSetupPhoneInput(e.target.value)}
-                maxLength={40}
-              />
-            </div>
-            <div className="actions-row">
+        <div
+          className="modal-backdrop"
+          data-testid="settings-modal-backdrop"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              closeSettingsModal(true);
+            }
+          }}
+        >
+          <div
+            ref={settingsModalRef}
+            className="settings-modal-dialog card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-modal-title"
+            data-testid="settings-profile-card"
+          >
+            <div className="settings-modal-header">
+              <div>
+                <h2 id="settings-modal-title">Settings</h2>
+                <p className="muted">
+                  Stored locally on this device only. Never uploaded to Cloudflare.
+                </p>
+              </div>
               <button
-                type="submit"
-                className="primary-btn"
-                disabled={savingProfile || !setupNameInput.trim()}
+                type="button"
+                data-testid="settings-close-x-button"
+                className="modal-close-x-btn"
+                aria-label="Close settings"
+                onClick={() => closeSettingsModal(true)}
               >
-                {savingProfile ? 'Saving...' : 'Save Profile'}
+                ×
               </button>
             </div>
-          </form>
-        </section>
+
+            <form className="setup-form" onSubmit={(e) => void handleSaveSettingsModal(e)}>
+              <div className="settings-modal-section">
+                <h3>My Profile</h3>
+                <div className="setup-field">
+                  <label htmlFor="settings-name">Name *</label>
+                  <input
+                    id="settings-name"
+                    type="text"
+                    className="code-input"
+                    placeholder="Your name"
+                    value={settingsDraftName}
+                    onChange={(e) => setSettingsDraftName(e.target.value)}
+                    required
+                    maxLength={60}
+                  />
+                </div>
+                <div className="setup-field">
+                  <label htmlFor="settings-email">Email (optional)</label>
+                  <input
+                    id="settings-email"
+                    type="email"
+                    className="code-input"
+                    placeholder="name@example.com"
+                    value={settingsDraftEmail}
+                    onChange={(e) => setSettingsDraftEmail(e.target.value)}
+                    maxLength={120}
+                  />
+                </div>
+                <div className="setup-field">
+                  <label htmlFor="settings-phone">Phone (optional)</label>
+                  <input
+                    id="settings-phone"
+                    type="tel"
+                    className="code-input"
+                    placeholder="+1 555 0100"
+                    value={settingsDraftPhone}
+                    onChange={(e) => setSettingsDraftPhone(e.target.value)}
+                    maxLength={40}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-modal-section">
+                <h3>Appearance</h3>
+                <div className="settings-theme-row">
+                  <span className="settings-theme-label">Theme</span>
+                  <div
+                    className="settings-theme-options"
+                    role="group"
+                    aria-label="Theme selection"
+                  >
+                    <button
+                      type="button"
+                      data-testid="settings-theme-dark"
+                      aria-pressed={settingsDraftTheme === 'dark'}
+                      className={`small-secondary-btn ${
+                        settingsDraftTheme === 'dark' ? 'active-view-btn' : ''
+                      }`}
+                      onClick={() => {
+                        setSettingsDraftTheme('dark');
+                        applyThemeToDom('dark');
+                      }}
+                    >
+                      Dark
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="settings-theme-light"
+                      aria-pressed={settingsDraftTheme === 'light'}
+                      className={`small-secondary-btn ${
+                        settingsDraftTheme === 'light' ? 'active-view-btn' : ''
+                      }`}
+                      onClick={() => {
+                        setSettingsDraftTheme('light');
+                        applyThemeToDom('light');
+                      }}
+                    >
+                      Light
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="settings-modal-footer">
+                {isSettingsDirty && (
+                  <span className="muted settings-unsaved-note">
+                    Unsaved changes
+                  </span>
+                )}
+                <button
+                  type="button"
+                  data-testid="settings-cancel-button"
+                  className="secondary-btn"
+                  onClick={() => closeSettingsModal(true)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  data-testid="settings-save-button"
+                  className="primary-btn"
+                  disabled={savingProfile || !settingsDraftName.trim()}
+                >
+                  {savingProfile ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
 
       {!deviceSetupState ? (
@@ -1761,15 +2631,109 @@ export function App(): React.ReactElement {
                         : undefined
                     }
                   />
-                  {webrtcSnap.guestVideoTracksCount === 0 && (
+                  {isLocalHost && stageStatus && (
                     <div
-                      className="viewer-stage-empty-placeholder muted"
-                      style={{ padding: '40px 20px', textAlign: 'center' }}
+                      className="host-session-stage-card"
+                      data-testid="host-session-stage"
                     >
-                      Screen sharing is currently off. The host can select a
-                      window or display and click &quot;Start Sharing&quot; below.
+                      <div className="host-stage-status-row">
+                        <span
+                          className={`presence-pill ${
+                            stageStatus.state === 'sharing' ||
+                            stageStatus.state === 'sharing_audio'
+                              ? 'online'
+                              : stageStatus.state === 'error'
+                              ? 'offline'
+                              : 'pending'
+                          }`}
+                          data-testid="host-stage-status-pill"
+                        >
+                          {stageStatus.headline}
+                        </span>
+                        <span className="muted" style={{ fontSize: '0.8rem' }}>
+                          {transportStatus?.label} · {chatStatus?.label}
+                        </span>
+                      </div>
+                      {stageStatus.detail && (
+                        <p
+                          className={
+                            stageStatus.state === 'error'
+                              ? 'host-stage-error'
+                              : 'muted'
+                          }
+                        >
+                          {stageStatus.detail}
+                        </p>
+                      )}
+                      {stageStatus.showHostControls && (
+                        <div className="host-stage-controls">
+                          {webrtcSnap.hostMediaState.screenVideo.approved && (
+                            <div className="host-source-picker-row">
+                              <select
+                                className="code-input"
+                                aria-label="Select window or display to share"
+                                value={selectedSourceId ?? ''}
+                                onChange={(e) =>
+                                  setSelectedSourceId(e.target.value || null)
+                                }
+                              >
+                                {shareableSources.map((src) => (
+                                  <option key={src.id} value={src.id}>
+                                    [{src.surfaceType.toUpperCase()}] {src.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="secondary-btn"
+                                onClick={handleRefreshSources}
+                              >
+                                Refresh Sources
+                              </button>
+                            </div>
+                          )}
+                          <div className="actions-row">
+                            <button
+                              type="button"
+                              data-testid="host-start-sharing-button"
+                              className="primary-btn"
+                              disabled={isStartingShare}
+                              onClick={handleExplicitStartSharing}
+                            >
+                              {isStartingShare
+                                ? 'Starting...'
+                                : webrtcSnap.hostMediaState.screenVideo.active
+                                ? 'Restart Sharing'
+                                : 'Start Sharing'}
+                            </button>
+                            {anyHostMediaActive && (
+                              <button
+                                type="button"
+                                className="danger-btn"
+                                onClick={handleStopAllSharing}
+                              >
+                                Stop All Sharing
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
+                  {!isLocalHost &&
+                    webrtcSnap.guestVideoTracksCount === 0 &&
+                    stageStatus && (
+                      <div
+                        className="viewer-stage-empty-placeholder muted"
+                        data-testid="guest-session-placeholder"
+                        style={{ padding: '40px 20px', textAlign: 'center' }}
+                      >
+                        <strong style={{ display: 'block', marginBottom: '6px' }}>
+                          {stageStatus.headline}
+                        </strong>
+                        <span>{stageStatus.detail}</span>
+                      </div>
+                    )}
                   {webrtcSnap.guestVideoTracksCount > 0 &&
                     webrtcSnap.guestPlayback.videoPausedLocally && (
                       <div className="viewer-paused-overlay">
@@ -1826,8 +2790,13 @@ export function App(): React.ReactElement {
                       ⋮⋮
                     </button>
 
-                    <span className="presence-pill online">
-                      {anyHostMediaActive ? 'Connected' : 'Connected'}
+                    <span
+                      className={`presence-pill ${
+                        transportStatus?.tone ?? 'pending'
+                      }`}
+                      data-testid="floating-transport-status"
+                    >
+                      {transportStatus?.label ?? 'Connecting'}
                     </span>
 
                     <button
@@ -1903,6 +2872,13 @@ export function App(): React.ReactElement {
                         height: `${panelLayout.chatHeight}px`,
                       }}
                     >
+                      <div
+                        className="muted"
+                        data-testid="floating-chat-status"
+                        style={{ fontSize: '0.75rem' }}
+                      >
+                        {chatStatus?.label ?? 'Chat Offline'}
+                      </div>
                       <div className="floating-chat-messages">
                         {webrtcSnap.messages.length === 0 ? (
                           <div className="muted">
@@ -2297,9 +3273,16 @@ export function App(): React.ReactElement {
                         </button>
                         {optInDiagnostics && liveDiagnostics && (
                           <div className="muted" style={{ fontSize: '0.72rem' }}>
-                            Decoded: {liveDiagnostics.decodedWidth ?? 0}×
-                            {liveDiagnostics.decodedHeight ?? 0} @{' '}
-                            {liveDiagnostics.decodedFps ?? 0}fps
+                            <div>
+                              Decoded: {liveDiagnostics.decodedWidth ?? 0}×
+                              {liveDiagnostics.decodedHeight ?? 0} @{' '}
+                              {liveDiagnostics.decodedFps ?? 0}fps
+                            </div>
+                            <div>
+                              Out Frames: {liveDiagnostics.outboundFramesSent ?? 0}{' '}
+                              | In Bytes: {liveDiagnostics.inboundBytesReceived ?? 0}{' '}
+                              | Dec Frames: {liveDiagnostics.inboundFramesDecoded ?? 0}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -2313,6 +3296,7 @@ export function App(): React.ReactElement {
           {/* INCOMING REQUEST DIALOG (USER A) */}
           {snapshot && snapshot.incomingInvites.length > 0 && (() => {
             const activeInvite = snapshot.incomingInvites[0];
+            const isReverseInvite = activeInvite.intent === 'invite';
             return (
               <section
                 className="card card-full card-incoming-invite"
@@ -2346,89 +3330,100 @@ export function App(): React.ReactElement {
                   )}
                 </div>
 
-                <div className="toggle-bar">
-                  <label
-                    className={`permission-toggle-card ${
-                      preAcceptMedia.screenVideo ? 'checked' : ''
-                    }`}
-                  >
-                    <span className="checkbox-label">
-                      <input
-                        type="checkbox"
-                        autoFocus
-                        checked={preAcceptMedia.screenVideo}
-                        onChange={(e) =>
-                          setPreAcceptMedia((prev) => ({
-                            ...prev,
-                            screenVideo: e.target.checked,
-                          }))
-                        }
-                      />
-                      <span>Screen</span>
-                    </span>
-                    <span
-                      className={`presence-pill ${
-                        preAcceptMedia.screenVideo ? 'online' : 'offline'
+                {isReverseInvite ? (
+                  <div className="subcard" data-testid="incoming-viewer-notice">
+                    <p className="muted">
+                      You are invited to view{' '}
+                      <strong>{activeInvite.requesterDisplayName}</strong>&apos;s
+                      screen. Nothing is shared until the host clicks{' '}
+                      <strong>Start Sharing</strong>.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="toggle-bar">
+                    <label
+                      className={`permission-toggle-card ${
+                        preAcceptMedia.screenVideo ? 'checked' : ''
                       }`}
                     >
-                      {preAcceptMedia.screenVideo ? 'ON' : 'OFF'}
-                    </span>
-                  </label>
+                      <span className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          autoFocus
+                          checked={preAcceptMedia.screenVideo}
+                          onChange={(e) =>
+                            setPreAcceptMedia((prev) => ({
+                              ...prev,
+                              screenVideo: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span>Screen</span>
+                      </span>
+                      <span
+                        className={`presence-pill ${
+                          preAcceptMedia.screenVideo ? 'online' : 'offline'
+                        }`}
+                      >
+                        {preAcceptMedia.screenVideo ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
 
-                  <label
-                    className={`permission-toggle-card ${
-                      preAcceptMedia.microphoneAudio ? 'checked' : ''
-                    }`}
-                  >
-                    <span className="checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={preAcceptMedia.microphoneAudio}
-                        onChange={(e) =>
-                          setPreAcceptMedia((prev) => ({
-                            ...prev,
-                            microphoneAudio: e.target.checked,
-                          }))
-                        }
-                      />
-                      <span>Microphone</span>
-                    </span>
-                    <span
-                      className={`presence-pill ${
-                        preAcceptMedia.microphoneAudio ? 'online' : 'offline'
+                    <label
+                      className={`permission-toggle-card ${
+                        preAcceptMedia.microphoneAudio ? 'checked' : ''
                       }`}
                     >
-                      {preAcceptMedia.microphoneAudio ? 'ON' : 'OFF'}
-                    </span>
-                  </label>
+                      <span className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={preAcceptMedia.microphoneAudio}
+                          onChange={(e) =>
+                            setPreAcceptMedia((prev) => ({
+                              ...prev,
+                              microphoneAudio: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span>Microphone</span>
+                      </span>
+                      <span
+                        className={`presence-pill ${
+                          preAcceptMedia.microphoneAudio ? 'online' : 'offline'
+                        }`}
+                      >
+                        {preAcceptMedia.microphoneAudio ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
 
-                  <label
-                    className={`permission-toggle-card ${
-                      preAcceptMedia.deviceAudio ? 'checked' : ''
-                    }`}
-                  >
-                    <span className="checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={preAcceptMedia.deviceAudio}
-                        onChange={(e) =>
-                          setPreAcceptMedia((prev) => ({
-                            ...prev,
-                            deviceAudio: e.target.checked,
-                          }))
-                        }
-                      />
-                      <span>Device Sound</span>
-                    </span>
-                    <span
-                      className={`presence-pill ${
-                        preAcceptMedia.deviceAudio ? 'online' : 'offline'
+                    <label
+                      className={`permission-toggle-card ${
+                        preAcceptMedia.deviceAudio ? 'checked' : ''
                       }`}
                     >
-                      {preAcceptMedia.deviceAudio ? 'ON' : 'OFF'}
-                    </span>
-                  </label>
-                </div>
+                      <span className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={preAcceptMedia.deviceAudio}
+                          onChange={(e) =>
+                            setPreAcceptMedia((prev) => ({
+                              ...prev,
+                              deviceAudio: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span>Device Sound</span>
+                      </span>
+                      <span
+                        className={`presence-pill ${
+                          preAcceptMedia.deviceAudio ? 'online' : 'offline'
+                        }`}
+                      >
+                        {preAcceptMedia.deviceAudio ? 'ON' : 'OFF'}
+                      </span>
+                    </label>
+                  </div>
+                )}
 
                 <div className="actions-row" style={{ marginTop: '14px' }}>
                   <button
@@ -2443,6 +3438,7 @@ export function App(): React.ReactElement {
                     type="button"
                     data-testid="incoming-accept-button"
                     className="primary-btn"
+                    autoFocus={isReverseInvite}
                     onClick={() => handleRespondToInvite(activeInvite, 'accept')}
                   >
                     Accept
@@ -2452,42 +3448,17 @@ export function App(): React.ReactElement {
             );
           })()}
 
-          {/* HOME DASHBOARD: SINGLE-ROW CONNECT + YOUR DEVICE CODE */}
+          {/* SIMPLIFIED SINGLE-WINDOW HOME INTERFACE */}
           {!snapshot?.activeSession && (
             <div className="home-stack" data-testid="home-dashboard">
               <section className="card home-connect-row">
                 <form className="connect-bar" onSubmit={handleSendInvite}>
-                  <button
-                    type="button"
-                    className={`presence-pill ${
-                      account
-                        ? snapshot?.online
-                          ? 'online'
-                          : 'offline'
-                        : 'offline'
-                    }`}
-                    disabled={!account}
-                    onClick={() =>
-                      void handleTogglePresence(!snapshot?.online)
-                    }
-                    title={
-                      account
-                        ? 'Toggle availability'
-                        : 'Registration required before going online'
-                    }
-                  >
-                    {account
-                      ? snapshot?.online
-                        ? 'Connected · Available'
-                        : 'Offline'
-                      : deviceSetupState.registrationStatus === 'registering'
-                        ? 'Setting up...'
-                        : 'Offline'}
-                  </button>
                   <input
+                    id="connect-friend-code-input"
                     type="text"
+                    data-testid="connect-friend-code-input"
                     className="code-input friend-code-input connect-bar-input"
-                    placeholder="Enter a friend's device code"
+                    placeholder="Enter a friend's device code..."
                     aria-label="Enter a friend's device code"
                     value={enteredFriendCode}
                     onChange={(e) =>
@@ -2498,64 +3469,639 @@ export function App(): React.ReactElement {
                   />
                   <button
                     type="submit"
+                    data-testid="send-connect-request-button"
                     className="primary-btn"
-                    disabled={!account || !enteredFriendCode.trim()}
+                    disabled={
+                      !account ||
+                      submittingRequest ||
+                      Boolean(snapshot?.outgoingInvite) ||
+                      !enteredFriendCode.trim()
+                    }
                   >
-                    Send Request
+                    {submittingRequest ? 'Sending...' : 'Send Request'}
                   </button>
                 </form>
 
-                {snapshot?.outgoingInvite && (
-                  <div className="subcard" style={{ marginTop: '12px' }}>
-                    <h3>Waiting for Approval</h3>
-                    <p className="muted">
-                      Request sent to{' '}
-                      <code>{snapshot.outgoingInvite.targetFriendCode}</code> (
-                      {snapshot.outgoingInvite.status})
-                    </p>
-                  </div>
-                )}
+                {snapshot?.outgoingInvite && (() => {
+                  const outgoing = snapshot.outgoingInvite;
+                  const remainingMs = outgoing.expiresAt
+                    ? Math.max(0, Date.parse(outgoing.expiresAt) - nowTickMs)
+                    : INVITE_TIMEOUT_MS;
+                  const waitingPeerName = resolveWaitingPeerName(
+                    outgoing.targetFriendCode,
+                    outgoing.targetDisplayName,
+                    recentPeers
+                  );
+                  return (
+                    <div
+                      className="subcard waiting-approval-card"
+                      data-testid="waiting-for-approval-card"
+                    >
+                      <h3>Waiting for Approval</h3>
+                      <p className="waiting-friend-line">
+                        Friend: <strong>{waitingPeerName}</strong>
+                      </p>
+                      <code className="waiting-code-line">
+                        {outgoing.targetFriendCode}
+                      </code>
+                      <p className="waiting-expiry-line muted">
+                        Expires in{' '}
+                        <strong data-testid="outgoing-invite-countdown">
+                          {formatCountdownMmSs(remainingMs)}
+                        </strong>
+                      </p>
+                      <button
+                        type="button"
+                        data-testid="cancel-outgoing-invite-button"
+                        className="danger-btn"
+                        disabled={cancellingInviteId === outgoing.inviteId}
+                        onClick={() => void handleCancelOutgoingInvite(outgoing.inviteId)}
+                      >
+                        {cancellingInviteId === outgoing.inviteId
+                          ? 'Cancelling...'
+                          : 'Cancel Request'}
+                      </button>
+                    </div>
+                  );
+                })()}
               </section>
 
-              <section className="card device-code-card">
-                <div className="subcard-header">
-                  <h2>Your Device Code</h2>
-                </div>
-                {account?.friendCode ? (
-                  <div className="friend-code-display">
-                    <code
-                      data-testid="friend-code-value"
-                      className="friend-code-value device-code-large"
-                    >
-                      {account.friendCode}
-                    </code>
+              {requestOutcomeModal && (
+                <section
+                  className="card request-outcome-card"
+                  role="alertdialog"
+                  aria-modal="true"
+                  data-testid="request-outcome-modal"
+                >
+                  <h3>
+                    {requestOutcomeModal.kind === 'offline'
+                      ? 'Friend Offline'
+                      : 'Request Expired'}
+                  </h3>
+                  {requestOutcomeModal.kind === 'offline' ? (
+                    <>
+                      <p className="muted">This desk is not available.</p>
+                      <p className="muted">
+                        Please make sure Elm-AnyDesk is running on the remote
+                        device and that it is connected to the internet.
+                      </p>
+                    </>
+                  ) : (
+                    <p className="muted">
+                      No response was received from{' '}
+                      <code>{requestOutcomeModal.friendCode}</code> before the{' '}
+                      {Math.round(INVITE_TIMEOUT_MS / 1000)}-second request
+                      timer expired.
+                    </p>
+                  )}
+                  <div className="actions-row" style={{ marginTop: '12px' }}>
                     <button
                       type="button"
-                      data-testid="copy-friend-code-button"
+                      data-testid="request-outcome-retry-button"
                       className="primary-btn"
-                      onClick={handleCopyFriendCode}
+                      disabled={submittingRequest}
+                      onClick={() => {
+                        if (requestOutcomeModal.inviteId) {
+                          const dismissedId = requestOutcomeModal.inviteId;
+                          setDismissedExpiredInviteIds((prev) => ({
+                            ...prev,
+                            [dismissedId]: true,
+                          }));
+                        }
+                        void submitInviteRequest({
+                          friendCode: requestOutcomeModal.friendCode,
+                          intent: requestOutcomeModal.intent,
+                          hostMediaSelection: requestOutcomeModal.hostMediaSelection,
+                        });
+                      }}
                     >
-                      {copiedCode ? 'Copied!' : 'Copy Code'}
+                      {submittingRequest ? 'Retrying...' : 'Retry'}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="request-outcome-close-button"
+                      className="secondary-btn"
+                      onClick={() => {
+                        if (requestOutcomeModal.inviteId) {
+                          const dismissedId = requestOutcomeModal.inviteId;
+                          setDismissedExpiredInviteIds((prev) => ({
+                            ...prev,
+                            [dismissedId]: true,
+                          }));
+                        }
+                        setRequestOutcomeModal(null);
+                      }}
+                    >
+                      Close
                     </button>
                   </div>
-                ) : (
-                  <div
-                    className="offline-setup-box"
-                    data-testid="offline-registration-status"
+                </section>
+              )}
+
+              {inviteDialogOpen && (
+                <section
+                  className="card invite-dialog-card"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="direct-invite-heading"
+                  data-testid="direct-invite-dialog"
+                >
+                  <div className="subcard-header">
+                    <div>
+                      <h2 id="direct-invite-heading">
+                        Invite a Friend to View Your Screen
+                      </h2>
+                      <p className="muted" style={{ marginTop: '4px' }}>
+                        Send a reverse screen-share invitation. Once accepted, you
+                        choose a window or display and click Start Sharing.
+                      </p>
+                    </div>
+                  </div>
+
+                  <form
+                    className="invite-dialog-form"
+                    onSubmit={handleSendReverseInvite}
                   >
+                    <div className="setup-field">
+                      <label htmlFor="invite-target-code">
+                        Friend&apos;s Device Code
+                      </label>
+                      <input
+                        id="invite-target-code"
+                        type="text"
+                        data-testid="invite-target-code-input"
+                        className="code-input friend-code-input"
+                        placeholder="ELM-XXXX-XXXX"
+                        value={inviteTargetCode}
+                        onChange={(e) =>
+                          setInviteTargetCode(e.target.value.toUpperCase())
+                        }
+                        maxLength={13}
+                        required
+                      />
+                    </div>
+
+                    <div className="toggle-bar">
+                      <label
+                        className={`permission-toggle-card ${
+                          inviteHostMedia.screenVideo ? 'checked' : ''
+                        }`}
+                      >
+                        <span className="checkbox-label">
+                          <input
+                            type="checkbox"
+                            checked={inviteHostMedia.screenVideo}
+                            onChange={(e) =>
+                              setInviteHostMedia((prev) => ({
+                                ...prev,
+                                screenVideo: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Screen</span>
+                        </span>
+                        <span
+                          className={`presence-pill ${
+                            inviteHostMedia.screenVideo ? 'online' : 'offline'
+                          }`}
+                        >
+                          {inviteHostMedia.screenVideo ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+
+                      <label
+                        className={`permission-toggle-card ${
+                          inviteHostMedia.microphoneAudio ? 'checked' : ''
+                        }`}
+                      >
+                        <span className="checkbox-label">
+                          <input
+                            type="checkbox"
+                            checked={inviteHostMedia.microphoneAudio}
+                            onChange={(e) =>
+                              setInviteHostMedia((prev) => ({
+                                ...prev,
+                                microphoneAudio: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Microphone</span>
+                        </span>
+                        <span
+                          className={`presence-pill ${
+                            inviteHostMedia.microphoneAudio ? 'online' : 'offline'
+                          }`}
+                        >
+                          {inviteHostMedia.microphoneAudio ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+
+                      <label
+                        className={`permission-toggle-card ${
+                          inviteHostMedia.deviceAudio ? 'checked' : ''
+                        }`}
+                      >
+                        <span className="checkbox-label">
+                          <input
+                            type="checkbox"
+                            checked={inviteHostMedia.deviceAudio}
+                            onChange={(e) =>
+                              setInviteHostMedia((prev) => ({
+                                ...prev,
+                                deviceAudio: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Device Sound</span>
+                        </span>
+                        <span
+                          className={`presence-pill ${
+                            inviteHostMedia.deviceAudio ? 'online' : 'offline'
+                          }`}
+                        >
+                          {inviteHostMedia.deviceAudio ? 'ON' : 'OFF'}
+                        </span>
+                      </label>
+                    </div>
+
+                    <div className="actions-row" style={{ marginTop: '12px' }}>
+                      <button
+                        type="submit"
+                        data-testid="send-direct-invite-button"
+                        className="primary-btn"
+                        disabled={
+                          submittingRequest ||
+                          !inviteTargetCode.trim() ||
+                          Boolean(snapshot?.outgoingInvite)
+                        }
+                      >
+                        {submittingRequest ? 'Sending...' : 'Send Invite'}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="copy-invitation-snippet-button"
+                        className="secondary-btn"
+                        disabled={!account}
+                        onClick={() => void handleCopyInvitationSnippet()}
+                      >
+                        {copiedInvitation ? 'Copied!' : 'Copy Invitation'}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="cancel-invite-dialog-button"
+                        className="secondary-btn"
+                        onClick={() => setInviteDialogOpen(false)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                </section>
+              )}
+
+              <section
+                className="card recent-sessions-card"
+                data-testid="recent-sessions-section"
+              >
+                <div className="subcard-header">
+                  <div>
+                    <h2>Recent Sessions</h2>
                     <p className="muted">
-                      {deviceSetupState.registrationMessage ||
-                        'Offline before registration: unable to assign your device code yet.'}
+                      Favorites stay pinned first; saved only on this device.
                     </p>
+                  </div>
+                  <div
+                    className="recent-view-toggle"
+                    role="group"
+                    aria-label="Recent sessions view mode"
+                  >
                     <button
                       type="button"
-                      data-testid="retry-registration-button"
-                      className="primary-btn"
-                      disabled={retryingRegistration}
-                      onClick={() => void handleRetryRegistration()}
+                      data-testid="recent-view-grid"
+                      className={`small-secondary-btn ${
+                        recentViewMode === 'grid' ? 'active-view-btn' : ''
+                      }`}
+                      onClick={() => setRecentViewMode('grid')}
                     >
-                      {retryingRegistration ? 'Retrying...' : 'Retry'}
+                      Grid
                     </button>
+                    <button
+                      type="button"
+                      data-testid="recent-view-list"
+                      className={`small-secondary-btn ${
+                        recentViewMode === 'list' ? 'active-view-btn' : ''
+                      }`}
+                      onClick={() => setRecentViewMode('list')}
+                    >
+                      List
+                    </button>
+                  </div>
+                </div>
+
+                {recentPeers.length === 0 ? (
+                  <p className="muted" data-testid="recent-sessions-empty">
+                    No recent sessions yet. Connect or invite a friend to see them
+                    here.
+                  </p>
+                ) : (
+                  <div
+                    className={
+                      recentViewMode === 'grid'
+                        ? 'recent-sessions-grid'
+                        : 'recent-sessions-list'
+                    }
+                    data-testid="recent-sessions-grid"
+                  >
+                    {recentPeers.map((peer) => {
+                      const onlineStatus = peerOnlineMap[peer.friendCode] ?? 'unknown';
+                      const peerLabel = resolveRecentPeerDisplayName(peer);
+                      const menuOpen = openPeerMenuCode === peer.friendCode;
+                      const isRenaming = renamingPeerCode === peer.friendCode;
+
+                      return (
+                        <article
+                          key={peer.friendCode}
+                          className={`recent-peer-card ${
+                            recentViewMode === 'list' ? 'list-row' : ''
+                          }`}
+                          data-testid={`recent-peer-card-${peer.friendCode}`}
+                        >
+                          <div className="peer-card-top">
+                            <div className="peer-card-heading">
+                              <button
+                                type="button"
+                                className={`peer-star-btn ${peer.favorite ? 'starred' : ''}`}
+                                aria-label={
+                                  peer.favorite
+                                    ? `Remove ${peerLabel} from favorites`
+                                    : `Add ${peerLabel} to favorites`
+                                }
+                                title={
+                                  peer.favorite
+                                    ? 'Remove from Favorites'
+                                    : 'Add to Favorites'
+                                }
+                                onClick={() => {
+                                  void window.elmDesktop
+                                    .toggleFavoritePeer(peer.friendCode)
+                                    .then((nextPeers) => {
+                                      setRecentPeers(nextPeers);
+                                    });
+                                }}
+                              >
+                                {peer.favorite ? '★' : '☆'}
+                              </button>
+                              {!isRenaming && (
+                                <strong className="peer-card-name">{peerLabel}</strong>
+                              )}
+                            </div>
+
+                            <span
+                              className={`peer-status-badge ${onlineStatus}`}
+                              data-testid={`peer-status-${peer.friendCode}`}
+                              title={
+                                onlineStatus === 'online'
+                                  ? 'Server confirmed online'
+                                  : onlineStatus === 'offline'
+                                    ? 'Server confirmed offline'
+                                    : 'Presence unknown'
+                              }
+                            >
+                              <span
+                                className={`peer-status-dot ${onlineStatus}`}
+                                aria-hidden="true"
+                              />
+                              <span className="peer-status-label">
+                                {onlineStatus === 'online'
+                                  ? 'Online'
+                                  : onlineStatus === 'offline'
+                                    ? 'Offline'
+                                    : 'Unknown'}
+                              </span>
+                            </span>
+                          </div>
+
+                          {isRenaming ? (
+                            <form
+                              className="peer-rename-form"
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                void window.elmDesktop
+                                  .renameRecentPeer({
+                                    friendCode: peer.friendCode,
+                                    alias: renameAliasInput,
+                                  })
+                                  .then((nextPeers) => {
+                                    setRecentPeers(nextPeers);
+                                    setRenamingPeerCode(null);
+                                  });
+                              }}
+                            >
+                              <input
+                                type="text"
+                                className="code-input"
+                                value={renameAliasInput}
+                                onChange={(e) => setRenameAliasInput(e.target.value)}
+                                placeholder={peer.peerName?.trim() || 'Enter friend name'}
+                                maxLength={60}
+                                autoFocus
+                              />
+                              <div className="actions-row">
+                                <button type="submit" className="small-secondary-btn">
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  className="small-secondary-btn"
+                                  onClick={() => setRenamingPeerCode(null)}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </form>
+                          ) : (
+                            <div className="peer-card-body">
+                              <code className="peer-card-code">{peer.friendCode}</code>
+                              {(peer.email || peer.phone) && (
+                                <div
+                                  className="peer-card-contact"
+                                  data-testid={`peer-card-contact-${peer.friendCode}`}
+                                >
+                                  {peer.email && (
+                                    <span
+                                      className="peer-card-contact-line"
+                                      data-testid={`peer-card-email-${peer.friendCode}`}
+                                      title={peer.email}
+                                    >
+                                      {peer.email}
+                                    </span>
+                                  )}
+                                  {peer.phone && (
+                                    <span
+                                      className="peer-card-contact-line"
+                                      data-testid={`peer-card-phone-${peer.friendCode}`}
+                                      title={peer.phone}
+                                    >
+                                      {peer.phone}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          <div className="peer-card-footer">
+                            <button
+                              type="button"
+                              className="small-secondary-btn"
+                              disabled={
+                                submittingRequest ||
+                                Boolean(snapshot?.outgoingInvite) ||
+                                Boolean(snapshot?.activeSession)
+                              }
+                              onClick={() => {
+                                setOpenPeerMenuCode(null);
+                                void submitInviteRequest({
+                                  friendCode: peer.friendCode,
+                                  intent: 'connect',
+                                });
+                              }}
+                            >
+                              Connect
+                            </button>
+                            <button
+                              type="button"
+                              className="small-secondary-btn"
+                              disabled={Boolean(snapshot?.activeSession)}
+                              onClick={() => {
+                                setOpenPeerMenuCode(null);
+                                setInviteTargetCode(peer.friendCode);
+                                setInviteHostMedia({
+                                  screenVideo: true,
+                                  microphoneAudio: false,
+                                  deviceAudio: false,
+                                });
+                                setInviteDialogOpen(true);
+                              }}
+                            >
+                              Invite
+                            </button>
+                            <button
+                              type="button"
+                              className="peer-menu-trigger"
+                              data-peer-menu-trigger={peer.friendCode}
+                              aria-label={`Actions for ${peerLabel}`}
+                              aria-haspopup="menu"
+                              aria-expanded={menuOpen}
+                              onClick={() =>
+                                setOpenPeerMenuCode((prev) =>
+                                  prev === peer.friendCode ? null : peer.friendCode
+                                )
+                              }
+                            >
+                              ⋮
+                            </button>
+                          </div>
+
+                          {menuOpen && (
+                            <div
+                              className="peer-card-menu"
+                              role="menu"
+                              data-peer-menu={peer.friendCode}
+                            >
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  void submitInviteRequest({
+                                    friendCode: peer.friendCode,
+                                    intent: 'connect',
+                                  });
+                                }}
+                              >
+                                Connect
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  setInviteTargetCode(peer.friendCode);
+                                  setInviteHostMedia({
+                                    screenVideo: true,
+                                    microphoneAudio: false,
+                                    deviceAudio: false,
+                                  });
+                                  setInviteDialogOpen(true);
+                                }}
+                              >
+                                Invite
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  void window.elmDesktop.copyTextToClipboard(
+                                    peer.friendCode
+                                  );
+                                  showToast(
+                                    `Copied ${peer.friendCode} to clipboard.`
+                                  );
+                                }}
+                              >
+                                Copy Code
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  void window.elmDesktop
+                                    .toggleFavoritePeer(peer.friendCode)
+                                    .then((nextPeers) => {
+                                      setRecentPeers(nextPeers);
+                                    });
+                                }}
+                              >
+                                {peer.favorite
+                                  ? 'Remove from Favorites'
+                                  : 'Add to Favorites'}
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  setRenamingPeerCode(peer.friendCode);
+                                  setRenameAliasInput(
+                                    peer.alias.trim() || peer.peerName?.trim() || ''
+                                  );
+                                }}
+                              >
+                                Rename
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="danger-menu-item"
+                                onClick={() => {
+                                  setOpenPeerMenuCode(null);
+                                  void window.elmDesktop
+                                    .removeRecentPeer(peer.friendCode)
+                                    .then((nextPeers) => {
+                                      setRecentPeers(nextPeers);
+                                    });
+                                }}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })}
                   </div>
                 )}
               </section>
@@ -2822,6 +4368,18 @@ export function App(): React.ReactElement {
         )}
       </section>
         </>
+      )}
+      {toastState && (
+        <div
+          className={`bottom-center-toast ${
+            toastState.variant === 'error' ? 'toast-error' : ''
+          }`}
+          role={toastState.variant === 'error' ? 'alert' : 'status'}
+          aria-live={toastState.variant === 'error' ? 'assertive' : 'polite'}
+          data-testid="bottom-center-toast"
+        >
+          {toastState.message}
+        </div>
       )}
     </main>
   );
