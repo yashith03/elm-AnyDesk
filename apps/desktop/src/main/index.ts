@@ -38,6 +38,17 @@ import { DesktopAuthAndInviteController } from './auth-invite-client';
 import { Win11TaskbarDwmController } from './win11-dwm';
 import { WasapiLoopbackManager } from './wasapi-loopback';
 
+// Allow isolated test runs to override Electron userData before app.whenReady()
+// so automated or side-by-side multi-client tests never touch the user's real profile.
+if (
+  typeof process.env.ELM_USER_DATA_DIR === 'string' &&
+  process.env.ELM_USER_DATA_DIR.trim().length > 0
+) {
+  const customUserData = path.resolve(process.env.ELM_USER_DATA_DIR.trim());
+  fs.mkdirSync(customUserData, { recursive: true });
+  app.setPath('userData', customUserData);
+}
+
 let mainWindow: BrowserWindow | null = null;
 let chatWindow: BrowserWindow | null = null;
 let taskbarDwmController: Win11TaskbarDwmController | null = null;
@@ -263,12 +274,36 @@ async function createMainWindow(): Promise<BrowserWindow> {
     return mainWindow;
   }
 
+  let customBounds: { x: number; y: number; width: number; height: number } | null = null;
+  if (typeof process.env.ELM_WINDOW_BOUNDS === 'string') {
+    const parts = process.env.ELM_WINDOW_BOUNDS.split(',').map((n) => Number(n.trim()));
+    if (
+      parts.length === 4 &&
+      parts.every((n) => Number.isFinite(n)) &&
+      parts[2] >= 640 &&
+      parts[3] >= 480
+    ) {
+      customBounds = {
+        x: Math.round(parts[0]),
+        y: Math.round(parts[1]),
+        width: Math.round(parts[2]),
+        height: Math.round(parts[3]),
+      };
+    }
+  }
+  const titleSuffix =
+    typeof process.env.ELM_WINDOW_TITLE_SUFFIX === 'string' &&
+    process.env.ELM_WINDOW_TITLE_SUFFIX.trim().length > 0
+      ? ` ${process.env.ELM_WINDOW_TITLE_SUFFIX.trim()}`
+      : '';
+
   const win = new BrowserWindow({
-    width: 1140,
-    height: 860,
-    minWidth: 900,
-    minHeight: 640,
-    title: 'Elm-AnyDesk — Consent-Based 1:1 Screen Share',
+    ...(customBounds ? { x: customBounds.x, y: customBounds.y } : {}),
+    width: customBounds?.width ?? 1140,
+    height: customBounds?.height ?? 860,
+    minWidth: customBounds ? Math.min(640, customBounds.width) : 900,
+    minHeight: customBounds ? Math.min(480, customBounds.height) : 640,
+    title: `Elm-AnyDesk — Consent-Based 1:1 Screen Share${titleSuffix}`,
     icon: getWindowIconPath(),
     titleBarStyle: 'hidden',
     autoHideMenuBar: true,

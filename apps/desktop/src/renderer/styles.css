@@ -1836,7 +1836,7 @@ select:focus-visible,
 .bottom-center-toast {
   position: fixed;
   left: 50%;
-  bottom: 24px;
+  bottom: 64px;
   transform: translateX(-50%);
   z-index: 1100;
   max-width: calc(100vw - 32px);
@@ -1850,6 +1850,12 @@ select:focus-visible,
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
   pointer-events: none;
   animation: toastFadeInUp 160ms ease-out;
+}
+
+.bottom-center-toast.toast-error {
+  border-color: var(--danger-border);
+  background-color: var(--danger-surface);
+  color: var(--status-offline-text);
 }
 
 @keyframes toastFadeInUp {

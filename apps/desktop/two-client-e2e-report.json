@@ -1,0 +1,132 @@
+{
+  "timestamp": "2026-11-22T00:27:47.659Z",
+  "backendUrl": "http://127.0.0.1:60556",
+  "passed": true,
+  "results": {
+    "registration_and_presence": {
+      "status": "PASSED",
+      "details": {
+        "pidA": 16820,
+        "pidB": 31160,
+        "codeA": "ELM-9H7G-DF2R",
+        "codeB": "ELM-6ZTH-4MN2"
+      }
+    },
+    "send_and_receive_request": {
+      "status": "PASSED",
+      "details": {
+        "waitingCountdown": "02:00",
+        "incomingRequesterCode": "ELM-9H7G-DF2R"
+      }
+    },
+    "accept_and_webrtc_connect": {
+      "status": "PASSED",
+      "details": {
+        "sessionId": "102f21f8-5a39-429e-983c-b8b709d41f15",
+        "roleA": "guest",
+        "roleB": "host",
+        "connectionStateA": "connected",
+        "iceStateA": "connected",
+        "dataChannelStateA": "open",
+        "connectionStateB": "connected",
+        "iceStateB": "connected",
+        "dataChannelStateB": "open"
+      }
+    },
+    "screen_sharing_b_to_a": {
+      "status": "BLOCKED_OS_CAPTURE_ZERO_FRAMES",
+      "details": {
+        "selectedSourceName": "[DISPLAY] Screen 2",
+        "sharingStartedByHost": true,
+        "hostCaptureWidth": null,
+        "hostCaptureHeight": null,
+        "hostCaptureFps": 0,
+        "hostOutboundFramesSent": 0,
+        "guestDecodedWidth": null,
+        "guestDecodedHeight": null,
+        "guestInboundFramesDecoded": 0,
+        "guestInboundBytesReceived": 0,
+        "guestVideoTracksCount": 1,
+        "rttMs": 2
+      }
+    },
+    "bidirectional_chat": {
+      "status": "PASSED",
+      "details": {
+        "msgAtoB": "Hello Friend B, this is a two-device simulation test.",
+        "msgBtoA": "Hello Friend A, I received your message successfully."
+      }
+    },
+    "chat_image_transfer": {
+      "status": "PASSED",
+      "details": {
+        "imagesRenderedOnBoth": true
+      }
+    },
+    "audio_probe": {
+      "status": "PARTIAL_HARDWARE_LIMITED",
+      "details": {
+        "wasapiProbe": {
+          "ok": true,
+          "endpointId": "{0.0.0.00000000}.{79a85bb0-7e87-4bcd-90fc-0fa198f258fe}",
+          "sampleRate": 48000,
+          "channels": 2,
+          "bitsPerSample": 32
+        },
+        "note": "Live cross-process speaker playback not asserted on single PC to avoid same-endpoint feedback loop."
+      }
+    },
+    "disconnect_and_mutual_recent_presence": {
+      "status": "PASSED",
+      "details": {
+        "cardOnA": {
+          "text": "☆Test Friend BOnlineELM-6ZTH-4MN2friend.b@example.com+1 555-0202ConnectInvite⋮",
+          "email": "friend.b@example.com",
+          "phone": "+1 555-0202",
+          "status": "Online"
+        },
+        "cardOnB": {
+          "text": "☆Test Friend AOnlineELM-9H7G-DF2Rfriend.a@example.com+1 555-0101ConnectInvite⋮",
+          "email": "friend.a@example.com",
+          "phone": "+1 555-0101",
+          "status": "Online"
+        }
+      }
+    },
+    "cancel_and_120s_expiry": {
+      "status": "PASSED",
+      "details": {
+        "cancelBannerShown": false,
+        "expiredAfter120s": true
+      }
+    },
+    "reverse_roles_a_to_b": {
+      "status": "PASSED_SIGNALING_AND_CHAT_CAPTURE_BLOCKED",
+      "details": {
+        "sessionId": "6a975ed3-e3a4-4dbe-9016-c88be38a371d",
+        "roleA": "host",
+        "roleB": "guest",
+        "videoCapturePassed": false,
+        "selectedSourceName": "[DISPLAY] Screen 2",
+        "sharingStartedByHost": true,
+        "hostCaptureWidth": null,
+        "hostCaptureHeight": null,
+        "hostCaptureFps": 0,
+        "hostOutboundFramesSent": 0,
+        "guestDecodedWidth": null,
+        "guestDecodedHeight": null,
+        "guestInboundFramesDecoded": 0,
+        "guestInboundBytesReceived": 0,
+        "guestVideoTracksCount": 1,
+        "rttMs": 0
+      }
+    },
+    "backend_privacy_audit": {
+      "status": "PASSED",
+      "details": {
+        "totalBackendRequests": 336,
+        "leaksFound": 0
+      }
+    }
+  }
+}

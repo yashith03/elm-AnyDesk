@@ -137,7 +137,10 @@ export function App(): React.ReactElement {
 
   // Copy Friend Code feedback & transient bottom-center toast
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastState, setToastState] = useState<{
+    message: string;
+    variant: 'info' | 'error';
+  } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
 
   // Home Connection Input & Request Modals
@@ -747,6 +750,29 @@ export function App(): React.ReactElement {
     );
 
     webrtcControllerRef.current = controller;
+    (
+      window as unknown as {
+        __elmGetLiveWebRtcProbe?: () => Promise<Record<string, unknown> | null>;
+      }
+    ).__elmGetLiveWebRtcProbe = async () => {
+      const ctrl = webrtcControllerRef.current;
+      if (!ctrl) return null;
+      const snap = ctrl.getSnapshot();
+      const diag = await ctrl.sampleReadabilityDiagnostics();
+      return {
+        sessionId: snap.sessionId,
+        localRole,
+        connectionState: snap.connectionState,
+        iceConnectionState: snap.iceConnectionState,
+        dataChannelState: snap.dataChannelState,
+        sharingStartedByHost: snap.sharingStartedByHost,
+        guestVideoTracksCount: snap.guestVideoTracksCount,
+        guestAudioTracksCount: snap.guestAudioTracksCount,
+        messagesCount: snap.messages.length,
+        imageAttachmentsCount: Object.keys(snap.imageAttachmentsByMessageId).length,
+        diagnostics: diag,
+      };
+    };
 
     // Automatically load shareable sources so Host A can pick one before clicking Start Sharing
     void window.elmDesktop.listShareableSources().then((sources) => {
@@ -1110,15 +1136,18 @@ export function App(): React.ReactElement {
     setStatusMessage(null);
   };
 
-  const showToast = (message: string) => {
+  const showToast = (
+    message: string,
+    variant: 'info' | 'error' = 'info'
+  ) => {
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
     }
-    setToastMessage(message);
+    setToastState({ message, variant });
     toastTimerRef.current = window.setTimeout(() => {
       toastTimerRef.current = null;
-      setToastMessage(null);
-    }, 2200);
+      setToastState(null);
+    }, variant === 'error' ? 3000 : 2200);
   };
 
   useEffect(() => {
@@ -1465,6 +1494,10 @@ export function App(): React.ReactElement {
         hostMediaSelection: params.hostMediaSelection,
       });
       if (!res.ok || !res.data) {
+        if (res.errorCode === 'SELF_INVITE_NOT_ALLOWED') {
+          showToast('You cannot connect to your code.', 'error');
+          return;
+        }
         if (res.errorCode === 'TARGET_OFFLINE') {
           setRequestOutcomeModal({
             kind: 'offline',
@@ -4336,14 +4369,16 @@ export function App(): React.ReactElement {
       </section>
         </>
       )}
-      {toastMessage && (
+      {toastState && (
         <div
-          className="bottom-center-toast"
-          role="status"
-          aria-live="polite"
+          className={`bottom-center-toast ${
+            toastState.variant === 'error' ? 'toast-error' : ''
+          }`}
+          role={toastState.variant === 'error' ? 'alert' : 'status'}
+          aria-live={toastState.variant === 'error' ? 'assertive' : 'polite'}
           data-testid="bottom-center-toast"
         >
-          {toastMessage}
+          {toastState.message}
         </div>
       )}
     </main>

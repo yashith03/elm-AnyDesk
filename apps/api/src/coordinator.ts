@@ -589,7 +589,7 @@ export class SignalingCoordinator implements DurableObject {
         };
       }
 
-      const now = new Date().toISOString();
+      const now = new Date(this.now()).toISOString();
       const subReason = params.subReason || params.reason;
       const detectionTimeMs = Math.max(1, Math.round(params.detectionTimeMs ?? 1));
 
@@ -728,7 +728,7 @@ export class SignalingCoordinator implements DurableObject {
   ): SessionTeardownReceipt | null {
     this.ensureSchema();
     const sql = this.state.storage.sql;
-    const now = new Date().toISOString();
+    const now = new Date(this.now()).toISOString();
 
     sql.exec(`DELETE FROM presence_sessions WHERE account_id = ?`, accountId);
 
@@ -1255,7 +1255,7 @@ export class SignalingCoordinator implements DurableObject {
       }
 
       const inviteId = crypto.randomUUID();
-      const nowMs = Date.now();
+      const nowMs = this.now();
       const now = new Date(nowMs).toISOString();
       const ttlMs =
         typeof body.expiresInMs === 'number' &&
@@ -1370,7 +1370,7 @@ export class SignalingCoordinator implements DurableObject {
         );
       }
 
-      const now = new Date().toISOString();
+      const now = new Date(this.now()).toISOString();
       sql.exec(
         `UPDATE invites SET status = 'cancelled', resolved_at = ?
          WHERE invite_id = ? AND status = 'pending'`,
@@ -1454,7 +1454,7 @@ export class SignalingCoordinator implements DurableObject {
         );
       }
 
-      const now = new Date().toISOString();
+      const now = new Date(this.now()).toISOString();
 
       if (body.action === 'decline') {
         sql.exec(
@@ -1743,7 +1743,7 @@ export class SignalingCoordinator implements DurableObject {
         return errorResponse(gate.status, gate.code, gate.message);
       }
 
-      const nowIso = body.timestampIso || new Date().toISOString();
+      const nowIso = body.timestampIso || new Date(this.now()).toISOString();
       const isHost = body.caller.accountId === gate.session.hostAccountId;
 
       if (isHost) {
@@ -1846,7 +1846,7 @@ export class SignalingCoordinator implements DurableObject {
         );
       }
 
-      const nowMs = body.nowIso ? Date.parse(body.nowIso) : Date.now();
+      const nowMs = body.nowIso ? Date.parse(body.nowIso) : this.now();
       const timeoutMs =
         body.livenessTimeoutMs ?? DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs;
       const hostAgeMs = Math.max(

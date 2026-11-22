@@ -170,6 +170,9 @@ export class ApprovedWebRtcSessionController {
 
   private hostAfterSeq = 0;
   private guestAfterSeq = 0;
+  private readonly pendingHostIceCandidates: RTCIceCandidateInit[] = [];
+  private readonly pendingGuestIceCandidates: RTCIceCandidateInit[] = [];
+  private remoteLivenessArmed = false;
   private negotiationQueue: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -483,6 +486,12 @@ export class ApprovedWebRtcSessionController {
     side: 'host' | 'guest'
   ): void {
     channel.onopen = () => {
+      if (this.mode === 'remote') {
+        const nowPerf = performance.now();
+        this.lastHostHeartbeatPerfMs = nowPerf;
+        this.lastGuestHeartbeatPerfMs = nowPerf;
+        this.remoteLivenessArmed = true;
+      }
       if (
         !this.closed &&
         this.localContactCard &&
@@ -671,8 +680,15 @@ export class ApprovedWebRtcSessionController {
     const nowPerf = performance.now();
     const nowEpoch = Date.now();
 
-    // 1. Send heartbeats for any non-suppressed peer
-    if (!this.hostHeartbeatSuppressed) {
+    // 1. Send heartbeats for local peer(s)
+    const shouldSendHost =
+      (this.mode === 'loopback' || this.localRole === 'host') &&
+      !this.hostHeartbeatSuppressed;
+    const shouldSendGuest =
+      (this.mode === 'loopback' || this.localRole === 'guest') &&
+      !this.guestHeartbeatSuppressed;
+
+    if (shouldSendHost) {
       this.lastHostHeartbeatPerfMs = nowPerf;
       if (this.hostDataChannel?.readyState === 'open') {
         try {
@@ -694,7 +710,7 @@ export class ApprovedWebRtcSessionController {
       });
     }
 
-    if (!this.guestHeartbeatSuppressed) {
+    if (shouldSendGuest) {
       this.lastGuestHeartbeatPerfMs = nowPerf;
       if (this.guestDataChannel?.readyState === 'open') {
         try {
@@ -716,11 +732,19 @@ export class ApprovedWebRtcSessionController {
       });
     }
 
-    // 2. Check local peer-to-peer liveness silence against threshold
+    // 2. Check peer-to-peer liveness silence against threshold
+    // In remote mode, wait until DataChannel has opened once so initial ICE/DTLS setup never prematurely disconnects.
+    if (this.mode === 'remote' && !this.remoteLivenessArmed) {
+      return;
+    }
     const hostSilenceMs = Math.max(0, nowPerf - this.lastHostHeartbeatPerfMs);
     const guestSilenceMs = Math.max(0, nowPerf - this.lastGuestHeartbeatPerfMs);
-    const hostExpired = hostSilenceMs > this.livenessTimeoutMs;
-    const guestExpired = guestSilenceMs > this.livenessTimeoutMs;
+    const hostExpired =
+      (this.mode === 'loopback' || this.localRole === 'guest') &&
+      hostSilenceMs > this.livenessTimeoutMs;
+    const guestExpired =
+      (this.mode === 'loopback' || this.localRole === 'host') &&
+      guestSilenceMs > this.livenessTimeoutMs;
 
     if (hostExpired || guestExpired) {
       const defaultSub =
@@ -886,6 +910,14 @@ export class ApprovedWebRtcSessionController {
         type: 'offer',
         sdp: payload.sdp,
       });
+      while (this.pendingGuestIceCandidates.length > 0 && !this.closed) {
+        const queued = this.pendingGuestIceCandidates.shift()!;
+        try {
+          await this.pcGuest.addIceCandidate(queued);
+        } catch {
+          // Ignore stale/duplicate queued ICE candidates
+        }
+      }
       const answer = await this.pcGuest.createAnswer();
       await this.pcGuest.setLocalDescription(answer);
       await window.elmDesktop.sendSessionSignal({
@@ -899,12 +931,17 @@ export class ApprovedWebRtcSessionController {
       this.pumpAgainRequested = true;
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
+      const candidateInit: RTCIceCandidateInit = {
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid,
+        sdpMLineIndex: payload.sdpMLineIndex,
+      };
+      if (!this.pcGuest.remoteDescription) {
+        this.pendingGuestIceCandidates.push(candidateInit);
+        return;
+      }
       try {
-        await this.pcGuest.addIceCandidate({
-          candidate: payload.candidate,
-          sdpMid: payload.sdpMid,
-          sdpMLineIndex: payload.sdpMLineIndex,
-        });
+        await this.pcGuest.addIceCandidate(candidateInit);
       } catch {
         // Ignore late ICE candidates
       }
@@ -922,15 +959,28 @@ export class ApprovedWebRtcSessionController {
           type: 'answer',
           sdp: payload.sdp,
         });
+        while (this.pendingHostIceCandidates.length > 0 && !this.closed) {
+          const queued = this.pendingHostIceCandidates.shift()!;
+          try {
+            await this.pcHost.addIceCandidate(queued);
+          } catch {
+            // Ignore stale/duplicate queued ICE candidates
+          }
+        }
       }
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
+      const candidateInit: RTCIceCandidateInit = {
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid,
+        sdpMLineIndex: payload.sdpMLineIndex,
+      };
+      if (!this.pcHost.remoteDescription) {
+        this.pendingHostIceCandidates.push(candidateInit);
+        return;
+      }
       try {
-        await this.pcHost.addIceCandidate({
-          candidate: payload.candidate,
-          sdpMid: payload.sdpMid,
-          sdpMLineIndex: payload.sdpMLineIndex,
-        });
+        await this.pcHost.addIceCandidate(candidateInit);
       } catch {
         // Ignore late ICE candidates
       }
