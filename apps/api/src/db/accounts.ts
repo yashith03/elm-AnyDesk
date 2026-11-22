@@ -163,6 +163,39 @@ export async function findAccountByFriendCode(
   return row ? mapRowToProfile(row) : null;
 }
 
+export async function findAccountsByFriendCodes(
+  db: D1Database,
+  rawFriendCodes: readonly string[]
+): Promise<Array<{ accountId: string; friendCode: string }>> {
+  await ensureAccountsSchema(db);
+  const normalized = Array.from(
+    new Set(
+      rawFriendCodes
+        .map((c) => normalizeFriendCode(String(c ?? '')))
+        .filter((c) => c.length > 0)
+    )
+  ).slice(0, 25);
+
+  if (normalized.length === 0) {
+    return [];
+  }
+
+  const placeholders = normalized.map((_, idx) => `?${idx + 1}`).join(', ');
+  const res = await db
+    .prepare(
+      `SELECT account_id, friend_code
+       FROM accounts
+       WHERE friend_code IN (${placeholders})`
+    )
+    .bind(...normalized)
+    .all<{ account_id: string; friend_code: string }>();
+
+  return (res.results ?? []).map((r) => ({
+    accountId: r.account_id,
+    friendCode: r.friend_code,
+  }));
+}
+
 export async function findAccountById(
   db: D1Database,
   accountId: string

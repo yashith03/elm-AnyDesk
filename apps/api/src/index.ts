@@ -2,12 +2,14 @@ import {
   isValidFriendCode,
   normalizeFriendCode,
   PILOT_NETWORK_POLICY,
+  PRESENCE_LOOKUP_MAX_BATCH_SIZE,
   PROTOCOL_VERSION,
   type AccountProfile,
   type AnonymousDeviceRegistrationResponse,
   type ApiHealthResponse,
   type AuthSessionResponse,
   type HostMediaSelection,
+  type InviteIntent,
   type PilotDownloadManifest,
   type ProtocolErrorCode,
 } from '@elm/protocol';
@@ -24,6 +26,7 @@ import {
 import {
   ensureAccountWithPermanentFriendCode,
   findAccountByFriendCode,
+  findAccountsByFriendCodes,
   findAccountById,
   registerAnonymousDevice,
 } from './db/accounts.ts';
@@ -557,7 +560,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
         );
       }
 
-      // 6. Presence Connect / Heartbeat: POST /presence/connect
+      // 6. Presence Connect: POST /presence/connect
       if (request.method === 'POST' && url.pathname === '/presence/connect') {
         const res = await coordinator.fetch(
           new Request('https://coordinator.internal/internal/presence/connect', {
@@ -565,6 +568,21 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ account }),
           })
+        );
+        return withCors(res);
+      }
+
+      // 6b. Presence Heartbeat: POST /presence/heartbeat
+      if (request.method === 'POST' && url.pathname === '/presence/heartbeat') {
+        const res = await coordinator.fetch(
+          new Request(
+            'https://coordinator.internal/internal/presence/heartbeat',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ account }),
+            }
+          )
         );
         return withCors(res);
       }
@@ -604,10 +622,56 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
         return withCors(res);
       }
 
+      // 8b. Batch Presence Lookup for Saved/Recent Peer Codes: POST /presence/lookup
+      if (request.method === 'POST' && url.pathname === '/presence/lookup') {
+        const body = (await request.json().catch(() => ({}))) as {
+          friendCodes?: unknown;
+        };
+        if (!Array.isArray(body.friendCodes)) {
+          return jsonError(
+            400,
+            'INVALID_REQUEST',
+            'friendCodes must be an array of Device Codes.'
+          );
+        }
+        if (body.friendCodes.length > PRESENCE_LOOKUP_MAX_BATCH_SIZE) {
+          return jsonError(
+            400,
+            'INVALID_REQUEST',
+            `Batch presence lookup is limited to at most ${PRESENCE_LOOKUP_MAX_BATCH_SIZE} Device Codes per request.`
+          );
+        }
+        const validCodes = Array.from(
+          new Set(
+            body.friendCodes
+              .map((c) => normalizeFriendCode(String(c ?? '')))
+              .filter((c) => isValidFriendCode(c))
+          )
+        );
+        const matchedAccounts =
+          validCodes.length > 0
+            ? await findAccountsByFriendCodes(env.DB, validCodes)
+            : [];
+        const res = await coordinator.fetch(
+          new Request('https://coordinator.internal/internal/presence/lookup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              callerAccountId: account.accountId,
+              requestedCodes: validCodes,
+              accounts: matchedAccounts,
+            }),
+          })
+        );
+        return withCors(res);
+      }
+
       // 9. Send Friend Code Invite: POST /invites
       if (request.method === 'POST' && url.pathname === '/invites') {
         const body = (await request.json().catch(() => ({}))) as {
           friendCode?: string;
+          intent?: InviteIntent;
+          hostMediaSelection?: Partial<HostMediaSelection>;
         };
         const rawCode = body.friendCode ?? '';
         const normalizedCode = normalizeFriendCode(rawCode);
@@ -647,6 +711,25 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
             body: JSON.stringify({
               requester: account,
               target: targetAccount,
+              intent: body.intent === 'invite' ? 'invite' : 'connect',
+              hostMediaSelection: body.hostMediaSelection,
+            }),
+          })
+        );
+        return withCors(res);
+      }
+
+      // 9b. Cancel Outgoing Pending Invite (Sender only): POST /invites/:inviteId/cancel
+      const cancelMatch = /^\/invites\/([^/]+)\/cancel$/.exec(url.pathname);
+      if (request.method === 'POST' && cancelMatch) {
+        const inviteId = decodeURIComponent(cancelMatch[1]);
+        const res = await coordinator.fetch(
+          new Request('https://coordinator.internal/internal/invites/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              caller: account,
+              inviteId,
             }),
           })
         );

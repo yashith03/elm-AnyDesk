@@ -22,6 +22,11 @@ import {
   validateChatImageAttachment,
   type ChatImageChunkFrame,
 } from '../shared/chat-attachments';
+import {
+  sanitizePeerContactFrame,
+  type PeerContactCardFrame,
+  type PeerContactCardPayload,
+} from '../shared/recent-peers';
 
 export interface GuestReceivedTrackInfo {
   readonly source: MediaSourceKind;
@@ -100,6 +105,8 @@ export interface WebRtcControllerOptions {
   readonly livenessTimeoutMs?: number;
   readonly enableBackgroundLivenessTimer?: boolean;
   readonly onGuestViewerCleared?: () => void;
+  readonly localContactCard?: PeerContactCardPayload;
+  readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
 }
 
 interface ActiveHostSenderEntry {
@@ -273,6 +280,8 @@ export class ApprovedWebRtcSessionController {
   private readonly livenessTimeoutMs: number;
   private readonly enableBackgroundLivenessTimer: boolean;
   private readonly onGuestViewerCleared?: () => void;
+  private localContactCard: PeerContactCardPayload | null = null;
+  private readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
   private livenessTimerId: ReturnType<typeof setInterval> | null = null;
   private lastHostHeartbeatPerfMs = performance.now();
   private lastGuestHeartbeatPerfMs = performance.now();
@@ -302,6 +311,8 @@ export class ApprovedWebRtcSessionController {
     this.enableBackgroundLivenessTimer =
       options?.enableBackgroundLivenessTimer ?? true;
     this.onGuestViewerCleared = options?.onGuestViewerCleared;
+    this.localContactCard = options?.localContactCard ?? null;
+    this.onPeerContactReceived = options?.onPeerContactReceived;
 
     this.hostMediaState = {
       ...createInitialHostMediaState(session.hostMediaSelection),
@@ -442,11 +453,55 @@ export class ApprovedWebRtcSessionController {
     }
   }
 
+  public sendPeerContactCard(contact: PeerContactCardPayload): boolean {
+    this.localContactCard = contact;
+    if (this.closed) {
+      return false;
+    }
+    const channel =
+      this.localRole === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (!channel || channel.readyState !== 'open') {
+      return false;
+    }
+    const frame: PeerContactCardFrame = {
+      __elmControl: 'peer-contact-card',
+      sender: this.localRole,
+      name: contact.name,
+      email: contact.email,
+      phone: contact.phone,
+    };
+    try {
+      channel.send(JSON.stringify(frame));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private attachDataChannelHandlers(
     channel: RTCDataChannel,
     side: 'host' | 'guest'
   ): void {
     channel.onopen = () => {
+      if (
+        !this.closed &&
+        this.localContactCard &&
+        side === this.localRole &&
+        channel.readyState === 'open'
+      ) {
+        const frame: PeerContactCardFrame = {
+          __elmControl: 'peer-contact-card',
+          sender: this.localRole,
+          name: this.localContactCard.name,
+          email: this.localContactCard.email,
+          phone: this.localContactCard.phone,
+        };
+        try {
+          channel.send(JSON.stringify(frame));
+        } catch {
+          // Ignore transient send error on open
+        }
+      }
       this.emitChange();
     };
     channel.onclose = () => {
@@ -459,12 +514,24 @@ export class ApprovedWebRtcSessionController {
       if (this.closed) return;
       try {
         const parsed = JSON.parse(String(event.data)) as (EphemeralChatMessage | ChatImageChunkFrame) & {
-          __elmControl?: 'liveness-heartbeat' | 'teardown-notice';
+          __elmControl?: 'liveness-heartbeat' | 'teardown-notice' | 'peer-contact-card';
           __elmImageChunk?: true;
           sender?: 'host' | 'guest';
           reason?: SessionTerminationReason;
           subReason?: string;
         };
+
+        if (parsed && parsed.__elmControl === 'peer-contact-card') {
+          const validated = sanitizePeerContactFrame(parsed);
+          if (!validated) {
+            return;
+          }
+          if (validated.sender === side) {
+            return;
+          }
+          this.onPeerContactReceived?.(validated.contact);
+          return;
+        }
 
         if (parsed.__elmControl === 'liveness-heartbeat') {
           const nowPerf = performance.now();

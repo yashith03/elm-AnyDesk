@@ -1,10 +1,15 @@
 import {
   DEFAULT_LIVENESS_CONFIG,
+  INVITE_TIMEOUT_MS,
+  PRESENCE_LOOKUP_RATE_LIMIT_MAX_REQUESTS,
+  PRESENCE_LOOKUP_RATE_LIMIT_WINDOW_MS,
+  PRESENCE_STALE_TIMEOUT_MS,
   sanitizeHostMediaSelection,
   type AccountProfile,
   type ApprovedSessionSummary,
   type CoordinatorServerEvent,
   type HostMediaSelection,
+  type InviteIntent,
   type InviteStatus,
   type InviteSummary,
   type PresenceStateSnapshot,
@@ -23,8 +28,11 @@ interface InviteRow extends Record<string, SqlStorageValue> {
   target_account_id: string;
   target_friend_code: string;
   target_display_name: string;
+  intent: string;
+  host_media_selection_json: string;
   status: string;
   created_at: string;
+  expires_at: string;
   resolved_at: string | null;
 }
 
@@ -67,6 +75,21 @@ interface SessionSignalRow extends Record<string, SqlStorageValue> {
 }
 
 function mapInviteRow(row: InviteRow): InviteSummary {
+  const intent: InviteIntent = row.intent === 'invite' ? 'invite' : 'connect';
+  let hostMediaSelection: HostMediaSelection | undefined;
+  if (intent === 'invite') {
+    try {
+      hostMediaSelection = sanitizeHostMediaSelection(
+        JSON.parse(row.host_media_selection_json || '{}') as Partial<HostMediaSelection>
+      );
+    } catch {
+      hostMediaSelection = sanitizeHostMediaSelection({ screenVideo: true });
+    }
+  }
+  const createdMs = Date.parse(row.created_at);
+  const fallbackExpiresAt = Number.isFinite(createdMs)
+    ? new Date(createdMs + INVITE_TIMEOUT_MS).toISOString()
+    : row.created_at;
   return {
     inviteId: row.invite_id,
     requesterAccountId: row.requester_account_id,
@@ -75,8 +98,11 @@ function mapInviteRow(row: InviteRow): InviteSummary {
     targetAccountId: row.target_account_id,
     targetFriendCode: row.target_friend_code,
     targetDisplayName: row.target_display_name,
+    intent,
+    ...(hostMediaSelection ? { hostMediaSelection } : {}),
     status: row.status as InviteStatus,
     createdAt: row.created_at,
+    expiresAt: row.expires_at || fallbackExpiresAt,
     resolvedAt: row.resolved_at,
   };
 }
@@ -131,10 +157,17 @@ function errorResponse(
 export class SignalingCoordinator implements DurableObject {
   private readonly state: DurableObjectState;
   private readonly socketsByAccount = new Map<string, Set<WebSocket>>();
+  private readonly lookupRateWindows = new Map<string, number[]>();
+  private readonly now: () => number;
   private schemaInitialized = false;
 
-  constructor(state: DurableObjectState, _env: unknown) {
+  constructor(
+    state: DurableObjectState,
+    _env: unknown,
+    options?: { readonly now?: () => number }
+  ) {
     this.state = state;
+    this.now = options?.now ?? (() => Date.now());
   }
 
   private ensureSchema(): void {
@@ -158,8 +191,11 @@ export class SignalingCoordinator implements DurableObject {
         target_account_id TEXT NOT NULL,
         target_friend_code TEXT NOT NULL,
         target_display_name TEXT NOT NULL,
+        intent TEXT NOT NULL DEFAULT 'connect',
+        host_media_selection_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL DEFAULT '',
         resolved_at TEXT
       );
 
@@ -202,18 +238,132 @@ export class SignalingCoordinator implements DurableObject {
       );
     `);
 
+    // Idempotent column upgrades for existing Durable Object SQLite tables
+    for (const stmt of [
+      `ALTER TABLE invites ADD COLUMN intent TEXT NOT NULL DEFAULT 'connect'`,
+      `ALTER TABLE invites ADD COLUMN host_media_selection_json TEXT NOT NULL DEFAULT '{}'`,
+      `ALTER TABLE invites ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''`,
+    ]) {
+      try {
+        sql.exec(stmt);
+      } catch {
+        // Column already exists
+      }
+    }
+
     this.schemaInitialized = true;
   }
 
-  private isAccountOnline(accountId: string): boolean {
+  private isAccountOnline(
+    accountId: string,
+    nowMs: number = this.now()
+  ): boolean {
     this.ensureSchema();
     const rows = this.state.storage.sql
-      .exec<{ account_id: string }>(
-        `SELECT account_id FROM presence_sessions WHERE account_id = ?`,
+      .exec<{ account_id: string; updated_at: string }>(
+        `SELECT account_id, updated_at FROM presence_sessions WHERE account_id = ?`,
         accountId
       )
       .toArray();
-    return rows.length > 0;
+    if (rows.length === 0) return false;
+    const updatedMs = Date.parse(rows[0].updated_at);
+    if (!Number.isFinite(updatedMs) || nowMs - updatedMs > PRESENCE_STALE_TIMEOUT_MS) {
+      this.markAccountOffline(accountId, 'connection_lost', 'presence_stale');
+      return false;
+    }
+    return true;
+  }
+
+  private refreshExistingPresence(
+    account: AccountProfile,
+    nowMs: number = this.now()
+  ): void {
+    if (!this.isAccountOnline(account.accountId, nowMs)) {
+      return;
+    }
+    this.state.storage.sql.exec(
+      `UPDATE presence_sessions SET updated_at = ? WHERE account_id = ?`,
+      new Date(nowMs).toISOString(),
+      account.accountId
+    );
+  }
+
+  private checkLookupRateLimit(
+    callerAccountId: string,
+    nowMs: number = this.now()
+  ): { readonly allowed: boolean; readonly retryAfterSec: number } {
+    const cutoff = nowMs - PRESENCE_LOOKUP_RATE_LIMIT_WINDOW_MS;
+    const prev = this.lookupRateWindows.get(callerAccountId) ?? [];
+    const recent = prev.filter((ts) => ts > cutoff);
+    if (recent.length >= PRESENCE_LOOKUP_RATE_LIMIT_MAX_REQUESTS) {
+      const oldestMs = recent[0] ?? nowMs;
+      const retryAfterMs = Math.max(
+        1000,
+        oldestMs + PRESENCE_LOOKUP_RATE_LIMIT_WINDOW_MS - nowMs
+      );
+      this.lookupRateWindows.set(callerAccountId, recent);
+      return {
+        allowed: false,
+        retryAfterSec: Math.ceil(retryAfterMs / 1000),
+      };
+    }
+    recent.push(nowMs);
+    this.lookupRateWindows.set(callerAccountId, recent);
+    return { allowed: true, retryAfterSec: 0 };
+  }
+
+  private pruneStalePresences(nowMs: number = this.now()): void {
+    this.ensureSchema();
+    const rows = this.state.storage.sql
+      .exec<{ account_id: string; updated_at: string }>(
+        `SELECT account_id, updated_at FROM presence_sessions`
+      )
+      .toArray();
+    for (const row of rows) {
+      const updatedMs = Date.parse(row.updated_at);
+      if (!Number.isFinite(updatedMs) || nowMs - updatedMs > PRESENCE_STALE_TIMEOUT_MS) {
+        this.markAccountOffline(row.account_id, 'connection_lost', 'presence_stale');
+      }
+    }
+  }
+
+  private expireStaleInvites(nowMs: number = this.now()): void {
+    this.ensureSchema();
+    this.pruneStalePresences(nowMs);
+    const sql = this.state.storage.sql;
+    const nowIso = new Date(nowMs).toISOString();
+    const pendingRows = sql
+      .exec<InviteRow>(`SELECT * FROM invites WHERE status = 'pending'`)
+      .toArray();
+
+    for (const row of pendingRows) {
+      const expiresMs = row.expires_at
+        ? Date.parse(row.expires_at)
+        : Date.parse(row.created_at) + INVITE_TIMEOUT_MS;
+      if (Number.isFinite(expiresMs) && nowMs >= expiresMs) {
+        sql.exec(
+          `UPDATE invites SET status = 'expired', resolved_at = ?
+           WHERE invite_id = ? AND status = 'pending'`,
+          nowIso,
+          row.invite_id
+        );
+        const expired = mapInviteRow({
+          ...row,
+          status: 'expired',
+          resolved_at: nowIso,
+        });
+        this.sendEventToAccount(row.requester_account_id, {
+          type: 'invite:updated',
+          invite: expired,
+          reason: 'expired',
+        });
+        this.sendEventToAccount(row.target_account_id, {
+          type: 'invite:updated',
+          invite: expired,
+          reason: 'expired',
+        });
+      }
+    }
   }
 
   private getActiveSessionForAccount(
@@ -233,12 +383,12 @@ export class SignalingCoordinator implements DurableObject {
   }
 
   private getPendingIncomingInvites(accountId: string): InviteSummary[] {
-    this.ensureSchema();
+    this.expireStaleInvites();
     return this.state.storage.sql
       .exec<InviteRow>(
         `SELECT * FROM invites
          WHERE target_account_id = ? AND status = 'pending'
-         ORDER BY created_at ASC`,
+         ORDER BY created_at ASC, rowid ASC`,
         accountId
       )
       .toArray()
@@ -246,12 +396,12 @@ export class SignalingCoordinator implements DurableObject {
   }
 
   private getPendingOutgoingInvite(accountId: string): InviteSummary | null {
-    this.ensureSchema();
+    this.expireStaleInvites();
     const rows = this.state.storage.sql
       .exec<InviteRow>(
         `SELECT * FROM invites
          WHERE requester_account_id = ? AND status = 'pending'
-         ORDER BY created_at DESC
+         ORDER BY created_at DESC, rowid DESC
          LIMIT 1`,
         accountId
       )
@@ -259,14 +409,37 @@ export class SignalingCoordinator implements DurableObject {
     return rows.length > 0 ? mapInviteRow(rows[0]) : null;
   }
 
+  private getRecentExpiredOutgoingInvite(accountId: string): InviteSummary | null {
+    const latestRows = this.state.storage.sql
+      .exec<InviteRow>(
+        `SELECT * FROM invites
+         WHERE requester_account_id = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`,
+        accountId
+      )
+      .toArray();
+    if (latestRows.length === 0) return null;
+    const latest = latestRows[0];
+    if (latest.status !== 'expired') return null;
+    return mapInviteRow(latest);
+  }
+
   private buildPresenceSnapshot(account: AccountProfile): PresenceStateSnapshot {
     this.ensureSchema();
+    this.expireStaleInvites();
+    const outgoingInvite = this.getPendingOutgoingInvite(account.accountId);
+    const activeSession = this.getActiveSessionForAccount(account.accountId);
     return {
       online: this.isAccountOnline(account.accountId),
       account,
       incomingInvites: this.getPendingIncomingInvites(account.accountId),
-      outgoingInvite: this.getPendingOutgoingInvite(account.accountId),
-      activeSession: this.getActiveSessionForAccount(account.accountId),
+      outgoingInvite,
+      recentExpiredOutgoingInvite:
+        !outgoingInvite && !activeSession
+          ? this.getRecentExpiredOutgoingInvite(account.accountId)
+          : null,
+      activeSession,
     };
   }
 
@@ -288,7 +461,7 @@ export class SignalingCoordinator implements DurableObject {
 
   private markAccountOnline(account: AccountProfile): void {
     this.ensureSchema();
-    const now = new Date().toISOString();
+    const now = new Date(this.now()).toISOString();
     this.state.storage.sql.exec(
       `INSERT INTO presence_sessions (account_id, friend_code, display_name, connected_at, updated_at)
        VALUES (?, ?, ?, ?, ?)
@@ -892,12 +1065,23 @@ export class SignalingCoordinator implements DurableObject {
       return this.handleWebSocketUpgrade(request, account);
     }
 
-    // Connect / Heartbeat Presence
+    // Connect Presence
     if (request.method === 'POST' && url.pathname === '/internal/presence/connect') {
       const body = (await request.json()) as { account: AccountProfile };
       this.markAccountOnline(body.account);
       return Response.json({
         snapshot: this.buildPresenceSnapshot(body.account),
+        serverTime: new Date(this.now()).toISOString(),
+      });
+    }
+
+    // Presence Heartbeat (server-timestamped freshness refresh & auto-recovery)
+    if (request.method === 'POST' && url.pathname === '/internal/presence/heartbeat') {
+      const body = (await request.json()) as { account: AccountProfile };
+      this.markAccountOnline(body.account);
+      return Response.json({
+        snapshot: this.buildPresenceSnapshot(body.account),
+        serverTime: new Date(this.now()).toISOString(),
       });
     }
 
@@ -922,18 +1106,69 @@ export class SignalingCoordinator implements DurableObject {
     // Get Presence & Session State Snapshot
     if (request.method === 'POST' && url.pathname === '/internal/presence/state') {
       const body = (await request.json()) as { account: AccountProfile };
+      this.refreshExistingPresence(body.account);
       return Response.json({
         snapshot: this.buildPresenceSnapshot(body.account),
+        serverTime: new Date(this.now()).toISOString(),
       });
     }
 
-    // Create Invite (User B enters User A's Friend Code)
+    // Batch Presence Lookup for Saved/Recent Peer Codes (authenticated & rate-limited)
+    if (request.method === 'POST' && url.pathname === '/internal/presence/lookup') {
+      const body = (await request.json()) as {
+        callerAccountId?: string;
+        requestedCodes?: string[];
+        accounts: Array<{ accountId: string; friendCode: string }>;
+      };
+      if (body.callerAccountId) {
+        const rate = this.checkLookupRateLimit(body.callerAccountId);
+        if (!rate.allowed) {
+          return Response.json(
+            {
+              error: 'RATE_LIMITED',
+              message:
+                'Too many presence lookup requests. Please wait a moment and try again.',
+            },
+            {
+              status: 429,
+              headers: { 'Retry-After': String(rate.retryAfterSec) },
+            }
+          );
+        }
+      }
+      const statuses: Record<string, boolean> = {};
+      for (const code of body.requestedCodes ?? []) {
+        statuses[code] = false;
+      }
+      for (const acc of body.accounts ?? []) {
+        statuses[acc.friendCode] = this.isAccountOnline(acc.accountId);
+      }
+      return Response.json({
+        statuses,
+        serverTime: new Date(this.now()).toISOString(),
+      });
+    }
+
+    // Create Invite (Connect = ask to view friend's screen; Invite = ask friend to view your screen)
     if (request.method === 'POST' && url.pathname === '/internal/invites/create') {
       const body = (await request.json()) as {
         requester: AccountProfile;
         target: AccountProfile;
+        intent?: InviteIntent;
+        hostMediaSelection?: Partial<HostMediaSelection>;
+        expiresInMs?: number;
       };
       const { requester, target } = body;
+      const intent: InviteIntent = body.intent === 'invite' ? 'invite' : 'connect';
+      const inviteMediaSelection =
+        intent === 'invite'
+          ? sanitizeHostMediaSelection({
+              screenVideo: body.hostMediaSelection?.screenVideo ?? true,
+              microphoneAudio: body.hostMediaSelection?.microphoneAudio ?? false,
+              deviceAudio: body.hostMediaSelection?.deviceAudio ?? false,
+            })
+          : sanitizeHostMediaSelection(null);
+      this.expireStaleInvites();
 
       // 1. Self-invite check
       if (
@@ -1020,7 +1255,16 @@ export class SignalingCoordinator implements DurableObject {
       }
 
       const inviteId = crypto.randomUUID();
-      const now = new Date().toISOString();
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      const ttlMs =
+        typeof body.expiresInMs === 'number' &&
+        Number.isFinite(body.expiresInMs) &&
+        body.expiresInMs > 0 &&
+        body.expiresInMs <= INVITE_TIMEOUT_MS
+          ? body.expiresInMs
+          : INVITE_TIMEOUT_MS;
+      const expiresAt = new Date(nowMs + ttlMs).toISOString();
 
       sql.exec(
         `INSERT INTO invites (
@@ -1031,10 +1275,13 @@ export class SignalingCoordinator implements DurableObject {
           target_account_id,
           target_friend_code,
           target_display_name,
+          intent,
+          host_media_selection_json,
           status,
           created_at,
+          expires_at,
           resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)`,
         inviteId,
         requester.accountId,
         requester.friendCode,
@@ -1042,7 +1289,10 @@ export class SignalingCoordinator implements DurableObject {
         target.accountId,
         target.friendCode,
         target.displayName,
-        now
+        intent,
+        JSON.stringify(inviteMediaSelection),
+        now,
+        expiresAt
       );
 
       const invite: InviteSummary = {
@@ -1053,21 +1303,105 @@ export class SignalingCoordinator implements DurableObject {
         targetAccountId: target.accountId,
         targetFriendCode: target.friendCode,
         targetDisplayName: target.displayName,
+        intent,
+        ...(intent === 'invite' ? { hostMediaSelection: inviteMediaSelection } : {}),
         status: 'pending',
         createdAt: now,
+        expiresAt,
         resolvedAt: null,
       };
 
-      // Notify intended owner (User A) in real time
+      // Notify intended recipient in real time
       this.sendEventToAccount(target.accountId, {
         type: 'invite:incoming',
         invite,
       });
 
-      return Response.json({ invite }, { status: 201 });
+      return Response.json(
+        {
+          invite,
+          snapshot: this.buildPresenceSnapshot(requester),
+        },
+        { status: 201 }
+      );
     }
 
-    // Respond to Invite (User A accepts or declines, choosing the 3 media controls)
+    // Cancel Outgoing Invite (Sender only)
+    if (request.method === 'POST' && url.pathname === '/internal/invites/cancel') {
+      const body = (await request.json()) as {
+        caller: AccountProfile;
+        inviteId: string;
+      };
+      this.expireStaleInvites();
+
+      const rows = sql
+        .exec<InviteRow>(
+          `SELECT * FROM invites WHERE invite_id = ? LIMIT 1`,
+          body.inviteId
+        )
+        .toArray();
+
+      if (rows.length === 0) {
+        return errorResponse(404, 'INVITE_NOT_FOUND', 'Invite not found.');
+      }
+      const inviteRow = rows[0];
+
+      if (body.caller.accountId !== inviteRow.requester_account_id) {
+        return errorResponse(
+          403,
+          'NOT_INVITE_SENDER',
+          'Only the request sender can cancel a pending request.'
+        );
+      }
+
+      if (inviteRow.status === 'expired') {
+        return errorResponse(
+          409,
+          'INVITE_EXPIRED',
+          'This connection request has already expired.'
+        );
+      }
+
+      if (inviteRow.status !== 'pending') {
+        return errorResponse(
+          409,
+          'INVITE_ALREADY_RESOLVED',
+          `Invite has already been ${inviteRow.status}.`
+        );
+      }
+
+      const now = new Date().toISOString();
+      sql.exec(
+        `UPDATE invites SET status = 'cancelled', resolved_at = ?
+         WHERE invite_id = ? AND status = 'pending'`,
+        now,
+        inviteRow.invite_id
+      );
+
+      const cancelledInvite = mapInviteRow({
+        ...inviteRow,
+        status: 'cancelled',
+        resolved_at: now,
+      });
+
+      this.sendEventToAccount(inviteRow.requester_account_id, {
+        type: 'invite:updated',
+        invite: cancelledInvite,
+        reason: 'cancelled_by_sender',
+      });
+      this.sendEventToAccount(inviteRow.target_account_id, {
+        type: 'invite:updated',
+        invite: cancelledInvite,
+        reason: 'cancelled_by_sender',
+      });
+
+      return Response.json({
+        invite: cancelledInvite,
+        snapshot: this.buildPresenceSnapshot(body.caller),
+      });
+    }
+
+    // Respond to Invite (Target accepts or declines)
     if (request.method === 'POST' && url.pathname === '/internal/invites/respond') {
       const body = (await request.json()) as {
         responder: AccountProfile;
@@ -1075,6 +1409,7 @@ export class SignalingCoordinator implements DurableObject {
         action: 'accept' | 'decline';
         mediaSelection?: Partial<HostMediaSelection>;
       };
+      this.expireStaleInvites();
 
       const rows = sql
         .exec<InviteRow>(
@@ -1093,7 +1428,7 @@ export class SignalingCoordinator implements DurableObject {
 
       const inviteRow = rows[0];
 
-      // 1. Accept/Decline ONLY from the intended owner (User A)
+      // 1. Accept/Decline ONLY from the intended recipient
       if (body.responder.accountId !== inviteRow.target_account_id) {
         return errorResponse(
           403,
@@ -1102,7 +1437,15 @@ export class SignalingCoordinator implements DurableObject {
         );
       }
 
-      // 2. Simultaneous accepts / already resolved invite check
+      // 2. Expired or already resolved invite check (single outcome guarantee)
+      if (inviteRow.status === 'expired') {
+        return errorResponse(
+          409,
+          'INVITE_EXPIRED',
+          'This connection request has expired.'
+        );
+      }
+
       if (inviteRow.status !== 'pending') {
         return errorResponse(
           409,
@@ -1140,6 +1483,7 @@ export class SignalingCoordinator implements DurableObject {
         return Response.json({
           invite: declinedInvite,
           session: null,
+          snapshot: this.buildPresenceSnapshot(body.responder),
         });
       }
 
@@ -1186,8 +1530,47 @@ export class SignalingCoordinator implements DurableObject {
         );
       }
 
-      // 5. Sanitize User A's independent media consent toggles (both audio options default OFF)
-      const mediaSelection = sanitizeHostMediaSelection(body.mediaSelection);
+      // 5. Role & media consent assignment based on request intent:
+      // - 'connect': target is Host, requester is Viewer (target chooses HostMediaSelection)
+      // - 'invite':  requester (sender) is Host, target (recipient) is Viewer
+      const isReverseInvite = inviteRow.intent === 'invite';
+      let hostPresetSelection: Partial<HostMediaSelection> | undefined;
+      if (isReverseInvite) {
+        try {
+          hostPresetSelection = JSON.parse(
+            inviteRow.host_media_selection_json || '{}'
+          ) as Partial<HostMediaSelection>;
+        } catch {
+          hostPresetSelection = { screenVideo: true };
+        }
+      }
+      const mediaSelection = isReverseInvite
+        ? sanitizeHostMediaSelection({
+            screenVideo: hostPresetSelection?.screenVideo ?? true,
+            microphoneAudio: hostPresetSelection?.microphoneAudio ?? false,
+            deviceAudio: hostPresetSelection?.deviceAudio ?? false,
+          })
+        : sanitizeHostMediaSelection(body.mediaSelection);
+
+      const hostAccountId = isReverseInvite
+        ? inviteRow.requester_account_id
+        : inviteRow.target_account_id;
+      const hostFriendCode = isReverseInvite
+        ? inviteRow.requester_friend_code
+        : inviteRow.target_friend_code;
+      const hostDisplayName = isReverseInvite
+        ? inviteRow.requester_display_name
+        : inviteRow.target_display_name;
+      const guestAccountId = isReverseInvite
+        ? inviteRow.target_account_id
+        : inviteRow.requester_account_id;
+      const guestFriendCode = isReverseInvite
+        ? inviteRow.target_friend_code
+        : inviteRow.requester_friend_code;
+      const guestDisplayName = isReverseInvite
+        ? inviteRow.target_display_name
+        : inviteRow.requester_display_name;
+
       const sessionId = crypto.randomUUID();
 
       sql.exec(
@@ -1213,12 +1596,12 @@ export class SignalingCoordinator implements DurableObject {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         sessionId,
         inviteRow.invite_id,
-        inviteRow.target_account_id,
-        inviteRow.target_friend_code,
-        inviteRow.target_display_name,
-        inviteRow.requester_account_id,
-        inviteRow.requester_friend_code,
-        inviteRow.requester_display_name,
+        hostAccountId,
+        hostFriendCode,
+        hostDisplayName,
+        guestAccountId,
+        guestFriendCode,
+        guestDisplayName,
         JSON.stringify(mediaSelection),
         now,
         now,
@@ -1275,12 +1658,12 @@ export class SignalingCoordinator implements DurableObject {
       const approvedSession: ApprovedSessionSummary = {
         sessionId,
         inviteId: inviteRow.invite_id,
-        hostAccountId: inviteRow.target_account_id,
-        hostFriendCode: inviteRow.target_friend_code,
-        hostDisplayName: inviteRow.target_display_name,
-        guestAccountId: inviteRow.requester_account_id,
-        guestFriendCode: inviteRow.requester_friend_code,
-        guestDisplayName: inviteRow.requester_display_name,
+        hostAccountId,
+        hostFriendCode,
+        hostDisplayName,
+        guestAccountId,
+        guestFriendCode,
+        guestDisplayName,
         hostMediaSelection: mediaSelection,
         createdAt: now,
       };
@@ -1302,6 +1685,7 @@ export class SignalingCoordinator implements DurableObject {
       return Response.json({
         invite: acceptedInvite,
         session: approvedSession,
+        snapshot: this.buildPresenceSnapshot(body.responder),
       });
     }
 

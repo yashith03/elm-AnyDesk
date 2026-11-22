@@ -1453,4 +1453,661 @@ test('7. Anonymous device registration: idempotent retry, secret protection, for
   assert.equal(inviteRes.status, 201);
 });
 
+test('8. Request cancel, close cleanup, 120s expiry, stale presence lookup, and reverse Invite intent', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_780_000_000_000 });
+
+  {
+    const env = createTestEnv();
+    const worker = createApiWorker({
+      codeGenerator: (() => {
+        const codes = ['ELM-1111-2222', 'ELM-3333-4444'];
+        let idx = 0;
+        return () => codes[idx++] ?? 'ELM-9999-0000';
+      })(),
+    });
+
+    const regA = (await (
+      await worker.fetch!(
+        new Request('https://api.elm.local/devices/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: 'device-a-8888-1111',
+            deviceSecret: 'secret-aaaa1111222233334444555566667777',
+          }),
+        }),
+        env,
+        dummyCtx
+      )
+    ).json()) as { token: string; account: AccountProfile };
+
+    const regB = (await (
+      await worker.fetch!(
+        new Request('https://api.elm.local/devices/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: 'device-b-8888-2222',
+            deviceSecret: 'secret-bbbb1111222233334444555566667777',
+          }),
+        }),
+        env,
+        dummyCtx
+      )
+    ).json()) as { token: string; account: AccountProfile };
+
+    const goOnline = async (token: string) => {
+      const r = await worker.fetch!(
+        new Request('https://api.elm.local/presence/connect', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        env,
+        dummyCtx
+      );
+      assert.equal(r.status, 200);
+    };
+
+    const getState = async (token: string) => {
+      const r = await worker.fetch!(
+        new Request('https://api.elm.local/presence/state', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        env,
+        dummyCtx
+      );
+      assert.equal(r.status, 200);
+      return (await r.json()) as {
+        snapshot: {
+          online: boolean;
+          incomingInvites: Array<{ inviteId: string; intent: string }>;
+          outgoingInvite: { inviteId: string; intent: string; expiresAt: string } | null;
+          recentExpiredOutgoingInvite: { inviteId: string; status: string } | null;
+          activeSession: {
+            sessionId: string;
+            hostAccountId: string;
+            guestAccountId: string;
+          } | null;
+        };
+      };
+    };
+
+    await goOnline(regA.token);
+    await goOnline(regB.token);
+
+    // 1. Presence lookup shows peer B online
+    const lookupOnlineRes = await worker.fetch!(
+      new Request('https://api.elm.local/presence/lookup', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCodes: [regB.account.friendCode] }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(lookupOnlineRes.status, 200);
+    const lookupOnline = (await lookupOnlineRes.json()) as {
+      statuses: Record<string, boolean>;
+    };
+    assert.equal(lookupOnline.statuses[regB.account.friendCode], true);
+
+    // 2. Sender A sends request; Recipient B cannot cancel (403); Sender A cancels (200)
+    const inv1Res = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCode: regB.account.friendCode }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(inv1Res.status, 201);
+    const inv1 = (await inv1Res.json()) as {
+      invite: { inviteId: string; expiresAt: string; intent: string };
+    };
+    assert.equal(inv1.invite.intent, 'connect');
+    assert.ok(inv1.invite.expiresAt);
+
+    const bCancelRes = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${inv1.invite.inviteId}/cancel`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${regB.token}` },
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(bCancelRes.status, 403);
+
+    const aCancelRes = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${inv1.invite.inviteId}/cancel`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${regA.token}` },
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(aCancelRes.status, 200);
+
+    const stateBAfterCancel = await getState(regB.token);
+    assert.equal(stateBAfterCancel.snapshot.incomingInvites.length, 0);
+
+    // Late accept after cancel fails cleanly
+    const lateAcceptAfterCancel = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${inv1.invite.inviteId}/respond`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regB.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'accept' }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(lateAcceptAfterCancel.status, 409);
+
+    // 3. Server 60-second expiry: advance clock 61s, verify expiry and single outcome
+    const inv2Res = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCode: regB.account.friendCode }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(inv2Res.status, 201);
+    const inv2 = (await inv2Res.json()) as { invite: { inviteId: string } };
+
+    // Keep both presences alive while verifying inv2 stays pending at 119s and expires at 120s
+    for (let i = 0; i < 4; i++) {
+      t.mock.timers.tick(25_000);
+      await goOnline(regA.token);
+      await goOnline(regB.token);
+    }
+    t.mock.timers.tick(19_000); // t = 119s (< 120s invite, 19s < 30s presence TTL)
+    const stateBeforeExpiry = await getState(regA.token);
+    assert.equal(stateBeforeExpiry.snapshot.outgoingInvite?.inviteId, inv2.invite.inviteId);
+
+    t.mock.timers.tick(1_000); // t = 120s (at deadline, 20s < 30s since last heartbeat)
+
+    const stateAAfterExpiry = await getState(regA.token);
+    assert.equal(stateAAfterExpiry.snapshot.outgoingInvite, null);
+    assert.equal(
+      stateAAfterExpiry.snapshot.recentExpiredOutgoingInvite?.inviteId,
+      inv2.invite.inviteId
+    );
+    assert.equal(
+      stateAAfterExpiry.snapshot.recentExpiredOutgoingInvite?.status,
+      'expired'
+    );
+
+    const stateBAfterExpiry = await getState(regB.token);
+    assert.equal(stateBAfterExpiry.snapshot.incomingInvites.length, 0);
+
+    const lateAcceptExpired = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${inv2.invite.inviteId}/respond`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regB.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'accept' }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(lateAcceptExpired.status, 409);
+    assert.equal(
+      ((await lateAcceptExpired.json()) as { error: string }).error,
+      'INVITE_EXPIRED'
+    );
+
+    const lateCancelExpired = await worker.fetch!(
+      new Request(`https://api.elm.local/invites/${inv2.invite.inviteId}/cancel`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${regA.token}` },
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(lateCancelExpired.status, 409);
+
+    // 4. Stale presence > 30s causes offline status in lookup & TARGET_OFFLINE on invite
+    t.mock.timers.tick(35_000); // 35s since B's last refresh at stateBAfterExpiry (t = 65s)
+    await goOnline(regA.token); // Refresh only A; B is now stale (> 30s)
+    const lookupStaleRes = await worker.fetch!(
+      new Request('https://api.elm.local/presence/lookup', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCodes: [regB.account.friendCode] }),
+      }),
+      env,
+      dummyCtx
+    );
+    const lookupStale = (await lookupStaleRes.json()) as {
+      statuses: Record<string, boolean>;
+    };
+    assert.equal(lookupStale.statuses[regB.account.friendCode], false);
+
+    const offlineInviteRes = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCode: regB.account.friendCode }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(offlineInviteRes.status, 409);
+    assert.equal(
+      ((await offlineInviteRes.json()) as { error: string }).error,
+      'TARGET_OFFLINE'
+    );
+
+    // 5. Disconnect on close cancels pending invite from sender A
+    await goOnline(regB.token);
+    const inv3Res = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCode: regB.account.friendCode }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(inv3Res.status, 201);
+    const disconnectA = await worker.fetch!(
+      new Request('https://api.elm.local/presence/disconnect', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${regA.token}` },
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(disconnectA.status, 200);
+    const stateBAfterQuit = await getState(regB.token);
+    assert.equal(stateBAfterQuit.snapshot.incomingInvites.length, 0);
+
+    // 6. Reverse Invite intent ('invite'): Sender A becomes Host, Acceptor B becomes Guest
+    await goOnline(regA.token);
+    await goOnline(regB.token);
+    const reverseInvRes = await worker.fetch!(
+      new Request('https://api.elm.local/invites', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          friendCode: regB.account.friendCode,
+          intent: 'invite',
+          hostMediaSelection: {
+            screenVideo: true,
+            microphoneAudio: false,
+            deviceAudio: false,
+          },
+        }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(reverseInvRes.status, 201);
+    const reverseInv = (await reverseInvRes.json()) as {
+      invite: { inviteId: string; intent: string };
+    };
+    assert.equal(reverseInv.invite.intent, 'invite');
+
+    const stateBReverse = await getState(regB.token);
+    assert.equal(stateBReverse.snapshot.incomingInvites[0]?.intent, 'invite');
+
+    const acceptReverseRes = await worker.fetch!(
+      new Request(
+        `https://api.elm.local/invites/${reverseInv.invite.inviteId}/respond`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${regB.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ action: 'accept' }),
+        }
+      ),
+      env,
+      dummyCtx
+    );
+    assert.equal(acceptReverseRes.status, 200);
+    const acceptedReverse = (await acceptReverseRes.json()) as {
+      session: {
+        sessionId: string;
+        hostAccountId: string;
+        guestAccountId: string;
+      };
+    };
+    assert.equal(acceptedReverse.session.hostAccountId, regA.account.accountId);
+    assert.equal(acceptedReverse.session.guestAccountId, regB.account.accountId);
+
+    // Accepted session must NOT time out after 125s while both peers remain online
+    for (let i = 0; i < 5; i++) {
+      t.mock.timers.tick(25_000);
+      await goOnline(regA.token);
+      await goOnline(regB.token);
+    }
+    const sessionStillAlive = await getState(regA.token);
+    assert.equal(
+      sessionStillAlive.snapshot.activeSession?.sessionId,
+      acceptedReverse.session.sessionId
+    );
+
+    // 7. Force-quit / network loss by sender clears recipient's pending invite after 30s
+    await worker.fetch!(
+      new Request('https://api.elm.local/sessions/disconnect', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${regA.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sessionId: acceptedReverse.session.sessionId }),
+      }),
+      env,
+      dummyCtx
+    );
+    await goOnline(regA.token);
+    await goOnline(regB.token);
+    const invFq = (
+      await (
+        await worker.fetch!(
+          new Request('https://api.elm.local/invites', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${regA.token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ friendCode: regB.account.friendCode }),
+          }),
+          env,
+          dummyCtx
+        )
+      ).json()
+    ) as { invite: { inviteId: string } };
+    // Simulate A force-quitting (stops polling) while B continues polling past 30s
+    t.mock.timers.tick(20_000);
+    await goOnline(regB.token);
+    t.mock.timers.tick(15_000); // A is 35s stale (> 30s), B is 15s fresh
+    const bAfterAFq = await getState(regB.token);
+    assert.equal(bAfterAFq.snapshot.incomingInvites.length, 0);
+    const lateAccAfterFq = await worker.fetch!(
+      new Request(
+        `https://api.elm.local/invites/${invFq.invite.inviteId}/respond`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${regB.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ action: 'accept' }),
+        }
+      ),
+      env,
+      dummyCtx
+    );
+    assert.equal(lateAccAfterFq.status, 409);
+  }
+});
+
+test('9. Automatic presence heartbeat, controllable 30s expiry, auth protection, batch lookup validation & rate limiting, and non-resumable reconnect', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const env = createTestEnv();
+  const worker = createApiWorker();
+
+  const registerDevice = async (deviceId: string, deviceSecret: string) => {
+    const res = await worker.fetch!(
+      new Request('https://api.elm.local/devices/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId, deviceSecret }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(res.status, 200);
+    return (await res.json()) as { token: string; account: AccountProfile };
+  };
+
+  const devA = await registerDevice('dev-presence-00000001', 'a'.repeat(40));
+  const devB = await registerDevice('dev-presence-00000002', 'b'.repeat(40));
+
+  // 1. Invalid/missing credentials cannot update presence or query lookup
+  for (const pathname of ['/presence/connect', '/presence/heartbeat', '/presence/disconnect', '/presence/lookup']) {
+    const unauth = await worker.fetch!(
+      new Request(`https://api.elm.local${pathname}`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer invalid.forged.token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ friendCodes: [devA.account.friendCode] }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(unauth.status, 401, `${pathname} must reject invalid credentials`);
+  }
+
+  // 2. Connect A & B -> two independent devices query each other's status
+  const connA = await worker.fetch!(
+    new Request('https://api.elm.local/presence/connect', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(connA.status, 200);
+  const connABody = (await connA.json()) as { snapshot: PresenceStateSnapshot; serverTime: string };
+  assert.equal(connABody.snapshot.online, true);
+  assert.ok(connABody.serverTime);
+
+  const connB = await worker.fetch!(
+    new Request('https://api.elm.local/presence/connect', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(connB.status, 200);
+
+  const lookupAtA = await worker.fetch!(
+    new Request('https://api.elm.local/presence/lookup', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCodes: [devB.account.friendCode, 'INVALID-CODE'] }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(lookupAtA.status, 200);
+  const lookupAtABody = (await lookupAtA.json()) as { statuses: Record<string, boolean> };
+  assert.equal(lookupAtABody.statuses[devB.account.friendCode], true);
+  assert.equal('INVALID-CODE' in lookupAtABody.statuses, false);
+
+  // 3. Heartbeat keeps A fresh at 20s while B stalls past 30s (force-quit expiry)
+  t.mock.timers.tick(20_000);
+  const hbA = await worker.fetch!(
+    new Request('https://api.elm.local/presence/heartbeat', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(hbA.status, 200);
+  assert.equal(((await hbA.json()) as { snapshot: PresenceStateSnapshot }).snapshot.online, true);
+
+  t.mock.timers.tick(15_000); // A is 15s fresh; B is 35s stale (> 30s)
+  const lookupAfterExpiry = await worker.fetch!(
+    new Request('https://api.elm.local/presence/lookup', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCodes: [devB.account.friendCode] }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(lookupAfterExpiry.status, 200);
+  assert.equal(
+    ((await lookupAfterExpiry.json()) as { statuses: Record<string, boolean> }).statuses[devB.account.friendCode],
+    false
+  );
+
+  // Inviting stale B must return TARGET_OFFLINE
+  const inviteStaleB = await worker.fetch!(
+    new Request('https://api.elm.local/invites', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCode: devB.account.friendCode }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(inviteStaleB.status, 409);
+  assert.equal(((await inviteStaleB.json()) as { error: string }).error, 'TARGET_OFFLINE');
+
+  // 4. B recovers via heartbeat -> Online again -> accepts session -> disconnect ends session -> heartbeat never restores ended session
+  const hbB = await worker.fetch!(
+    new Request('https://api.elm.local/presence/heartbeat', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(hbB.status, 200);
+  assert.equal(((await hbB.json()) as { snapshot: PresenceStateSnapshot }).snapshot.online, true);
+
+  const invRes = await worker.fetch!(
+    new Request('https://api.elm.local/invites', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devA.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCode: devB.account.friendCode }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(invRes.status, 201);
+  const createdInv = ((await invRes.json()) as { invite: InviteSummary }).invite;
+
+  const accRes = await worker.fetch!(
+    new Request(`https://api.elm.local/invites/${createdInv.inviteId}/respond`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'accept' }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(accRes.status, 200);
+
+  // Normal close disconnect from B terminates active session and marks B offline
+  const discB = await worker.fetch!(
+    new Request('https://api.elm.local/presence/disconnect', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'app_closed' }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(discB.status, 200);
+
+  // Reconnecting presence after restart/recovery must NOT restore the ended session
+  const reconnectB = await worker.fetch!(
+    new Request('https://api.elm.local/presence/connect', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(reconnectB.status, 200);
+  const reconnectBBody = (await reconnectB.json()) as { snapshot: PresenceStateSnapshot };
+  assert.equal(reconnectBBody.snapshot.online, true);
+  assert.equal(reconnectBBody.snapshot.activeSession, null);
+
+  // 5. Batch lookup validation (> 50 codes rejected with 400) and rate limiting (429 after 30 reqs/60s)
+  const oversizedCodes = Array.from({ length: 51 }, (_, idx) => `ELM-AAAA-${String(idx + 1000).replace(/0/g, '2').replace(/1/g, '3').slice(0, 4)}`);
+  const oversizedRes = await worker.fetch!(
+    new Request('https://api.elm.local/presence/lookup', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCodes: oversizedCodes }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(oversizedRes.status, 400);
+
+  for (let i = 0; i < 30; i++) {
+    const okRes = await worker.fetch!(
+      new Request('https://api.elm.local/presence/lookup', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ friendCodes: [devA.account.friendCode] }),
+      }),
+      env,
+      dummyCtx
+    );
+    assert.equal(okRes.status, 200);
+  }
+  const rateLimited = await worker.fetch!(
+    new Request('https://api.elm.local/presence/lookup', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCodes: [devA.account.friendCode] }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(rateLimited.status, 429);
+  assert.equal(((await rateLimited.json()) as { error: string }).error, 'RATE_LIMITED');
+  assert.ok(Number(rateLimited.headers.get('Retry-After')) >= 1);
+
+  // After 60s window expires, rate limit resets
+  t.mock.timers.tick(61_000);
+  const afterWindow = await worker.fetch!(
+    new Request('https://api.elm.local/presence/lookup', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${devB.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ friendCodes: [devA.account.friendCode] }),
+    }),
+    env,
+    dummyCtx
+  );
+  assert.equal(afterWindow.status, 200);
+});
+
 

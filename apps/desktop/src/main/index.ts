@@ -15,6 +15,7 @@ import {
   DEFAULT_HOST_MEDIA_SELECTION,
   PROTOCOL_VERSION,
   type HostMediaSelection,
+  type InviteIntent,
   type MediaSourceKind,
   type SessionTerminationReason,
   type WebRtcSignalPayload,
@@ -22,6 +23,7 @@ import {
 import type {
   DesktopRuntimeMetadata,
   DesktopWindowRole,
+  PresenceRuntimeStatus,
   ShareableSourceDescriptor,
   TaskbarDwmTelemetry,
   VolatileSessionUiState,
@@ -221,9 +223,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function broadcastPresenceStatus(status: PresenceRuntimeStatus): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('elm:presence-status-updated', status);
+  }
+}
+
 function getAuthController(): DesktopAuthAndInviteController {
   if (!authInviteController) {
-    authInviteController = new DesktopAuthAndInviteController();
+    authInviteController = new DesktopAuthAndInviteController(undefined, {
+      onPresenceStatusChanged: broadcastPresenceStatus,
+    });
   }
   return authInviteController;
 }
@@ -260,6 +270,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     minHeight: 640,
     title: 'Elm-AnyDesk — Consent-Based 1:1 Screen Share',
     icon: getWindowIconPath(),
+    titleBarStyle: 'hidden',
     autoHideMenuBar: true,
     backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
     webPreferences: createSecureWebPreferences(),
@@ -274,17 +285,27 @@ async function createMainWindow(): Promise<BrowserWindow> {
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'main' } });
 
+  win.on('maximize', () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send('elm:window-maximized-changed', true);
+    }
+  });
+  win.on('unmaximize', () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send('elm:window-maximized-changed', false);
+    }
+  });
+
   win.on('closed', () => {
     wasapiManager.stopCapture();
     resetVolatileUiState();
-    getAuthController().disconnectActiveSession({
-      reason: 'app_closed',
-      subReason: 'main_window_closed',
-    });
     mainWindow = null;
     taskbarDwmController = null;
     if (chatWindow && !chatWindow.isDestroyed()) {
       chatWindow.close();
+    }
+    if (presentationWindow && !presentationWindow.isDestroyed()) {
+      presentationWindow.close();
     }
   });
 
@@ -351,6 +372,9 @@ async function createOrFocusPresentationWindow(): Promise<BrowserWindow> {
 
   windowRoles.set(win, 'presentation');
   attachWindowSecurityGuards(win);
+
+  const presentationDwm = new Win11TaskbarDwmController(win);
+  presentationDwm.initialize();
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'presentation' } });
@@ -498,7 +522,16 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'elm:device-save-local-profile',
-    (_event, input: { name: string; email?: string; phone?: string }) => {
+    (
+      _event,
+      input: {
+        name: string;
+        email?: string;
+        phone?: string;
+        shareEmailWithPeers?: boolean;
+        sharePhoneWithPeers?: boolean;
+      }
+    ) => {
       return getAuthController().saveLocalProfile(input);
     }
   );
@@ -542,6 +575,14 @@ function registerIpcHandlers(): void {
     return getAuthController().getPresenceSnapshot();
   });
 
+  ipcMain.handle('elm:presence-get-runtime-status', () => {
+    return getAuthController().getPresenceRuntimeStatus();
+  });
+
+  ipcMain.handle('elm:presence-trigger-reconnect', () => {
+    return getAuthController().triggerPresenceReconnect();
+  });
+
   ipcMain.handle(
     'elm:presence-set-online',
     (
@@ -561,8 +602,81 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle('elm:invites-send', (_event, friendCode: string) => {
-    return getAuthController().sendFriendCodeInvite(String(friendCode ?? ''));
+  ipcMain.handle(
+    'elm:invites-send',
+    (
+      _event,
+      input:
+        | string
+        | {
+            friendCode: string;
+            intent?: InviteIntent;
+            hostMediaSelection?: HostMediaSelection;
+          }
+    ) => {
+      return getAuthController().sendFriendCodeInvite(input);
+    }
+  );
+
+  ipcMain.handle('elm:invites-cancel', (_event, inviteId: string) => {
+    return getAuthController().cancelOutgoingInvite(String(inviteId ?? ''));
+  });
+
+  ipcMain.handle(
+    'elm:presence-lookup',
+    (_event, friendCodes: string[]) => {
+      return getAuthController().lookupDevicePresence(
+        Array.isArray(friendCodes) ? friendCodes.map(String) : []
+      );
+    }
+  );
+
+  ipcMain.handle('elm:recent-peers-get', () => {
+    return getAuthController().getRecentPeers();
+  });
+
+  ipcMain.handle(
+    'elm:recent-peers-record',
+    (
+      _event,
+      params: { friendCode: string; defaultAlias?: string; connectedAt?: string }
+    ) => {
+      return getAuthController().recordConnectedPeer(params);
+    }
+  );
+
+  ipcMain.handle(
+    'elm:recent-peers-update-contact',
+    (
+      _event,
+      params: {
+        friendCode: string;
+        peerName?: string;
+        email?: string;
+        phone?: string;
+        connectedAt?: string;
+      }
+    ) => {
+      return getAuthController().updateRecentPeerContact(params);
+    }
+  );
+
+  ipcMain.handle(
+    'elm:recent-peers-toggle-favorite',
+    (_event, friendCode: string) => {
+      return getAuthController().toggleFavoritePeer(String(friendCode ?? ''));
+    }
+  );
+
+  ipcMain.handle(
+    'elm:recent-peers-rename',
+    (_event, params: { friendCode: string; alias: string }) => {
+      return getAuthController().renameRecentPeer(params);
+    }
+  );
+
+  ipcMain.handle('elm:recent-peers-remove', (_event, friendCode: string) => {
+    return getAuthController().removeRecentPeer(String(friendCode ?? ''));
   });
 
   ipcMain.handle(
@@ -780,6 +894,34 @@ function registerIpcHandlers(): void {
     }
   );
 
+  ipcMain.handle('elm:window-minimize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.minimize();
+    }
+  });
+
+  ipcMain.handle('elm:window-toggle-maximize', (): { maximized: boolean } => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { maximized: false };
+    }
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+    return { maximized: mainWindow.isMaximized() };
+  });
+
+  ipcMain.handle('elm:window-close', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
+
+  ipcMain.handle('elm:window-is-maximized', (): boolean => {
+    return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized());
+  });
+
   ipcMain.handle(
     'elm:verify-static-thumbnail-and-peek',
     async (): Promise<TaskbarDwmTelemetry> => {
@@ -879,10 +1021,17 @@ app.whenReady().then(async () => {
   powerMonitor.on('suspend', () => {
     wasapiManager.stopCapture();
     resetVolatileUiState();
-    getAuthController().disconnectActiveSession({
+    const ctrl = getAuthController();
+    ctrl.pausePresenceForSuspend();
+    void ctrl.disconnectActiveSession({
       reason: 'connection_lost',
       subReason: 'os_sleep_suspend',
     });
+  });
+
+  powerMonitor.on('resume', () => {
+    // Re-establish presence only; never restore an ended screen-sharing session.
+    void getAuthController().triggerPresenceReconnect();
   });
 
   mainWindow = await createMainWindow();
@@ -1342,13 +1491,25 @@ async function runAutomatedPrototypeSuite(win: BrowserWindow): Promise<void> {
   }
 }
 
-app.on('before-quit', () => {
+let cleanupCompletedBeforeQuit = false;
+
+app.on('before-quit', (event) => {
   wasapiManager.stopCapture();
   resetVolatileUiState();
-  getAuthController().disconnectActiveSession({
-    reason: 'app_closed',
-    subReason: 'app_before_quit',
-  });
+  if (!cleanupCompletedBeforeQuit) {
+    event.preventDefault();
+    cleanupCompletedBeforeQuit = true;
+    void (async () => {
+      try {
+        await Promise.race([
+          getAuthController().cleanupOnAppQuit(),
+          new Promise((r) => setTimeout(r, 2500)),
+        ]);
+      } finally {
+        app.quit();
+      }
+    })();
+  }
 });
 
 app.on('window-all-closed', () => {

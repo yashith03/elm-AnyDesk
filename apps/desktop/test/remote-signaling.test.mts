@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import {
+  buildOutgoingPeerContactCard,
+  resolveRecentPeerDisplayName,
+  sanitizePeerContactFrame,
+  upsertRecentPeerContact,
+  upsertSuccessfulPeerConnection,
+  type RecentPeerEntry,
+} from '../src/shared/recent-peers.ts';
 
 /**
  * Integration test for two independent device clients (A and B) with separate
@@ -354,5 +365,167 @@ test('two independent device clients complete invite, recipient-only accept/decl
     assert.equal(postDiscSig.status, 409);
   } finally {
     server.close();
+  }
+});
+
+test('two independent clients exchange P2P contact details with opt-in privacy, persist locally across restart, reject malformed frames, and never send profile data to Cloudflare', async () => {
+  const capturedBackendRequests: string[] = [];
+
+  const server = http.createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const rawBody = Buffer.concat(chunks).toString('utf8');
+    capturedBackendRequests.push(`${req.method} ${req.url} ${rawBody}`);
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    if (req.method === 'POST' && url.pathname === '/devices/register') {
+      const parsed = rawBody ? (JSON.parse(rawBody) as { deviceId?: string }) : {};
+      const idx = parsed.deviceId?.endsWith('A') ? 1 : 2;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          token: `tok-${idx}`,
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          alreadyRegistered: false,
+          account: {
+            accountId: `acct-${idx}`,
+            provider: 'anonymous-device',
+            providerSubject: `dev-${idx}`,
+            displayName: 'Elm Device',
+            friendCode: idx === 1 ? 'ELM-HOST-0001' : 'ELM-PEER-0002',
+            createdAt: new Date().toISOString(),
+          },
+        })
+      );
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  assert.ok(addr && typeof addr === 'object');
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'elm-contact-p2p-'));
+  const statePathA = path.join(tmpDir, 'client-a.json');
+  const statePathB = path.join(tmpDir, 'client-b.json');
+
+  try {
+    // Client A and Client B register anonymously (deviceId + deviceSecret only — zero profile fields)
+    await fetch(`${baseUrl}/devices/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: 'device-000000000000000A', deviceSecret: 's'.repeat(32) }),
+    });
+    await fetch(`${baseUrl}/devices/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: 'device-000000000000000B', deviceSecret: 't'.repeat(32) }),
+    });
+
+    // Local profiles stored strictly on each device
+    const profileA = {
+      name: 'Alice Host',
+      email: '',
+      phone: '+1 555-0101', // phone-only entered
+      updatedAt: '2026-11-22T02:00:00.000Z',
+    };
+    const profileB = {
+      name: 'Bob Guest',
+      email: 'bob.shared@example.com',
+      phone: '+1 555-0202',
+      updatedAt: '2026-11-22T02:00:00.000Z',
+    };
+
+    // Simulate direct P2P DataChannel exchange after session approval
+    const cardA = buildOutgoingPeerContactCard(profileA);
+    const cardB = buildOutgoingPeerContactCard(profileB);
+    const wireFromA = JSON.stringify({
+      __elmControl: 'peer-contact-card',
+      sender: 'host',
+      ...cardA,
+    });
+    const wireFromB = JSON.stringify({
+      __elmControl: 'peer-contact-card',
+      sender: 'guest',
+      ...cardB,
+    });
+
+    const parsedAtB = sanitizePeerContactFrame(JSON.parse(wireFromA));
+    const parsedAtA = sanitizePeerContactFrame(JSON.parse(wireFromB));
+    assert.ok(parsedAtB);
+    assert.ok(parsedAtA);
+
+    // Reject malformed DataChannel payload without corrupting state
+    assert.equal(
+      sanitizePeerContactFrame({ __elmControl: 'peer-contact-card', sender: 'host', name: null, email: '', phone: '' }),
+      null
+    );
+
+    let peersA: RecentPeerEntry[] = upsertSuccessfulPeerConnection([], {
+      friendCode: 'ELM-PEER-0002',
+    });
+    peersA = upsertRecentPeerContact(peersA, {
+      friendCode: 'ELM-PEER-0002',
+      peerName: parsedAtA.contact.name,
+      email: parsedAtA.contact.email,
+      phone: parsedAtA.contact.phone,
+    });
+
+    let peersB: RecentPeerEntry[] = upsertSuccessfulPeerConnection([], {
+      friendCode: 'ELM-HOST-0001',
+    });
+    peersB = upsertRecentPeerContact(peersB, {
+      friendCode: 'ELM-HOST-0001',
+      peerName: parsedAtB.contact.name,
+      email: parsedAtB.contact.email,
+      phone: parsedAtB.contact.phone,
+    });
+
+    // Persist locally and simulate restart by reloading from disk
+    fs.writeFileSync(statePathA, JSON.stringify({ localProfile: profileA, recentPeers: peersA }), 'utf8');
+    fs.writeFileSync(statePathB, JSON.stringify({ localProfile: profileB, recentPeers: peersB }), 'utf8');
+
+    const reloadedA = JSON.parse(fs.readFileSync(statePathA, 'utf8')) as {
+      localProfile: typeof profileA;
+      recentPeers: RecentPeerEntry[];
+    };
+    const reloadedB = JSON.parse(fs.readFileSync(statePathB, 'utf8')) as {
+      localProfile: typeof profileB;
+      recentPeers: RecentPeerEntry[];
+    };
+
+    // Client B sees Alice's name + phone (without email because Alice left email blank)
+    assert.equal(resolveRecentPeerDisplayName(reloadedB.recentPeers[0]), 'Alice Host');
+    assert.equal(reloadedB.recentPeers[0].email, undefined);
+    assert.equal(reloadedB.recentPeers[0].phone, '+1 555-0101');
+
+    // Client A sees Bob's name + email + phone (all entered fields shared P2P)
+    assert.equal(resolveRecentPeerDisplayName(reloadedA.recentPeers[0]), 'Bob Guest');
+    assert.equal(reloadedA.recentPeers[0].email, 'bob.shared@example.com');
+    assert.equal(reloadedA.recentPeers[0].phone, '+1 555-0202');
+
+    // Verify ZERO personal profile data reached Cloudflare backend
+    const allBackendTraffic = capturedBackendRequests.join('\n');
+    for (const secret of [
+      'Alice Host',
+      'Bob Guest',
+      'alice.private@example.com',
+      'bob.shared@example.com',
+      '+1 555-0101',
+      '+1 555-0202',
+      'shareEmailWithPeers',
+      'sharePhoneWithPeers',
+    ]) {
+      assert.equal(
+        allBackendTraffic.includes(secret),
+        false,
+        `Backend request unexpectedly contained personal profile field: ${secret}`
+      );
+    }
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

@@ -126,10 +126,22 @@ function formatHResult(hr: number): string {
 }
 
 /**
- * Creates a 32-bit bottom-up BGRA DIB section containing a static Elm-AnyDesk
- * shield logo graphic (never real window content).
+ * Builds an opaque solid-white (#FFFFFF) 32-bit BGRA pixel buffer with no logos or borders.
  */
-function createStaticLogoBitmap(
+export function buildSolidWhiteBgraBuffer(
+  width: number,
+  height: number
+): Buffer {
+  const safeWidth = Math.max(1, Math.floor(width));
+  const safeHeight = Math.max(1, Math.floor(height));
+  return Buffer.alloc(safeWidth * safeHeight * 4, 0xff);
+}
+
+/**
+ * Creates a 32-bit bottom-up BGRA DIB section containing a plain solid white
+ * background (no logos, emblems, borders, or live window content).
+ */
+function createSolidWhiteBitmap(
   apis: Win32Apis,
   requestedWidth: number,
   requestedHeight: number
@@ -152,63 +164,7 @@ function createStaticLogoBitmap(
   const bitsPtr = ppvBits.readBigUInt64LE(0);
 
   if (hBitmap !== 0n && bitsPtr !== 0n) {
-    // Render static logo pixels in memory and copy into the DIB section
-    const pixelBuf = Buffer.alloc(width * height * 4);
-    const cx = Math.floor(width / 2);
-    const cy = Math.floor(height / 2);
-    const shieldRadius = Math.max(12, Math.floor(Math.min(width, height) * 0.28));
-
-    for (let y = 0; y < height; y++) {
-      // Bottom-up row index
-      const dibRow = height - 1 - y;
-      const isBorder =
-        y < 3 || y >= height - 3 || false;
-
-      for (let x = 0; x < width; x++) {
-        const offset = (dibRow * width + x) * 4;
-        const borderEdge =
-          isBorder || x < 3 || x >= width - 3;
-
-        const dx = x - cx;
-        const dy = y - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-
-        let r = 15;
-        let g = 23;
-        let b = 42; // Dark slate #0f172a
-
-        if (borderEdge) {
-          // Royal blue outer frame #2563eb
-          r = 37;
-          g = 99;
-          b = 235;
-        } else if (dist <= shieldRadius) {
-          if (dist >= shieldRadius - 3) {
-            // Cyan-blue shield ring #38bdf8
-            r = 56;
-            g = 189;
-            b = 248;
-          } else if (Math.abs(dx) <= 4 || Math.abs(dy) <= 4) {
-            // Inner emblem cross #f8fafc
-            r = 248;
-            g = 250;
-            b = 252;
-          } else {
-            // Shield fill #1d4ed8
-            r = 29;
-            g = 78;
-            b = 216;
-          }
-        }
-
-        pixelBuf[offset + 0] = b; // Blue
-        pixelBuf[offset + 1] = g; // Green
-        pixelBuf[offset + 2] = r; // Red
-        pixelBuf[offset + 3] = 255; // Alpha (opaque)
-      }
-    }
-
-    // Copy pixelBuf into the native DIB section memory via RtlMoveMemory
+    const pixelBuf = buildSolidWhiteBgraBuffer(width, height);
     apis.RtlMoveMemory(bitsPtr, pixelBuf, BigInt(pixelBuf.byteLength));
   }
 
@@ -354,7 +310,7 @@ export class Win11TaskbarDwmController {
     trigger: string
   ): void {
     const apis = getWin32Apis();
-    const { hBitmap, width, height } = createStaticLogoBitmap(
+    const { hBitmap, width, height } = createSolidWhiteBitmap(
       apis,
       maxWidth,
       maxHeight
@@ -379,7 +335,7 @@ export class Win11TaskbarDwmController {
   private supplyStaticLivePreview(trigger: string): void {
     const apis = getWin32Apis();
     const bounds = this.win.getBounds();
-    const { hBitmap } = createStaticLogoBitmap(
+    const { hBitmap } = createSolidWhiteBitmap(
       apis,
       Math.min(360, bounds.width),
       Math.min(240, bounds.height)

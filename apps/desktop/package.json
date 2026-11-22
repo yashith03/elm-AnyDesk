@@ -7,7 +7,7 @@
   "scripts": {
     "lint": "npm run typecheck",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
-    "test": "node --experimental-strip-types --test test/theme.test.mts test/readability.test.mts test/incoming-request.test.mts test/floating-panel.test.mts test/chat-attachments.test.mts test/remote-signaling.test.mts test/session-ui-status.test.mts",
+    "test": "node --experimental-strip-types --test test/theme.test.mts test/readability.test.mts test/incoming-request.test.mts test/recent-peers.test.mts test/floating-panel.test.mts test/chat-attachments.test.mts test/remote-signaling.test.mts test/session-ui-status.test.mts test/win11-dwm.test.mts test/home-ui-state.test.mts test/presence-lifecycle.test.mts",
     "build:node": "node scripts/build-electron.mjs",
     "build:renderer": "vite build",
     "build": "npm run build:node && npm run build:renderer",
