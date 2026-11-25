@@ -1190,13 +1190,21 @@ try {
   await cdpA.click('[data-testid="floating-panel-chat"] button[type="submit"]');
 
   await waitForCondition(
-    'Host B Chat Popup receives A->B message',
+    'Host B Chat Popup receives A->B message with real sender name',
     () =>
-      hostChatCdp.eval<boolean>(
-        `(document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '').includes(${JSON.stringify(
-          msgAtoB
-        )})`
-      ),
+      hostChatCdp.eval<boolean>(`(() => {
+        const txt = document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '';
+        return txt.includes(${JSON.stringify(msgAtoB)}) && txt.includes('Test Friend A') && !txt.includes('Elm Device');
+      })()`),
+    8_000
+  );
+  await waitForCondition(
+    'Viewer A outgoing text message reaches Seen (✓✓) status',
+    () =>
+      cdpA.eval<boolean>(`(() => {
+        const ticks = Array.from(document.querySelectorAll('[data-testid^="chat-status-"]'));
+        return ticks.some((el) => el.getAttribute('data-status') === 'seen' && el.textContent?.trim() === '✓✓');
+      })()`),
     8_000
   );
 
@@ -1207,16 +1215,29 @@ try {
   await hostChatCdp.click('[data-testid="floating-panel-chat"] button[type="submit"]');
 
   await waitForCondition(
-    'Viewer A receives B->A message from Host Chat Popup',
+    'Viewer A receives B->A message with real sender name',
     () =>
-      cdpA.eval<boolean>(
-        `(document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '').includes(${JSON.stringify(
-          msgBtoA
-        )})`
-      ),
+      cdpA.eval<boolean>(`(() => {
+        const txt = document.querySelector('[data-testid="floating-panel-chat"]')?.textContent || '';
+        return txt.includes(${JSON.stringify(msgBtoA)}) && txt.includes('Test Friend B') && !txt.includes('Elm Device');
+      })()`),
     8_000
   );
-  recordStep('bidirectional_chat', 'PASSED', { msgAtoB, msgBtoA });
+  await waitForCondition(
+    'Host B Chat Popup outgoing text message reaches Seen (✓✓) status',
+    () =>
+      hostChatCdp.eval<boolean>(`(() => {
+        const ticks = Array.from(document.querySelectorAll('[data-testid^="chat-status-"]'));
+        return ticks.some((el) => el.getAttribute('data-status') === 'seen' && el.textContent?.trim() === '✓✓');
+      })()`),
+    8_000
+  );
+  recordStep('bidirectional_chat', 'PASSED', {
+    msgAtoB,
+    msgBtoA,
+    realSenderNamesShown: true,
+    seenStatusConfirmedOnBoth: true,
+  });
 
   // 6. Chat Image Transfer (Viewer A <-> Host B Chat Popup via real DataChannel chunking)
   const attachAndSendTestPng = async (
@@ -1272,11 +1293,13 @@ try {
     'from-b.png'
   );
   await waitForCondition(
-    'Viewer A renders both images (own + from B)',
+    'Viewer A renders both images (own + from B) and both outgoing messages are Seen (✓✓)',
     () =>
-      cdpA.eval<boolean>(
-        `document.querySelectorAll('[data-testid="floating-panel-chat"] img').length >= 2`
-      ),
+      cdpA.eval<boolean>(`(() => {
+        const imgs = document.querySelectorAll('[data-testid="floating-panel-chat"] img').length >= 2;
+        const ticks = Array.from(document.querySelectorAll('[data-testid^="chat-status-"]'));
+        return imgs && ticks.length >= 2 && ticks.every((el) => el.getAttribute('data-status') === 'seen');
+      })()`),
     10_000
   );
 

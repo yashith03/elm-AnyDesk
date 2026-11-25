@@ -3,6 +3,7 @@ import type {
   AllowedScreenSurface,
   ApprovedSessionSummary,
   BackendCompatibilityStatus,
+  ChatDeliveryStatus,
   DevicePresenceConnectionState,
   DeviceRegistrationStatus,
   EphemeralChatMessage,
@@ -142,6 +143,7 @@ export interface VolatileSessionUiState {
   readonly messagePreviewsEnabled: boolean;
   readonly messages: readonly EphemeralChatMessage[];
   readonly imageAttachmentsByMessageId: Record<string, string>;
+  readonly messageStatusesById: Record<string, ChatDeliveryStatus>;
   readonly hostMediaState: HostMediaRuntimeState | null;
 }
 
@@ -402,6 +404,12 @@ export interface ElmDesktopBridge {
   requestHostStopSharingFromChatWindow: (
     target: MediaSourceKind | 'all'
   ) => Promise<{ requested: boolean }>;
+  markChatMessagesSeen: (
+    messageIds: readonly string[]
+  ) => Promise<{ marked: boolean }>;
+  onChatMessagesSeenRequested: (
+    listener: (messageIds: readonly string[]) => void
+  ) => () => void;
   onVolatileSessionUiStateUpdated: (
     listener: (state: VolatileSessionUiState) => void
   ) => () => void;

@@ -5,6 +5,7 @@ import {
   STREAM_ID_BY_SOURCE,
   validateStunOnlyIceServers,
   type ApprovedSessionSummary,
+  type ChatDeliveryStatus,
   type EphemeralChatMessage,
   type HostMediaRuntimeState,
   type HostMediaSelection,
@@ -96,6 +97,7 @@ export interface WebRtcSessionSnapshot {
   readonly guestPlayback: GuestLocalPlaybackControls;
   readonly messages: readonly EphemeralChatMessage[];
   readonly imageAttachmentsByMessageId: Readonly<Record<string, string>>;
+  readonly messageStatusesById: Readonly<Record<string, ChatDeliveryStatus>>;
   readonly lastStatusBanner: string | null;
   readonly permissionsInvalidated: boolean;
   readonly signalingMembershipInvalidated: boolean;
@@ -237,8 +239,139 @@ export class ApprovedWebRtcSessionController {
 
   private readonly messages: EphemeralChatMessage[] = [];
   private imageAttachments: Record<string, string> = {};
+  private messageStatusesById: Record<string, ChatDeliveryStatus> = {};
+  private readonly sentSeenAckIds = new Set<string>();
+  private readonly pendingSeenAckIds = new Set<string>();
   private readonly imageReassemblyBuffer = new ChatImageReassemblyBuffer();
   private lastStatusBanner: string | null = null;
+  private localDisplayName: string | null = null;
+  private resolvedPeerDisplayName: string | null = null;
+
+  private static isGenericDisplayName(name: string | null | undefined): boolean {
+    const norm = (name ?? '').trim().toLowerCase();
+    return (
+      !norm ||
+      norm === 'elm device' ||
+      norm === 'windows desktop' ||
+      norm === 'unknown device'
+    );
+  }
+
+  public setLocalDisplayName(name: string | null | undefined): void {
+    const trimmed = (name ?? '').trim();
+    this.localDisplayName = trimmed && !ApprovedWebRtcSessionController.isGenericDisplayName(trimmed)
+      ? trimmed
+      : null;
+  }
+
+  private resolveOutgoingSenderName(
+    explicitName: string | undefined,
+    sender: 'host' | 'guest'
+  ): string {
+    const candidates = [
+      explicitName,
+      this.localDisplayName,
+      this.localContactCard?.name,
+      sender === 'host'
+        ? this.session.hostDisplayName
+        : this.session.guestDisplayName,
+    ];
+    for (const c of candidates) {
+      const trimmed = (c ?? '').trim();
+      if (trimmed && !ApprovedWebRtcSessionController.isGenericDisplayName(trimmed)) {
+        return trimmed;
+      }
+    }
+    return sender === 'host'
+      ? this.session.hostDisplayName || this.session.hostFriendCode
+      : this.session.guestDisplayName || this.session.guestFriendCode;
+  }
+
+  private resolveIncomingSenderName(rawName: string | undefined): string {
+    const trimmed = (rawName ?? '').trim();
+    if (trimmed && !ApprovedWebRtcSessionController.isGenericDisplayName(trimmed)) {
+      return trimmed;
+    }
+    if (this.resolvedPeerDisplayName) {
+      return this.resolvedPeerDisplayName;
+    }
+    return trimmed || 'Peer';
+  }
+
+  private updateMessageStatusMonotonic(
+    messageId: string,
+    nextStatus: ChatDeliveryStatus
+  ): boolean {
+    const rank: Record<ChatDeliveryStatus, number> = {
+      sent: 1,
+      delivered: 2,
+      seen: 3,
+    };
+    const current = this.messageStatusesById[messageId];
+    if (current && rank[current] >= rank[nextStatus]) {
+      return false;
+    }
+    this.messageStatusesById = {
+      ...this.messageStatusesById,
+      [messageId]: nextStatus,
+    };
+    return true;
+  }
+
+  private flushPendingSeenAcks(side: 'host' | 'guest'): void {
+    if (this.closed || this.pendingSeenAckIds.size === 0) return;
+    const channel =
+      side === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (!channel || channel.readyState !== 'open') return;
+    const ids = Array.from(this.pendingSeenAckIds);
+    this.pendingSeenAckIds.clear();
+    this.sendControlFrame(side, {
+      __elmControl: 'chat-seen',
+      sender: side,
+      sessionId: this.session.sessionId,
+      messageIds: ids,
+    });
+  }
+
+  public markMessagesSeen(messageIds: readonly string[]): void {
+    if (this.closed || messageIds.length === 0) return;
+    const localAccountId =
+      this.localRole === 'guest'
+        ? this.session.guestAccountId
+        : this.session.hostAccountId;
+    const validIds: string[] = [];
+    for (const id of messageIds) {
+      if (!id || this.sentSeenAckIds.has(id)) continue;
+      const msg = this.messages.find(
+        (m) =>
+          m.messageId === id &&
+          m.sessionId === this.session.sessionId &&
+          (this.mode === 'loopback' || m.senderAccountId !== localAccountId)
+      );
+      if (msg) {
+        this.sentSeenAckIds.add(id);
+        validIds.push(id);
+      }
+    }
+    if (validIds.length === 0) return;
+
+    const side: 'host' | 'guest' =
+      this.localRole === 'guest' ? 'guest' : 'host';
+    const channel =
+      side === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (channel && channel.readyState === 'open') {
+      this.sendControlFrame(side, {
+        __elmControl: 'chat-seen',
+        sender: side,
+        sessionId: this.session.sessionId,
+        messageIds: validIds,
+      });
+    } else {
+      for (const id of validIds) {
+        this.pendingSeenAckIds.add(id);
+      }
+    }
+  }
 
   public sendChatImageOverDataChannel(params: {
     sender: 'host' | 'guest';
@@ -268,12 +401,16 @@ export class ApprovedWebRtcSessionController {
     const messageId = crypto.randomUUID();
     const sentAt = new Date().toISOString();
     const trimmedText = params.text.trim() || '[Image]';
+    const resolvedSenderName = this.resolveOutgoingSenderName(
+      params.senderDisplayName,
+      params.sender
+    );
     try {
       const frames = chunkChatImagePayload({
         messageId,
         sessionId: this.session.sessionId,
         senderAccountId: params.senderAccountId,
-        senderDisplayName: params.senderDisplayName,
+        senderDisplayName: resolvedSenderName,
         sentAt,
         text: trimmedText,
         mimeType: params.mimeType.trim().toLowerCase(),
@@ -292,12 +429,13 @@ export class ApprovedWebRtcSessionController {
       messageId,
       sessionId: this.session.sessionId,
       senderAccountId: params.senderAccountId,
-      senderDisplayName: params.senderDisplayName,
+      senderDisplayName: resolvedSenderName,
       text: trimmedText,
       sentAt,
     };
     this.messages.push(message);
     this.imageAttachments[messageId] = params.dataUrl;
+    this.updateMessageStatusMonotonic(messageId, 'sent');
     this.emitChange();
     return { ok: true, message };
   }
@@ -571,6 +709,7 @@ export class ApprovedWebRtcSessionController {
           // Ignore transient send error on open
         }
       }
+      this.flushPendingSeenAcks(side);
       this.emitChange();
     };
     channel.onclose = () => {
@@ -589,13 +728,18 @@ export class ApprovedWebRtcSessionController {
             | 'peer-contact-card'
             | 'peer-mic-request'
             | 'peer-mic-response'
-            | 'viewer-mic-state';
+            | 'viewer-mic-state'
+            | 'chat-delivered'
+            | 'chat-seen';
           __elmImageChunk?: true;
           sender?: 'host' | 'guest';
           accepted?: boolean;
           active?: boolean;
           reason?: SessionTerminationReason;
           subReason?: string;
+          messageId?: string;
+          messageIds?: string[];
+          sessionId?: string;
         };
 
         if (parsed && parsed.__elmControl === 'peer-mic-request') {
@@ -645,7 +789,70 @@ export class ApprovedWebRtcSessionController {
           if (validated.sender === side) {
             return;
           }
+          const contactName = validated.contact.name.trim();
+          if (
+            contactName &&
+            !ApprovedWebRtcSessionController.isGenericDisplayName(contactName)
+          ) {
+            this.resolvedPeerDisplayName = contactName;
+            let updatedAny = false;
+            for (let i = 0; i < this.messages.length; i += 1) {
+              const m = this.messages[i];
+              if (
+                ApprovedWebRtcSessionController.isGenericDisplayName(
+                  m.senderDisplayName
+                ) &&
+                m.senderAccountId !==
+                  (this.localRole === 'guest'
+                    ? this.session.guestAccountId
+                    : this.session.hostAccountId)
+              ) {
+                this.messages[i] = { ...m, senderDisplayName: contactName };
+                updatedAny = true;
+              }
+            }
+            if (updatedAny) {
+              this.emitChange();
+            }
+          }
           this.onPeerContactReceived?.(validated.contact);
+          return;
+        }
+
+        if (parsed && parsed.__elmControl === 'chat-delivered') {
+          if (
+            parsed.sessionId === this.session.sessionId &&
+            parsed.sender !== side &&
+            typeof parsed.messageId === 'string' &&
+            parsed.messageId
+          ) {
+            if (this.updateMessageStatusMonotonic(parsed.messageId, 'delivered')) {
+              this.emitChange();
+            }
+          }
+          return;
+        }
+
+        if (parsed && parsed.__elmControl === 'chat-seen') {
+          if (
+            parsed.sessionId === this.session.sessionId &&
+            parsed.sender !== side &&
+            Array.isArray(parsed.messageIds)
+          ) {
+            let changed = false;
+            for (const id of parsed.messageIds) {
+              if (
+                typeof id === 'string' &&
+                id &&
+                this.updateMessageStatusMonotonic(id, 'seen')
+              ) {
+                changed = true;
+              }
+            }
+            if (changed) {
+              this.emitChange();
+            }
+          }
           return;
         }
 
@@ -678,10 +885,22 @@ export class ApprovedWebRtcSessionController {
             this.session.sessionId
           );
           if (completed) {
-            if (!this.messages.some((m) => m.messageId === completed.message.messageId)) {
-              this.messages.push(completed.message);
+            const resolvedMsg: EphemeralChatMessage = {
+              ...completed.message,
+              senderDisplayName: this.resolveIncomingSenderName(
+                completed.message.senderDisplayName
+              ),
+            };
+            if (!this.messages.some((m) => m.messageId === resolvedMsg.messageId)) {
+              this.messages.push(resolvedMsg);
             }
-            this.imageAttachments[completed.message.messageId] = completed.dataUrl;
+            this.imageAttachments[resolvedMsg.messageId] = completed.dataUrl;
+            this.sendControlFrame(side, {
+              __elmControl: 'chat-delivered',
+              sender: side,
+              sessionId: this.session.sessionId,
+              messageId: resolvedMsg.messageId,
+            });
             this.emitChange();
           }
           return;
@@ -693,7 +912,20 @@ export class ApprovedWebRtcSessionController {
           parsed.sessionId === this.session.sessionId &&
           !this.messages.some((m) => m.messageId === parsed.messageId)
         ) {
-          this.messages.push(parsed as EphemeralChatMessage);
+          const rawMsg = parsed as EphemeralChatMessage;
+          const resolvedMsg: EphemeralChatMessage = {
+            ...rawMsg,
+            senderDisplayName: this.resolveIncomingSenderName(
+              rawMsg.senderDisplayName
+            ),
+          };
+          this.messages.push(resolvedMsg);
+          this.sendControlFrame(side, {
+            __elmControl: 'chat-delivered',
+            sender: side,
+            sessionId: this.session.sessionId,
+            messageId: resolvedMsg.messageId,
+          });
           this.emitChange();
         }
       } catch {
@@ -2271,6 +2503,7 @@ export class ApprovedWebRtcSessionController {
   public async sendChatMessageOverDataChannel(params: {
     sender: 'host' | 'guest';
     text: string;
+    senderDisplayName?: string;
   }): Promise<EphemeralChatMessage> {
     const trimmed = params.text.trim();
     if (!trimmed) {
@@ -2299,10 +2532,10 @@ export class ApprovedWebRtcSessionController {
         params.sender === 'host'
           ? this.session.hostAccountId
           : this.session.guestAccountId,
-      senderDisplayName:
-        params.sender === 'host'
-          ? this.session.hostDisplayName
-          : this.session.guestDisplayName,
+      senderDisplayName: this.resolveOutgoingSenderName(
+        params.senderDisplayName,
+        params.sender
+      ),
       text: trimmed,
       sentAt: new Date().toISOString(),
     };
@@ -2312,6 +2545,7 @@ export class ApprovedWebRtcSessionController {
     }
 
     channel.send(JSON.stringify(msg));
+    this.updateMessageStatusMonotonic(msg.messageId, 'sent');
 
     // Allow microtask/SCTP loopback delivery to complete on receiving DataChannel
     await new Promise((r) => setTimeout(r, 25));
@@ -2618,6 +2852,7 @@ export class ApprovedWebRtcSessionController {
       guestPlayback: { ...this.guestPlayback },
       messages: [...this.messages],
       imageAttachmentsByMessageId: { ...this.imageAttachments },
+      messageStatusesById: { ...this.messageStatusesById },
       lastStatusBanner: this.lastStatusBanner,
       permissionsInvalidated: this.permissionsInvalidated,
       signalingMembershipInvalidated: this.signalingMembershipInvalidated,
@@ -2922,6 +3157,10 @@ export class ApprovedWebRtcSessionController {
     this.latestAdvertisedTracks = [];
     this.messages.length = 0;
     this.imageAttachments = {};
+    this.messageStatusesById = {};
+    this.sentSeenAckIds.clear();
+    this.pendingSeenAckIds.clear();
+    this.resolvedPeerDisplayName = null;
     this.imageReassemblyBuffer.clear();
     this.guestViewerCleared = true;
     this.onGuestViewerCleared?.();

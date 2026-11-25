@@ -172,6 +172,22 @@ const bridge: ElmDesktopBridge = Object.freeze({
     target: MediaSourceKind | 'all'
   ): Promise<{ requested: boolean }> =>
     ipcRenderer.invoke('elm:chat-window-stop-sharing', target),
+  markChatMessagesSeen: (
+    messageIds: readonly string[]
+  ): Promise<{ marked: boolean }> =>
+    ipcRenderer.invoke('elm:chat-mark-seen', messageIds),
+  onChatMessagesSeenRequested: (
+    listener: (messageIds: readonly string[]) => void
+  ): (() => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      messageIds: readonly string[]
+    ) => {
+      listener(Array.isArray(messageIds) ? messageIds : []);
+    };
+    ipcRenderer.on('elm:chat-mark-seen-request', handler);
+    return () => ipcRenderer.removeListener('elm:chat-mark-seen-request', handler);
+  },
   onVolatileSessionUiStateUpdated: (
     listener: (state: VolatileSessionUiState) => void
   ): (() => void) => {

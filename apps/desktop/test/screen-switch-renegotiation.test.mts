@@ -242,6 +242,9 @@ function setupWebRtcTestEnv() {
         async pollSessionSignals() {
           return { ok: true, data: { signals: [] } };
         },
+        async disconnectActiveSession() {
+          return { ok: true };
+        },
         async stopWasapiLoopback() {},
       },
     },
@@ -431,11 +434,8 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   assert.equal(pc.signalingState, 'stable');
 
   // 10: Explicit session termination after multiple source changes
-  await ctrl.executeIdempotentTeardown({
-    reason: 'user_top_bar_disconnect',
+  await ctrl.executeIdempotentTeardown('user_top_bar_disconnect', {
     subReason: 'test_end',
-    initiator: 'host',
-    sendBackendDisconnect: async () => ({ ok: true }),
   });
   assert.equal(pc.connectionState, 'closed');
 });

@@ -379,6 +379,8 @@ export interface WebRtcSignalEnvelope {
  * Ephemeral private chat message sent peer-to-peer over a reliable, ordered
  * WebRTC DataChannel ('elm-private-chat'). Never persisted in D1, SQLite, or disk.
  */
+export type ChatDeliveryStatus = 'sent' | 'delivered' | 'seen';
+
 export interface EphemeralChatMessage {
   readonly messageId: string;
   readonly sessionId: string;

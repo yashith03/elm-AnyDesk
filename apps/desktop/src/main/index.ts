@@ -113,6 +113,7 @@ let volatileUiState: VolatileSessionUiState = {
   messagePreviewsEnabled: false,
   messages: [],
   imageAttachmentsByMessageId: {},
+  messageStatusesById: {},
   hostMediaState: null,
 };
 
@@ -248,6 +249,7 @@ function resetVolatileUiState(): void {
     messagePreviewsEnabled: false,
     messages: [],
     imageAttachmentsByMessageId: {},
+    messageStatusesById: {},
     hostMediaState: null,
   };
   broadcastVolatileUiState();
@@ -1407,6 +1409,20 @@ function registerIpcHandlers(): void {
         return { queued: true };
       }
       return { queued: false };
+    }
+  );
+
+  ipcMain.handle(
+    'elm:chat-mark-seen',
+    (_event, messageIds: readonly string[]): { marked: boolean } => {
+      const cleanIds = Array.isArray(messageIds)
+        ? messageIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+        : [];
+      if (cleanIds.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
+        return { marked: false };
+      }
+      mainWindow.webContents.send('elm:chat-mark-seen-request', cleanIds);
+      return { marked: true };
     }
   );
 

@@ -1077,16 +1077,20 @@ select:focus-visible,
 }
 
 .chat-bubble {
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
+  padding: 8px 12px 6px;
+  border-radius: 14px;
   border: 1px solid var(--border-subtle);
   background-color: var(--surface-elevated);
   max-width: 85%;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 .chat-bubble.chat-mine {
   align-self: flex-end;
+  border-bottom-right-radius: 4px;
   background-color: var(--accent-action-bg);
   border-color: var(--accent-action-bg);
   color: var(--text-on-action);
@@ -1103,8 +1107,38 @@ select:focus-visible,
 
 .chat-bubble.chat-theirs {
   align-self: flex-start;
+  border-bottom-left-radius: 4px;
   background-color: var(--surface-elevated);
   border-color: var(--border-subtle);
+}
+
+.chat-bubble-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 2px;
+  font-size: 0.68rem;
+  line-height: 1;
+}
+
+.chat-timestamp {
+  opacity: 0.78;
+}
+
+.chat-status-ticks {
+  font-weight: 700;
+  letter-spacing: -0.14em;
+  padding-right: 2px;
+}
+
+.chat-status-ticks.sent,
+.chat-status-ticks.delivered {
+  color: rgba(203, 213, 225, 0.85);
+}
+
+.chat-bubble.chat-mine .chat-status-ticks.seen {
+  color: #38bdf8;
 }
 
 .chat-meta {

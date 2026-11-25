@@ -297,6 +297,7 @@ export function App(): React.ReactElement {
     () => typeof document !== 'undefined' && document.visibilityState !== 'visible'
   );
   const readIncomingMessageIdsRef = useRef<Set<string>>(new Set());
+  const viewerChatScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Window Controls & Request Lifecycle State
   const [isWindowMaximized, setIsWindowMaximized] = useState<boolean>(false);
@@ -808,6 +809,8 @@ export function App(): React.ReactElement {
         connectionState: 'closed',
         dataChannelState: 'closed',
         messages: [],
+        imageAttachmentsByMessageId: {},
+        messageStatusesById: {},
         hostMediaState: null,
       });
       return;
@@ -887,6 +890,9 @@ export function App(): React.ReactElement {
           imageAttachmentsByMessageId: nextSnap.teardownReceipt
             ? {}
             : nextSnap.imageAttachmentsByMessageId,
+          messageStatusesById: nextSnap.teardownReceipt
+            ? {}
+            : nextSnap.messageStatusesById,
           hostMediaState: nextSnap.hostMediaState,
         });
       },
@@ -1017,6 +1023,11 @@ export function App(): React.ReactElement {
         const defaultRole =
           account?.accountId === ctrl.session.guestAccountId ? 'guest' : 'host';
         const activeSender = senderOverride ?? defaultRole;
+        const localProfileName =
+          deviceSetupState?.localProfile?.name?.trim() ||
+          account?.displayName?.trim() ||
+          undefined;
+        ctrl.setLocalDisplayName(localProfileName);
         if (imageDataUrl && imageMimeType) {
           ctrl.sendChatImageOverDataChannel({
             sender: activeSender,
@@ -1026,7 +1037,7 @@ export function App(): React.ReactElement {
                 ? ctrl.session.hostAccountId
                 : ctrl.session.guestAccountId),
             senderDisplayName:
-              account?.displayName ??
+              localProfileName ??
               (activeSender === 'host'
                 ? ctrl.session.hostDisplayName
                 : ctrl.session.guestDisplayName),
@@ -1040,6 +1051,7 @@ export function App(): React.ReactElement {
         await ctrl.sendChatMessageOverDataChannel({
           sender: activeSender,
           text,
+          senderDisplayName: localProfileName,
         });
       }
     );
@@ -1060,7 +1072,63 @@ export function App(): React.ReactElement {
       unsubChatSend();
       unsubStopReq();
     };
-  }, [metadata?.windowRole, account?.accountId, account?.displayName]);
+  }, [
+    metadata?.windowRole,
+    account?.accountId,
+    account?.displayName,
+    deviceSetupState?.localProfile?.name,
+  ]);
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    return window.elmDesktop.onChatMessagesSeenRequested((messageIds) => {
+      webrtcControllerRef.current?.markMessagesSeen(messageIds);
+    });
+  }, [metadata?.windowRole]);
+
+  useEffect(() => {
+    const ctrl = webrtcControllerRef.current;
+    if (!ctrl) return;
+    const localProfileName =
+      deviceSetupState?.localProfile?.name?.trim() ||
+      account?.displayName?.trim() ||
+      undefined;
+    ctrl.setLocalDisplayName(localProfileName);
+  }, [deviceSetupState?.localProfile?.name, account?.displayName, activeSessionId]);
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    if (!floatingChatOpen || isDocumentHidden || !activeSessionId) return;
+    const container = viewerChatScrollRef.current;
+    const ctrl = webrtcControllerRef.current;
+    if (!container || !ctrl) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visibleIds: string[] = [];
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            const id = (entry.target as HTMLElement).dataset.messageId;
+            if (id) visibleIds.push(id);
+          }
+        }
+        if (visibleIds.length > 0 && document.visibilityState === 'visible') {
+          ctrl.markMessagesSeen(visibleIds);
+        }
+      },
+      { root: container, threshold: 0.25 }
+    );
+
+    const nodes = container.querySelectorAll('[data-message-id][data-incoming="true"]');
+    nodes.forEach((n) => observer.observe(n));
+    return () => observer.disconnect();
+  }, [
+    metadata?.windowRole,
+    floatingChatOpen,
+    isDocumentHidden,
+    activeSessionId,
+    webrtcSnap?.messages.length,
+  ]);
 
   // Bind Guest B's received tracks to Guest B's local <video> and <audio> playback elements
   useEffect(() => {
@@ -2412,6 +2480,11 @@ export function App(): React.ReactElement {
     const activeSender: 'host' | 'guest' =
       account?.accountId === ctrl.session.guestAccountId ? 'guest' : 'host';
 
+    const localProfileName =
+      deviceSetupState?.localProfile?.name?.trim() ||
+      account?.displayName?.trim() ||
+      undefined;
+    ctrl.setLocalDisplayName(localProfileName);
     if (imageUrl && imageMime) {
       const result = ctrl.sendChatImageOverDataChannel({
         sender: activeSender,
@@ -2421,7 +2494,7 @@ export function App(): React.ReactElement {
             ? ctrl.session.hostAccountId
             : ctrl.session.guestAccountId),
         senderDisplayName:
-          account?.displayName ??
+          localProfileName ??
           (activeSender === 'host'
             ? ctrl.session.hostDisplayName
             : ctrl.session.guestDisplayName),
@@ -2446,6 +2519,7 @@ export function App(): React.ReactElement {
     await ctrl.sendChatMessageOverDataChannel({
       sender: activeSender,
       text,
+      senderDisplayName: localProfileName,
     });
   };
 
@@ -3726,7 +3800,10 @@ export function App(): React.ReactElement {
                       >
                         {chatStatus?.label ?? 'Chat Offline'}
                       </div>
-                      <div className="floating-chat-messages">
+                      <div
+                        className="floating-chat-messages"
+                        ref={viewerChatScrollRef}
+                      >
                         {webrtcSnap.messages.length === 0 ? (
                           <div className="muted">
                             In-memory session chat. Cleared on End Session.
@@ -3737,19 +3814,26 @@ export function App(): React.ReactElement {
                               webrtcSnap.imageAttachmentsByMessageId[
                                 m.messageId
                               ] ?? inMemoryImagesByMsgId[m.messageId];
+                            const isMine =
+                              m.senderAccountId === account?.accountId;
+                            const status = isMine
+                              ? webrtcSnap.messageStatusesById[m.messageId] ??
+                                'sent'
+                              : null;
                             return (
                               <div
                                 key={m.messageId}
+                                data-message-id={m.messageId}
+                                data-incoming={isMine ? 'false' : 'true'}
                                 className={`chat-bubble ${
-                                  m.senderAccountId === account?.accountId
-                                    ? 'chat-mine'
-                                    : 'chat-theirs'
+                                  isMine ? 'chat-mine' : 'chat-theirs'
                                 }`}
                               >
-                                <div className="chat-meta">
-                                  <strong>{m.senderDisplayName}</strong> ·{' '}
-                                  {new Date(m.sentAt).toLocaleTimeString()}
-                                </div>
+                                {!isMine && (
+                                  <div className="chat-meta">
+                                    <strong>{m.senderDisplayName}</strong>
+                                  </div>
+                                )}
                                 {m.text && (
                                   <div className="chat-text">{m.text}</div>
                                 )}
@@ -3760,6 +3844,24 @@ export function App(): React.ReactElement {
                                     className="in-memory-image-preview"
                                   />
                                 )}
+                                <div className="chat-bubble-footer">
+                                  <span className="chat-timestamp">
+                                    {new Date(m.sentAt).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}
+                                  </span>
+                                  {status && (
+                                    <span
+                                      className={`chat-status-ticks ${status}`}
+                                      data-testid={`chat-status-${m.messageId}`}
+                                      data-status={status}
+                                      aria-label={`Message status: ${status}`}
+                                    >
+                                      {status === 'sent' ? '✓' : '✓✓'}
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             );
                           })

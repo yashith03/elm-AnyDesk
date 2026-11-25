@@ -974,6 +974,7 @@ export function PrivateChatPopupWindow(props: {
   const currentAccount = volatileState?.currentAccount ?? null;
   const messages = volatileState?.messages ?? [];
   const imageAttachments = volatileState?.imageAttachmentsByMessageId ?? {};
+  const messageStatuses = volatileState?.messageStatusesById ?? {};
 
   const [chatInputText, setChatInputText] = useState('');
   const [chatAttachmentError, setChatAttachmentError] = useState<string | null>(
@@ -987,12 +988,54 @@ export function PrivateChatPopupWindow(props: {
     string | null
   >(null);
   const [pendingImageByteLength, setPendingImageByteLength] = useState(0);
+  const [isPopupVisible, setIsPopupVisible] = useState<boolean>(
+    () => typeof document === 'undefined' || document.visibilityState === 'visible'
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const onVisChange = () => {
+      setIsPopupVisible(document.visibilityState === 'visible');
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+    window.addEventListener('focus', onVisChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisChange);
+      window.removeEventListener('focus', onVisChange);
+    };
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
+
+  useEffect(() => {
+    if (!activeSession || !isPopupVisible) return;
+    const container = messagesScrollRef.current;
+    if (!container) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visibleIds: string[] = [];
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            const id = (entry.target as HTMLElement).dataset.messageId;
+            if (id) visibleIds.push(id);
+          }
+        }
+        if (visibleIds.length > 0 && document.visibilityState === 'visible') {
+          void window.elmDesktop.markChatMessagesSeen(visibleIds);
+        }
+      },
+      { root: container, threshold: 0.25 }
+    );
+
+    const nodes = container.querySelectorAll('[data-message-id][data-incoming="true"]');
+    nodes.forEach((n) => observer.observe(n));
+    return () => observer.disconnect();
+  }, [activeSession?.sessionId, isPopupVisible, messages.length]);
 
   const chatStatus = getChatStatusDisplay({
     dataChannelState: volatileState?.dataChannelState ?? 'closed',
@@ -1112,7 +1155,10 @@ export function PrivateChatPopupWindow(props: {
         </div>
       ) : (
         <>
-          <div className="floating-chat-messages chat-popup-messages">
+          <div
+            className="floating-chat-messages chat-popup-messages"
+            ref={messagesScrollRef}
+          >
             {messages.length === 0 ? (
               <div className="muted">
                 In-memory session chat over WebRTC DataChannel. Cleared when the
@@ -1121,19 +1167,24 @@ export function PrivateChatPopupWindow(props: {
             ) : (
               messages.map((m) => {
                 const imgUrl = imageAttachments[m.messageId];
+                const isMine = m.senderAccountId === currentAccount?.accountId;
+                const status = isMine
+                  ? messageStatuses[m.messageId] ?? 'sent'
+                  : null;
                 return (
                   <div
                     key={m.messageId}
+                    data-message-id={m.messageId}
+                    data-incoming={isMine ? 'false' : 'true'}
                     className={`chat-bubble ${
-                      m.senderAccountId === currentAccount?.accountId
-                        ? 'chat-mine'
-                        : 'chat-theirs'
+                      isMine ? 'chat-mine' : 'chat-theirs'
                     }`}
                   >
-                    <div className="chat-meta">
-                      <strong>{m.senderDisplayName}</strong> ·{' '}
-                      {new Date(m.sentAt).toLocaleTimeString()}
-                    </div>
+                    {!isMine && (
+                      <div className="chat-meta">
+                        <strong>{m.senderDisplayName}</strong>
+                      </div>
+                    )}
                     {m.text && <div className="chat-text">{m.text}</div>}
                     {imgUrl && (
                       <img
@@ -1142,6 +1193,24 @@ export function PrivateChatPopupWindow(props: {
                         className="in-memory-image-preview"
                       />
                     )}
+                    <div className="chat-bubble-footer">
+                      <span className="chat-timestamp">
+                        {new Date(m.sentAt).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </span>
+                      {status && (
+                        <span
+                          className={`chat-status-ticks ${status}`}
+                          data-testid={`chat-status-${m.messageId}`}
+                          data-status={status}
+                          aria-label={`Message status: ${status}`}
+                        >
+                          {status === 'sent' ? '✓' : '✓✓'}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 );
               })

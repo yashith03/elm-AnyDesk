@@ -163,6 +163,7 @@ export function installBrowserPreviewBridgeIfNeeded(): void {
     messagePreviewsEnabled: false,
     messages: [],
     imageAttachmentsByMessageId: {},
+    messageStatusesById: {},
     hostMediaState: null,
   };
 
@@ -448,6 +449,8 @@ export function installBrowserPreviewBridgeIfNeeded(): void {
     syncVolatileSessionUiState: async () => volatileState,
     sendChatFromChatWindow: async () => ({ queued: false }),
     requestHostStopSharingFromChatWindow: async () => ({ requested: false }),
+    markChatMessagesSeen: async () => ({ marked: false }),
+    onChatMessagesSeenRequested: () => () => {},
     onVolatileSessionUiStateUpdated: () => () => {},
     onChatWindowOutboundSend: () => () => {},
     onHostStopSharingRequest: () => () => {},
