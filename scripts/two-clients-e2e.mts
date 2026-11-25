@@ -620,7 +620,7 @@ try {
   // 3b. Verify Independent Host Floating Toolbar, Capture Protection, & Main Window Minimize
   const hostToolbarCdp = await CdpClient.connectByRole(clientB.debugPort!, 'host-toolbar');
   const toolbarUiCheck = await waitForCondition(
-    'Host floating toolbar controls & Test ON toggle ready',
+    'Host floating toolbar controls & Hidden: ON indicator ready',
     () =>
       hostToolbarCdp.eval<Record<string, unknown> | null>(`(() => {
         const bar = document.querySelector('[data-testid="floating-panel-bar"]');
@@ -630,27 +630,22 @@ try {
           text: (b.textContent || '').trim(),
           disabled: b.disabled,
         }));
-        const toggle = document.querySelector('[data-testid="capture-protection-test-toggle"]');
+        const hiddenBadge = document.querySelector('[data-testid="host-hidden-status-indicator"]');
         const hasFit = buttons.some((b) => b.text === 'Fit' || b.text === '1:1');
         const micBtn = document.querySelector('[data-testid="toolbar-my-mic-btn"]');
         const soundBtn = document.querySelector('[data-testid="toolbar-device-sound-btn"]');
         const startBtn = document.querySelector('[data-testid="host-start-sharing-button"]');
-        if (!toggle || !micBtn || !soundBtn || !startBtn) return null;
+        if (!hiddenBadge || !micBtn || !soundBtn || !startBtn) return null;
         return {
           firstButtonTestId: buttons[0]?.testId ?? null,
-          toggleText: (toggle.textContent || '').trim(),
+          hiddenBadgeText: (hiddenBadge.textContent || '').trim(),
           hasFitOr1to1: hasFit,
           buttonTestIds: buttons.map((b) => b.testId),
         };
       })()`),
     10_000
   );
-  assert.equal(
-    toolbarUiCheck.firstButtonTestId,
-    'capture-protection-test-toggle',
-    'Dev Capture Protection toggle must be at the far left of the Host toolbar'
-  );
-  assert.equal(toolbarUiCheck.toggleText, 'Test ON');
+  assert.equal(toolbarUiCheck.hiddenBadgeText, 'Hidden: ON');
   assert.equal(toolbarUiCheck.hasFitOr1to1, false, 'Host toolbar must not include Fit or 1:1 viewer buttons');
 
   const initialProt = await cdpB.eval<{
@@ -926,8 +921,8 @@ try {
     });
   }
 
-  // 4b. Test Capture Protection Test Toggle (ON -> OFF -> ON), Mic, Device Sound, Settings Popup, & Stop/Restart Screen
-  await hostToolbarCdp.click('[data-testid="capture-protection-test-toggle"]');
+  // 4b. Test Capture Protection Toggle (ON -> OFF -> ON), Mic, Device Sound, Settings Popup, & Stop/Restart Screen
+  await cdpB.eval(`window.elmDesktop.setCaptureProtectionTestEnabled(false)`);
   const protAfterOff = await waitForCondition(
     'Capture protection toggled OFF for verification',
     async () => {
@@ -942,7 +937,7 @@ try {
   assert.equal(protAfterOff.windowDisplayAffinities?.main, 0);
   assert.equal(protAfterOff.windowDisplayAffinities?.hostToolbar, 0);
 
-  await hostToolbarCdp.click('[data-testid="capture-protection-test-toggle"]');
+  await cdpB.eval(`window.elmDesktop.setCaptureProtectionTestEnabled(true)`);
   const protAfterOn = await waitForCondition(
     'Capture protection toggled back ON',
     async () => {

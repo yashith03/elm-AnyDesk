@@ -643,8 +643,8 @@ async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
       : screen.getPrimaryDisplay().workArea;
   const display = screen.getDisplayMatching(anchorBounds);
   const wa = display.workArea;
-  const baseWidth = captureProtection.isToggleAllowed() ? 520 : 440;
-  const width = Math.min(Math.max(360, wa.width - 24), baseWidth);
+  const baseWidth = 540;
+  const width = Math.min(Math.max(380, wa.width - 24), baseWidth);
   const height = HOST_TOOLBAR_WINDOW_HEIGHT;
 
   const initialRect = clampRectToDisplayWorkArea(
@@ -688,11 +688,11 @@ async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
   windowRoles.set(win, 'host-toolbar');
   win.setAlwaysOnTop(true, 'floating');
   attachWindowSecurityGuards(win);
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'hostToolbar');
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'host-toolbar' } });
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'hostToolbar');
 
   win.on('move', () => {
     if (win.isDestroyed()) return;
@@ -701,13 +701,20 @@ async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
       positionPopupBelowHostToolbar(sourcePickerWindow, 360, 340, 'center');
     }
     if (settingsWindow && !settingsWindow.isDestroyed()) {
-      positionPopupBelowHostToolbar(settingsWindow, 320, 410, 'right');
+      positionPopupBelowHostToolbar(settingsWindow, 320, 480, 'right');
     }
   });
 
   win.on('show', () => {
     win.setAlwaysOnTop(true, 'floating');
-    captureProtection.applyToWindow(win);
+    captureProtection.applyToWindow(win, 'hostToolbar');
+    broadcastCaptureProtectionState();
+  });
+
+  win.on('restore', () => {
+    win.setAlwaysOnTop(true, 'floating');
+    captureProtection.applyToWindow(win, 'hostToolbar');
+    broadcastCaptureProtectionState();
   });
 
   win.on('closed', () => {
@@ -754,13 +761,13 @@ async function createOrShowHostSourcePickerWindow(): Promise<BrowserWindow> {
   windowRoles.set(win, 'host-source-picker');
   win.setAlwaysOnTop(true, 'floating');
   attachWindowSecurityGuards(win);
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'sourcePicker');
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, {
     query: { role: 'host-source-picker' },
   });
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'sourcePicker');
   positionPopupBelowHostToolbar(win, 360, 340, 'center');
 
   win.on('blur', () => {
@@ -784,8 +791,8 @@ async function createOrShowHostSourcePickerWindow(): Promise<BrowserWindow> {
 
 async function createOrShowHostSettingsWindow(): Promise<BrowserWindow> {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
-    captureProtection.applyToWindow(settingsWindow);
-    positionPopupBelowHostToolbar(settingsWindow, 320, 410, 'right');
+    captureProtection.applyToWindow(settingsWindow, 'settings');
+    positionPopupBelowHostToolbar(settingsWindow, 320, 480, 'right');
     settingsWindow.show();
     settingsWindow.focus();
     broadcastHostOverlayState();
@@ -794,7 +801,7 @@ async function createOrShowHostSettingsWindow(): Promise<BrowserWindow> {
 
   const win = new BrowserWindow({
     width: 320,
-    height: 410,
+    height: 480,
     frame: false,
     transparent: true,
     resizable: false,
@@ -813,12 +820,12 @@ async function createOrShowHostSettingsWindow(): Promise<BrowserWindow> {
   windowRoles.set(win, 'host-settings');
   win.setAlwaysOnTop(true, 'floating');
   attachWindowSecurityGuards(win);
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'settings');
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'host-settings' } });
-  captureProtection.applyToWindow(win);
-  positionPopupBelowHostToolbar(win, 320, 410, 'right');
+  captureProtection.applyToWindow(win, 'settings');
+  positionPopupBelowHostToolbar(win, 320, 480, 'right');
 
   win.on('blur', () => {
     closeHostSettingsWindow();
@@ -903,18 +910,18 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     win.setAlwaysOnTop(true, 'floating');
   }
   attachWindowSecurityGuards(win);
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'chat');
 
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'chat' } });
-  captureProtection.applyToWindow(win);
+  captureProtection.applyToWindow(win, 'chat');
   if (!win.isDestroyed() && !win.isVisible()) {
     win.show();
-    captureProtection.applyToWindow(win);
+    captureProtection.applyToWindow(win, 'chat');
   }
 
   win.on('show', () => {
-    captureProtection.applyToWindow(win);
+    captureProtection.applyToWindow(win, 'chat');
     broadcastHostOverlayState();
   });
   win.on('hide', () => {
@@ -924,7 +931,7 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     broadcastHostOverlayState();
   });
   win.on('restore', () => {
-    captureProtection.applyToWindow(win);
+    captureProtection.applyToWindow(win, 'chat');
     broadcastHostOverlayState();
   });
 
@@ -1590,6 +1597,10 @@ function registerIpcHandlers(): void {
     'elm:host-toolbar-window-toggle',
     async (_event, open: boolean): Promise<{ open: boolean }> => {
       if (open) {
+        if (!hostToolbarWindow || hostToolbarWindow.isDestroyed()) {
+          // Requirement 4: Default to ON on every new Host session
+          captureProtection.resetToDefaultOn(getProtectedRegistry());
+        }
         await createOrShowHostToolbarWindow();
         return { open: true };
       }

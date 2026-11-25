@@ -1,7 +1,10 @@
 import { app, type BrowserWindow } from 'electron';
 import koffi from 'koffi';
 import {
+  WIN32_AFFINITY_EXCLUDE_FROM_CAPTURE,
+  isAlwaysProtectedWindowKey,
   resolveEffectiveCaptureProtection,
+  resolveHostVisibilityVerification,
   shouldAllowCaptureProtectionToggle,
   type CaptureProtectionState,
   type CaptureProtectionWindowStatus,
@@ -64,6 +67,7 @@ function readWindowDisplayAffinity(win: BrowserWindow | null): number | null {
 
 export class CaptureProtectionController {
   private requestedTestEnabled = true;
+  private lastApplyFailed = false;
 
   public isToggleAllowed(): boolean {
     return shouldAllowCaptureProtectionToggle({
@@ -96,24 +100,38 @@ export class CaptureProtectionController {
     registry: ProtectedWindowRegistry
   ): CaptureProtectionState {
     this.requestedTestEnabled = true;
+    this.lastApplyFailed = false;
     return this.applyToAll(registry);
   }
 
-  public applyToWindow(win: BrowserWindow | null): boolean {
+  public applyToWindow(
+    win: BrowserWindow | null,
+    key: keyof CaptureProtectionWindowStatus = 'main'
+  ): boolean {
     if (!win || win.isDestroyed()) {
       return false;
     }
-    const effective = this.getEffectiveEnabled();
+    const targetEnabled = isAlwaysProtectedWindowKey(key)
+      ? true
+      : this.getEffectiveEnabled();
     try {
-      win.setContentProtection(effective);
+      win.setContentProtection(targetEnabled);
+      if (!targetEnabled && !win.webContents.isDestroyed()) {
+        // Trigger DWM recomposite when transitioning transparent overlay back to visible
+        win.webContents.invalidate();
+      }
+      return targetEnabled;
     } catch {
-      // Best-effort on unsupported environments
+      if (!isAlwaysProtectedWindowKey(key)) {
+        this.lastApplyFailed = true;
+      }
+      return false;
     }
-    return effective;
   }
 
   public applyToAll(registry: ProtectedWindowRegistry): CaptureProtectionState {
     const effective = this.getEffectiveEnabled();
+    this.lastApplyFailed = false;
     const keys: Array<keyof CaptureProtectionWindowStatus> = [
       'main',
       'hostToolbar',
@@ -124,10 +142,16 @@ export class CaptureProtectionController {
     for (const key of keys) {
       const win = registry[key];
       if (win && !win.isDestroyed()) {
+        const targetEnabled = isAlwaysProtectedWindowKey(key) ? true : effective;
         try {
-          win.setContentProtection(effective);
+          win.setContentProtection(targetEnabled);
+          if (!targetEnabled && !win.webContents.isDestroyed()) {
+            win.webContents.invalidate();
+          }
         } catch {
-          // Ignore unsupported platform failure
+          if (!isAlwaysProtectedWindowKey(key)) {
+            this.lastApplyFailed = true;
+          }
         }
       }
     }
@@ -136,41 +160,64 @@ export class CaptureProtectionController {
 
   public getState(registry: ProtectedWindowRegistry): CaptureProtectionState {
     const effective = this.getEffectiveEnabled();
-    const isWinProtected = (win: BrowserWindow | null): boolean =>
-      Boolean(win && !win.isDestroyed() && effective);
-
     const affinities: Partial<
       Record<keyof CaptureProtectionWindowStatus, number | null>
     > = {};
+    const keys: Array<keyof CaptureProtectionWindowStatus> = [
+      'main',
+      'hostToolbar',
+      'chat',
+      'sourcePicker',
+      'settings',
+    ];
+
     if (process.platform === 'win32') {
-      if (registry.main && !registry.main.isDestroyed()) {
-        affinities.main = readWindowDisplayAffinity(registry.main);
-      }
-      if (registry.hostToolbar && !registry.hostToolbar.isDestroyed()) {
-        affinities.hostToolbar = readWindowDisplayAffinity(registry.hostToolbar);
-      }
-      if (registry.chat && !registry.chat.isDestroyed()) {
-        affinities.chat = readWindowDisplayAffinity(registry.chat);
-      }
-      if (registry.sourcePicker && !registry.sourcePicker.isDestroyed()) {
-        affinities.sourcePicker = readWindowDisplayAffinity(
-          registry.sourcePicker
-        );
-      }
-      if (registry.settings && !registry.settings.isDestroyed()) {
-        affinities.settings = readWindowDisplayAffinity(registry.settings);
+      for (const key of keys) {
+        const win = registry[key];
+        if (win && !win.isDestroyed()) {
+          affinities[key] = readWindowDisplayAffinity(win);
+        }
       }
     }
+
+    const isWinActuallyProtected = (
+      key: keyof CaptureProtectionWindowStatus
+    ): boolean => {
+      const win = registry[key];
+      if (!win || win.isDestroyed()) return false;
+      if (process.platform === 'win32') {
+        return affinities[key] === WIN32_AFFINITY_EXCLUDE_FROM_CAPTURE;
+      }
+      return isAlwaysProtectedWindowKey(key) ? true : effective;
+    };
+
+    const openControlledKeys: Array<'main' | 'hostToolbar'> = [];
+    if (registry.main && !registry.main.isDestroyed()) {
+      openControlledKeys.push('main');
+    }
+    if (registry.hostToolbar && !registry.hostToolbar.isDestroyed()) {
+      openControlledKeys.push('hostToolbar');
+    }
+
+    const verification = resolveHostVisibilityVerification({
+      platform: process.platform,
+      requestedEnabled: effective,
+      applyFailed: this.lastApplyFailed,
+      openControlledKeys,
+      affinities,
+    });
 
     return {
       enabled: effective,
       toggleAllowed: this.isToggleAllowed(),
+      verificationStatus: verification.verificationStatus,
+      error: verification.error,
       windows: {
-        main: isWinProtected(registry.main),
-        hostToolbar: isWinProtected(registry.hostToolbar),
-        chat: isWinProtected(registry.chat),
-        sourcePicker: isWinProtected(registry.sourcePicker),
-        settings: isWinProtected(registry.settings),
+        main: isWinActuallyProtected('main'),
+        hostToolbar: isWinActuallyProtected('hostToolbar'),
+        chat: isWinActuallyProtected('chat'),
+        sourcePicker: isWinActuallyProtected('sourcePicker'),
+        settings: isWinActuallyProtected('settings'),
       },
       windowDisplayAffinities: affinities,
     };

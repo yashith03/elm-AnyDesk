@@ -2189,31 +2189,83 @@ select:focus-visible,
   flex-shrink: 0;
 }
 
-.test-protection-btn {
+.hidden-status-pill {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   height: 28px;
-  padding: 0 8px;
+  padding: 0 9px;
   border-radius: 6px;
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.02em;
-  border: 1px solid var(--border-strong);
-  cursor: pointer;
+  border: 1.5px solid var(--border-strong);
+  cursor: default;
+  user-select: none;
+  pointer-events: none;
   flex-shrink: 0;
 }
 
-.test-protection-btn.test-on {
+.hidden-status-pill.hidden-on {
   background-color: var(--status-online-bg);
   color: var(--status-online-text);
   border-color: var(--status-online-border);
 }
 
-.test-protection-btn.test-off {
+.hidden-status-pill.hidden-off {
   background-color: var(--status-offline-bg);
   color: var(--status-offline-text);
   border-color: var(--status-offline-border);
+}
+
+.hidden-status-pill.hidden-error {
+  background-color: rgba(245, 158, 11, 0.16);
+  color: #fbbf24;
+  border-color: #f59e0b;
+}
+
+.sidebar-section-title {
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.visibility-toggle-btn {
+  min-width: 54px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  border: 1.5px solid var(--border-strong);
+}
+
+.visibility-toggle-btn.is-on {
+  background-color: var(--status-online-bg);
+  color: var(--status-online-text);
+  border-color: var(--status-online-border);
+}
+
+.visibility-toggle-btn.is-off {
+  background-color: var(--status-offline-bg);
+  color: var(--status-offline-text);
+  border-color: var(--status-offline-border);
+}
+
+.visibility-helper-note {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  margin-top: 4px;
+}
+
+.visibility-error-note {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: #fbbf24;
+  margin-top: 4px;
 }
 
 .overlay-popup-shell {

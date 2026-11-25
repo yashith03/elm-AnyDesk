@@ -209,29 +209,37 @@ export function HostFloatingToolbarWindow(props: {
           ),
         }}
       >
-        {protection.toggleAllowed && (
-          <button
-            type="button"
-            data-testid="capture-protection-test-toggle"
-            className={`test-protection-btn no-drag ${
-              protection.enabled ? 'test-on' : 'test-off'
-            }`}
-            aria-label={
-              protection.enabled
-                ? 'Capture Protection Test ON'
-                : 'Capture Protection Test OFF'
-            }
-            aria-pressed={protection.enabled}
-            onClick={() => {
-              hideTooltip();
-              void window.elmDesktop.setCaptureProtectionTestEnabled(
-                !protection.enabled
-              );
-            }}
-          >
-            {protection.enabled ? 'Test ON' : 'Test OFF'}
-          </button>
-        )}
+        {(() => {
+          const vStatus = protection.verificationStatus ?? (protection.enabled ? 'verified_on' : 'verified_off');
+          const pillClass =
+            vStatus === 'verified_on'
+              ? 'hidden-status-pill hidden-on no-drag'
+              : vStatus === 'verified_off'
+                ? 'hidden-status-pill hidden-off no-drag'
+                : 'hidden-status-pill hidden-error no-drag';
+          const pillText =
+            vStatus === 'verified_on'
+              ? 'Hidden: ON'
+              : vStatus === 'verified_off'
+                ? 'Hidden: OFF'
+                : 'Hidden: Error';
+          return (
+            <span
+              role="status"
+              aria-live="polite"
+              data-testid="host-hidden-status-indicator"
+              data-verification-status={vStatus}
+              className={pillClass}
+              aria-label={
+                vStatus === 'unverified'
+                  ? protection.error || 'Capture protection status unverified'
+                  : pillText
+              }
+            >
+              {pillText}
+            </span>
+          );
+        })()}
 
         <div
           className="floating-drag-handle host-os-drag-handle"
@@ -908,6 +916,39 @@ export function HostSettingsPopup(props: {
         >
           ×
         </button>
+      </div>
+
+      <div className="sidebar-section">
+        <div className="sidebar-section-title">Visibility</div>
+        <div className="sidebar-row">
+          <span>Hide Elm-AnyDesk UI</span>
+          <button
+            type="button"
+            data-testid="host-visibility-toggle"
+            aria-pressed={overlay.captureProtection.enabled}
+            aria-label={`Hide Elm-AnyDesk UI: ${
+              overlay.captureProtection.enabled ? 'ON' : 'OFF'
+            }`}
+            className={`visibility-toggle-btn ${
+              overlay.captureProtection.enabled ? 'is-on' : 'is-off'
+            }`}
+            onClick={() =>
+              void window.elmDesktop.setCaptureProtectionTestEnabled(
+                !overlay.captureProtection.enabled
+              )
+            }
+          >
+            {overlay.captureProtection.enabled ? 'ON' : 'OFF'}
+          </button>
+        </div>
+        <p className="muted visibility-helper-note">
+          Controls main window &amp; toolbar only. Private Chat stays hidden. Resets to ON on restart or new session.
+        </p>
+        {overlay.captureProtection.verificationStatus === 'unverified' && (
+          <p className="visibility-error-note" role="alert" data-testid="host-visibility-error">
+            {overlay.captureProtection.error || 'Could not verify capture protection status.'}
+          </p>
+        )}
       </div>
 
       <div className="sidebar-section">

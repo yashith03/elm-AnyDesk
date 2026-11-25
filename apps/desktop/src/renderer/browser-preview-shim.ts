@@ -173,6 +173,7 @@ export function installBrowserPreviewBridgeIfNeeded(): void {
   let previewCaptureProtection: CaptureProtectionState = {
     enabled: true,
     toggleAllowed: false,
+    verificationStatus: 'unverified',
     windows: {
       main: true,
       hostToolbar: false,

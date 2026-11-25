@@ -88,7 +88,8 @@ test('WhatsApp-style Chat: real names, sent -> delivered -> seen ACKs for text &
     configurable: true,
     value: { mediaDevices: {} },
   });
-  let lastOfferNegId: string | undefined;
+  let nextSeq = 1;
+  const pendingHostSignals: Array<{ seq: number; payload: unknown }> = [];
   Object.assign(globalThis, {
     RTCPeerConnection: MockPeerConnection,
     MediaStream: class {},
@@ -96,12 +97,20 @@ test('WhatsApp-style Chat: real names, sent -> delivered -> seen ACKs for text &
       elmDesktop: {
         async sendSessionSignal(params: { payload: { type: string; negotiationId?: string } }) {
           if (params.payload.type === 'offer') {
-            lastOfferNegId = params.payload.negotiationId;
+            pendingHostSignals.push({
+              seq: nextSeq++,
+              payload: {
+                type: 'answer',
+                sdp: 'v=0',
+                negotiationId: params.payload.negotiationId,
+              },
+            });
           }
           return { ok: true };
         },
         async pollSessionSignals() {
-          return { ok: true, data: { signals: [] } };
+          const out = pendingHostSignals.splice(0, pendingHostSignals.length);
+          return { ok: true, data: { signals: out } };
         },
         async disconnectActiveSession() {
           return { ok: true };
@@ -139,19 +148,13 @@ test('WhatsApp-style Chat: real names, sent -> delivered -> seen ACKs for text &
   });
   ctrl.setLocalDisplayName('Alice Host');
 
-  // Attach open DataChannel on host
-  const connectPromise = ctrl.connectAcceptedSession();
-  await new Promise((r) => setTimeout(r, 15));
-  await ctrl.injectRemoteSignalForTest('host', {
-    type: 'answer',
-    sdp: 'v=0',
-    negotiationId: lastOfferNegId,
-  });
-  await connectPromise;
-  const hostChannel = (ctrl as unknown as { hostDataChannel: MockDataChannel })
-    .hostDataChannel;
-  assert.ok(hostChannel);
-  hostChannel.onopen?.();
+  try {
+    // Attach open DataChannel on host
+    await ctrl.connectAcceptedSession();
+    const hostChannel = (ctrl as unknown as { hostDataChannel: MockDataChannel })
+      .hostDataChannel;
+    assert.ok(hostChannel);
+    hostChannel.onopen?.();
 
   // 1. Outgoing text message uses local profile name ("Alice Host") and starts as 'sent'
   const sentText = await ctrl.sendChatMessageOverDataChannel({
@@ -285,9 +288,11 @@ test('WhatsApp-style Chat: real names, sent -> delivered -> seen ACKs for text &
   );
 
   // 7. Teardown clears all messages and statuses
-  await ctrl.executeIdempotentTeardown('user_top_bar_disconnect', {
-    subReason: 'test_end',
-  });
+  } finally {
+    await ctrl.executeIdempotentTeardown('user_top_bar_disconnect', {
+      subReason: 'test_end',
+    });
+  }
   assert.equal(ctrl.getSnapshot().messages.length, 0);
   assert.deepEqual(ctrl.getSnapshot().messageStatusesById, {});
   void sentFramesGuest;

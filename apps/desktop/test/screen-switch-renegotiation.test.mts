@@ -227,6 +227,8 @@ function setupWebRtcTestEnv() {
       },
     },
   });
+  const pendingHostSignals: Array<{ seq: number; payload: unknown }> = [];
+  let nextSigSeq = 1;
   Object.assign(globalThis, {
     RTCPeerConnection: MockPeerConnection,
     MediaStream: MockMediaStream,
@@ -240,7 +242,8 @@ function setupWebRtcTestEnv() {
           return { ok: true };
         },
         async pollSessionSignals() {
-          return { ok: true, data: { signals: [] } };
+          const out = pendingHostSignals.splice(0, pendingHostSignals.length);
+          return { ok: true, data: { signals: out } };
         },
         async disconnectActiveSession() {
           return { ok: true };
@@ -269,6 +272,9 @@ function setupWebRtcTestEnv() {
     session,
     sentSignals,
     createdPeers,
+    pushHostSignal(payload: WebRtcSignalPayload) {
+      pendingHostSignals.push({ seq: nextSigSeq++, payload });
+    },
     setReplaceTrackFail(v: boolean) {
       replaceTrackShouldFail = v;
     },
@@ -297,7 +303,7 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   await new Promise((r) => setTimeout(r, 20));
   const initialOffer = env.sentSignals.find((s) => s.payload.type === 'offer');
   assert.ok(initialOffer && initialOffer.payload.type === 'offer');
-  await ctrl.injectRemoteSignalForTest('host', {
+  env.pushHostSignal({
     type: 'answer',
     sdp: 'answer-initial',
     negotiationId: initialOffer.payload.negotiationId,
@@ -312,7 +318,7 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   await new Promise((r) => setTimeout(r, 20));
   const startOffer = env.sentSignals.filter((s) => s.payload.type === 'offer')[1];
   assert.ok(startOffer && startOffer.payload.type === 'offer');
-  await ctrl.injectRemoteSignalForTest('host', {
+  env.pushHostSignal({
     type: 'answer',
     sdp: 'answer-start',
     negotiationId: startOffer.payload.negotiationId,
@@ -361,10 +367,8 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   let resolveSlow!: (s: MockMediaStream) => void;
   const slowTrack = createMockTrack('slow-old-track', 'Slow Old');
   const fastTrack = createMockTrack('fast-latest-track', 'Fast Latest');
-  let callIdx = 0;
-  env.setCustomGetDisplayMedia(async () => {
-    callIdx += 1;
-    if (callIdx === 1) {
+  env.setCustomGetDisplayMedia(async (srcId) => {
+    if (srcId === 'window:slow:1') {
       return new Promise<MockMediaStream>((r) => {
         resolveSlow = r;
       });
@@ -372,6 +376,7 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
     return new MockMediaStream([fastTrack]);
   });
   const pSlow = ctrl.switchScreenSource('window:slow:1');
+  await new Promise((r) => setTimeout(r, 10));
   const pFast = ctrl.switchScreenSource('window:fast:2');
   await pFast;
   resolveSlow(new MockMediaStream([slowTrack]));
@@ -401,11 +406,12 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   const countDuringOffer1 = offersSoFar.length;
 
   // Inject stale answer with wrong negotiationId -> must be ignored, r2 must NOT fire yet
-  await ctrl.injectRemoteSignalForTest('host', {
+  env.pushHostSignal({
     type: 'answer',
     sdp: 'stale-answer',
     negotiationId: 'wrong-neg-id',
   });
+  await new Promise((r) => setTimeout(r, 400));
   assert.equal(pc.signalingState, 'have-local-offer');
   assert.equal(
     env.sentSignals.filter((s) => s.payload.type === 'offer').length,
@@ -414,7 +420,7 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   );
 
   // Inject matching answer for offer1 -> r1 completes, r2 starts
-  await ctrl.injectRemoteSignalForTest('host', {
+  env.pushHostSignal({
     type: 'answer',
     sdp: 'valid-answer-1',
     negotiationId: offer1.payload.negotiationId,
@@ -425,7 +431,7 @@ test('screen source switching reuses RTCRtpSender via replaceTrack, preserves MI
   assert.equal(offersAfterR1.length, countDuringOffer1 + 1);
   const offer2 = offersAfterR1[offersAfterR1.length - 1];
   assert.ok(offer2 && offer2.payload.type === 'offer');
-  await ctrl.injectRemoteSignalForTest('host', {
+  env.pushHostSignal({
     type: 'answer',
     sdp: 'valid-answer-2',
     negotiationId: offer2.payload.negotiationId,
