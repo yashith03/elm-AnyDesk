@@ -40,6 +40,7 @@ import {
   resolveWaitingPeerName,
 } from '../shared/request-ui';
 import {
+  computeUnreadChatState,
   getChatStatusDisplay,
   getSessionStageStatus,
   getTransportStatusDisplay,
@@ -67,9 +68,24 @@ import {
   type WebRtcSessionSnapshot,
 } from './webrtc-session';
 
+function isValidPresenceSnapshot(
+  candidate: unknown
+): candidate is PresenceStateSnapshot {
+  if (!candidate || typeof candidate !== 'object') {
+    return false;
+  }
+  const snap = candidate as Partial<PresenceStateSnapshot>;
+  return (
+    typeof snap.online === 'boolean' &&
+    Boolean(snap.account && typeof snap.account === 'object') &&
+    Array.isArray(snap.incomingInvites)
+  );
+}
+
 function ThemeToggleButton(props: {
   themeState: ThemeStateSnapshot;
   onToggle: () => void;
+  suppressTooltip?: boolean;
 }): React.ReactElement {
   const isDark = props.themeState.mode === 'dark';
   return (
@@ -81,11 +97,15 @@ function ThemeToggleButton(props: {
         isDark ? 'Dark' : 'Light'
       })`}
       aria-pressed={isDark}
-      title={`Current theme: ${isDark ? 'Dark' : 'Light'} (${
-        props.themeState.source === 'system_default'
-          ? 'System Default'
-          : 'Saved Preference'
-      }). Click or press Enter/Space to switch.`}
+      title={
+        props.suppressTooltip
+          ? undefined
+          : `Current theme: ${isDark ? 'Dark' : 'Light'} (${
+              props.themeState.source === 'system_default'
+                ? 'System Default'
+                : 'Saved Preference'
+            }). Click or press Enter/Space to switch.`
+      }
       onClick={props.onToggle}
     >
       <span className="theme-toggle-icon" aria-hidden="true">
@@ -246,10 +266,11 @@ export function App(): React.ReactElement {
     useState<VolatileSessionUiState | null>(null);
   const [chatInputText, setChatInputText] = useState<string>('');
 
-  // Guest B media element refs for local playback
+  // Guest B media element refs for local playback (and Host A playback of Viewer mic)
   const guestVideoRef = useRef<HTMLVideoElement | null>(null);
   const guestMicAudioRef = useRef<HTMLAudioElement | null>(null);
   const guestDeviceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const hostViewerMicAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Viewer Display Mode, DPI Scaling & Readability Diagnostics State
   const [viewerMode, setViewerMode] = useState<'fit' | 'actual'>('fit');
@@ -271,6 +292,11 @@ export function App(): React.ReactElement {
   const [floatingChatOpen, setFloatingChatOpen] = useState<boolean>(false);
   const [floatingSettingsOpen, setFloatingSettingsOpen] =
     useState<boolean>(false);
+  const [hasUnreadChat, setHasUnreadChat] = useState<boolean>(false);
+  const [isDocumentHidden, setIsDocumentHidden] = useState<boolean>(
+    () => typeof document !== 'undefined' && document.visibilityState !== 'visible'
+  );
+  const readIncomingMessageIdsRef = useRef<Set<string>>(new Set());
 
   // Window Controls & Request Lifecycle State
   const [isWindowMaximized, setIsWindowMaximized] = useState<boolean>(false);
@@ -284,6 +310,7 @@ export function App(): React.ReactElement {
   >({});
   const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
   const snapshotEpochRef = useRef<number>(0);
+  const lastAppliedSnapshotGenRef = useRef<number>(0);
 
   // External Invitation Copy Feedback
   const [copiedInvitation, setCopiedInvitation] = useState<boolean>(false);
@@ -404,6 +431,16 @@ export function App(): React.ReactElement {
         ]) => {
           if (!mounted) return;
           setMetadata(meta);
+          const isOverlayRole =
+            meta.windowRole === 'host-toolbar' ||
+            meta.windowRole === 'host-source-picker' ||
+            meta.windowRole === 'host-settings' ||
+            meta.windowRole === 'chat';
+          if (isOverlayRole) {
+            document.documentElement.dataset.overlayWindow = 'true';
+          } else {
+            delete document.documentElement.dataset.overlayWindow;
+          }
           setVolatileChatState(volatileState);
           if (overlayState) setHostOverlayState(overlayState);
           if (floatingApp) {
@@ -466,9 +503,33 @@ export function App(): React.ReactElement {
       (nextRuntime) => {
         if (!mounted) return;
         setPresenceRuntime(nextRuntime);
-        if (nextRuntime.snapshot) {
-          setSnapshot(nextRuntime.snapshot);
+        const candidate = nextRuntime.snapshot;
+        if (!isValidPresenceSnapshot(candidate)) {
+          return;
         }
+        const incomingGen = nextRuntime.snapshotGeneration ?? 0;
+        if (incomingGen > 0 && incomingGen < lastAppliedSnapshotGenRef.current) {
+          return;
+        }
+        const isNewerMutation =
+          incomingGen > 0 && incomingGen > lastAppliedSnapshotGenRef.current;
+        if (nextRuntime.connectionState !== 'online' && !isNewerMutation) {
+          return;
+        }
+        if (incomingGen > 0) {
+          lastAppliedSnapshotGenRef.current = incomingGen;
+        }
+        setSnapshot((prev) => {
+          if (
+            nextRuntime.connectionState !== 'online' &&
+            prev?.activeSession &&
+            !candidate.activeSession &&
+            !isNewerMutation
+          ) {
+            return { ...candidate, activeSession: prev.activeSession };
+          }
+          return candidate;
+        });
       }
     );
 
@@ -541,7 +602,12 @@ export function App(): React.ReactElement {
     applyThemeToDom(updated.mode);
   };
 
-  const applyAuthoritativeSnapshot = (nextSnapshot: PresenceStateSnapshot) => {
+  const applyAuthoritativeSnapshot = (
+    nextSnapshot: PresenceStateSnapshot | null | undefined
+  ) => {
+    if (!isValidPresenceSnapshot(nextSnapshot)) {
+      return;
+    }
     snapshotEpochRef.current += 1;
     setSnapshot(nextSnapshot);
   };
@@ -563,7 +629,13 @@ export function App(): React.ReactElement {
     const poll = async () => {
       const epoch = snapshotEpochRef.current;
       const res = await window.elmDesktop.getPresenceSnapshot();
-      if (!cancelled && epoch === snapshotEpochRef.current && res.ok && res.data) {
+      if (
+        !cancelled &&
+        epoch === snapshotEpochRef.current &&
+        res.ok &&
+        res.data &&
+        isValidPresenceSnapshot(res.data.snapshot)
+      ) {
         setSnapshot(res.data.snapshot);
       }
     };
@@ -595,7 +667,12 @@ export function App(): React.ReactElement {
       if (now >= Date.parse(pendingOutgoingExpiresAt)) {
         const epoch = snapshotEpochRef.current;
         void window.elmDesktop.getPresenceSnapshot().then((res) => {
-          if (epoch === snapshotEpochRef.current && res.ok && res.data) {
+          if (
+            epoch === snapshotEpochRef.current &&
+            res.ok &&
+            res.data &&
+            isValidPresenceSnapshot(res.data.snapshot)
+          ) {
             setSnapshot(res.data.snapshot);
           }
         });
@@ -704,7 +781,20 @@ export function App(): React.ReactElement {
     const currentSession = snapshot?.activeSession ?? null;
     if (!currentSession) {
       if (webrtcControllerRef.current) {
-        webrtcControllerRef.current.destroy();
+        const prevSnap = webrtcControllerRef.current.getSnapshot();
+        const prevReceipt = prevSnap.teardownReceipt;
+        if (
+          prevReceipt &&
+          prevReceipt.reason !== 'user_top_bar_disconnect' &&
+          prevSnap.lastStatusBanner
+        ) {
+          setStatusMessage(prevSnap.lastStatusBanner);
+        }
+        webrtcControllerRef.current.destroyLocalOnly(
+          'connection_lost',
+          'session_cleared_by_server',
+          { silent: true }
+        );
         webrtcControllerRef.current = null;
       }
       clearGuestMediaElements();
@@ -731,7 +821,12 @@ export function App(): React.ReactElement {
     }
 
     if (webrtcControllerRef.current) {
-      webrtcControllerRef.current.destroy();
+      webrtcControllerRef.current.destroyLocalOnly(
+        'connection_lost',
+        'session_replaced',
+        { silent: true }
+      );
+      webrtcControllerRef.current = null;
     }
 
     const isRemoteSession = account?.provider !== 'test-double';
@@ -779,6 +874,9 @@ export function App(): React.ReactElement {
     const controller = new ApprovedWebRtcSessionController(
       currentSession,
       (nextSnap) => {
+        if (webrtcControllerRef.current !== controller) {
+          return;
+        }
         setWebrtcSnap(nextSnap);
         void window.elmDesktop.syncVolatileSessionUiState({
           session: nextSnap.teardownReceipt ? null : currentSession,
@@ -807,6 +905,35 @@ export function App(): React.ReactElement {
               connectedAt: currentSession.createdAt,
             })
             .then(setRecentPeers);
+        },
+        onSessionEndedRemotely: ({ sessionId, message }) => {
+          if (webrtcControllerRef.current === controller) {
+            webrtcControllerRef.current = null;
+          }
+          clearGuestMediaElements();
+          setFloatingChatOpen(false);
+          setFloatingSettingsOpen(false);
+          setHostSourcePickerOpen(false);
+          setWebrtcSnap(null);
+          setSnapshot((prev) =>
+            prev && prev.activeSession?.sessionId === sessionId
+              ? { ...prev, activeSession: null }
+              : prev
+          );
+          setStatusMessage(message);
+          void window.elmDesktop.syncVolatileSessionUiState({
+            session: null,
+            currentAccount: account,
+            connectionState: 'closed',
+            dataChannelState: 'closed',
+            messages: [],
+            hostMediaState: null,
+          });
+          void window.elmDesktop.getPresenceSnapshot().then((fresh) => {
+            if (fresh.ok && fresh.data?.snapshot) {
+              applyAuthoritativeSnapshot(fresh.data.snapshot);
+            }
+          });
         },
       }
     );
@@ -855,7 +982,21 @@ export function App(): React.ReactElement {
     void controller.connectAcceptedSession();
 
     return () => {
-      // Cleanup on unmount
+      // Local-only cleanup on React unmount/re-run; never invoke POST /sessions/disconnect here.
+      if (webrtcControllerRef.current === controller) {
+        const snap = controller.getSnapshot();
+        if (
+          snap.teardownReceipt &&
+          snap.teardownReceipt.reason !== 'user_top_bar_disconnect' &&
+          snap.lastStatusBanner
+        ) {
+          setStatusMessage(snap.lastStatusBanner);
+        }
+        controller.destroyLocalOnly('app_closed', 'react_unmount', {
+          silent: true,
+        });
+        webrtcControllerRef.current = null;
+      }
     };
   }, [activeSessionId, metadata?.windowRole]);
 
@@ -968,6 +1109,22 @@ export function App(): React.ReactElement {
         }
       } else {
         guestDeviceAudioRef.current.srcObject = null;
+      }
+    }
+
+    if (hostViewerMicAudioRef.current) {
+      hostViewerMicAudioRef.current.muted =
+        webrtcSnap.hostViewerMicMutedLocally;
+      if (webrtcSnap.hostReceivedViewerMicStream) {
+        if (
+          hostViewerMicAudioRef.current.srcObject !==
+          webrtcSnap.hostReceivedViewerMicStream
+        ) {
+          hostViewerMicAudioRef.current.srcObject =
+            webrtcSnap.hostReceivedViewerMicStream;
+        }
+      } else {
+        hostViewerMicAudioRef.current.srcObject = null;
       }
     }
   }, [webrtcSnap]);
@@ -1384,6 +1541,45 @@ export function App(): React.ReactElement {
 
   useEffect(() => {
     if (metadata?.windowRole !== 'main') return;
+    const onVisibilityChange = () => {
+      setIsDocumentHidden(document.visibilityState !== 'visible');
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [metadata?.windowRole]);
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
+    if (!activeSessionId || !webrtcSnap) {
+      readIncomingMessageIdsRef.current.clear();
+      setHasUnreadChat(false);
+      return;
+    }
+    const chatVisible = isHostInActiveSession
+      ? Boolean(hostOverlayState?.chatOpen)
+      : Boolean(floatingChatOpen && !isDocumentHidden);
+    const nextUnread = computeUnreadChatState({
+      messages: webrtcSnap.messages,
+      currentAccountId: account?.accountId,
+      chatVisible,
+      readIncomingIds: readIncomingMessageIdsRef.current,
+    });
+    setHasUnreadChat(nextUnread);
+  }, [
+    metadata?.windowRole,
+    activeSessionId,
+    webrtcSnap,
+    isHostInActiveSession,
+    hostOverlayState?.chatOpen,
+    floatingChatOpen,
+    isDocumentHidden,
+    account?.accountId,
+  ]);
+
+  useEffect(() => {
+    if (metadata?.windowRole !== 'main') return;
     if (!isHostInActiveSession || !snapshot?.activeSession || !webrtcSnap) {
       return;
     }
@@ -1396,12 +1592,19 @@ export function App(): React.ReactElement {
       dataChannelState: webrtcSnap.dataChannelState,
       hostMediaState: webrtcSnap.hostMediaState,
       hostMicMutedLocally: webrtcSnap.hostMicMutedLocally,
+      peerMicActive: Boolean(
+        webrtcSnap.remoteViewerMicActive ||
+          webrtcSnap.hostReceivedViewerMicStream
+      ),
+      peerMicMutedLocally: webrtcSnap.hostViewerMicMutedLocally,
+      peerMicRequestPending: webrtcSnap.hostViewerMicRequestSent,
       isStartingShare,
       isStartingMic,
       isStartingDeviceSound,
       shareableSources,
       selectedSourceId,
       playWasapiTestTone,
+      hasUnreadChat,
     });
   }, [
     metadata?.windowRole,
@@ -1414,6 +1617,7 @@ export function App(): React.ReactElement {
     shareableSources,
     selectedSourceId,
     playWasapiTestTone,
+    hasUnreadChat,
   ]);
 
   const openSettingsModal = () => {
@@ -1619,7 +1823,13 @@ export function App(): React.ReactElement {
   const handleSignOut = async () => {
     clearAlerts();
     if (webrtcControllerRef.current) {
-      webrtcControllerRef.current.destroy();
+      await webrtcControllerRef.current.executeIdempotentTeardown(
+        'user_top_bar_disconnect',
+        {
+          subReason: 'user_sign_out',
+          initiatedByAccountId: account?.accountId ?? null,
+        }
+      );
       webrtcControllerRef.current = null;
     }
     await window.elmDesktop.signOut();
@@ -1730,7 +1940,25 @@ export function App(): React.ReactElement {
         setErrorMessage(res.errorMessage ?? 'Could not send invite.');
         return;
       }
-      applyAuthoritativeSnapshot(res.data.snapshot);
+      if (isValidPresenceSnapshot(res.data.snapshot)) {
+        applyAuthoritativeSnapshot(res.data.snapshot);
+      } else if (res.data.invite) {
+        snapshotEpochRef.current += 1;
+        setSnapshot((prev) =>
+          prev
+            ? {
+                ...prev,
+                outgoingInvite: res.data!.invite,
+                recentExpiredOutgoingInvite: null,
+              }
+            : prev
+        );
+        void window.elmDesktop.getPresenceSnapshot().then((fresh) => {
+          if (fresh.ok && fresh.data && isValidPresenceSnapshot(fresh.data.snapshot)) {
+            applyAuthoritativeSnapshot(fresh.data.snapshot);
+          }
+        });
+      }
       if (params.intent === 'invite') {
         setInviteDialogOpen(false);
         setInviteTargetCode('');
@@ -1775,7 +2003,24 @@ export function App(): React.ReactElement {
         }
         return;
       }
-      applyAuthoritativeSnapshot(res.data.snapshot);
+      if (isValidPresenceSnapshot(res.data.snapshot)) {
+        applyAuthoritativeSnapshot(res.data.snapshot);
+      } else {
+        snapshotEpochRef.current += 1;
+        setSnapshot((prev) =>
+          prev
+            ? {
+                ...prev,
+                outgoingInvite: null,
+              }
+            : prev
+        );
+        void window.elmDesktop.getPresenceSnapshot().then((fresh) => {
+          if (fresh.ok && fresh.data && isValidPresenceSnapshot(fresh.data.snapshot)) {
+            applyAuthoritativeSnapshot(fresh.data.snapshot);
+          }
+        });
+      }
     } finally {
       setCancellingInviteId(null);
     }
@@ -1806,7 +2051,40 @@ export function App(): React.ReactElement {
       setErrorMessage(res.errorMessage ?? 'Could not respond to invite.');
       return;
     }
-    applyAuthoritativeSnapshot(res.data.snapshot);
+    if (isValidPresenceSnapshot(res.data.snapshot)) {
+      applyAuthoritativeSnapshot(res.data.snapshot);
+    } else if (action === 'accept' && res.data.session) {
+      const approvedSession = res.data.session;
+      snapshotEpochRef.current += 1;
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              incomingInvites: [],
+              outgoingInvite: null,
+              recentExpiredOutgoingInvite: null,
+              activeSession: approvedSession,
+            }
+          : prev
+      );
+      void window.elmDesktop.getPresenceSnapshot().then((fresh) => {
+        if (fresh.ok && fresh.data && isValidPresenceSnapshot(fresh.data.snapshot)) {
+          applyAuthoritativeSnapshot(fresh.data.snapshot);
+        }
+      });
+    } else if (action === 'decline') {
+      snapshotEpochRef.current += 1;
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              incomingInvites: prev.incomingInvites.filter(
+                (item) => item.inviteId !== invite.inviteId
+              ),
+            }
+          : prev
+      );
+    }
     if (action === 'accept' && res.data.session) {
       setStatusMessage(
         `Accepted invite from ${invite.requesterDisplayName}. Connecting peer session. Media will not start until you click "Start Sharing".`
@@ -1848,11 +2126,20 @@ export function App(): React.ReactElement {
       subReason: 'user_top_bar_disconnect',
       callerAccountId: account?.accountId,
     });
-    if (res.ok && res.data) {
+    if (res.ok && res.data && isValidPresenceSnapshot(res.data.snapshot)) {
       applyAuthoritativeSnapshot(res.data.snapshot);
+    } else if (
+      res.ok ||
+      res.status === 409 ||
+      res.errorCode === 'SESSION_ALREADY_ENDED'
+    ) {
+      snapshotEpochRef.current += 1;
+      setSnapshot((prev) => (prev ? { ...prev, activeSession: null } : prev));
     }
     setStatusMessage(
-      'Session ended via unified idempotent teardown path: A\'s tracks stopped, peer connections & DataChannels closed, B\'s viewer cleared, and session permissions invalidated. Send a fresh invite to connect again.'
+      res.status === 409 || res.errorCode === 'SESSION_ALREADY_ENDED'
+        ? 'Session had already ended on the server. All media and permissions are cleared. Send a fresh invite to connect again.'
+        : 'Session ended. All media and permissions have been cleared. Send a fresh invite to connect again.'
     );
   };
 
@@ -1874,10 +2161,13 @@ export function App(): React.ReactElement {
     }
     setIsStartingShare(true);
     try {
-      await ctrl.stopHostSource('screenVideo');
-      await ctrl.startHostSource('screenVideo', {
-        selectedSourceId: nextSourceId,
-      });
+      const nextSnap = await ctrl.switchScreenSource(nextSourceId);
+      const nextScreen = nextSnap.hostMediaState.screenVideo;
+      if (!nextScreen.active && nextScreen.message) {
+        showToast(nextScreen.message, 'error');
+      } else if (nextScreen.status === 'permission_denied' || nextScreen.status === 'source_disappeared') {
+        showToast(nextScreen.message, 'error');
+      }
       setHostSourcePickerOpen(false);
     } catch (err) {
       showToast(
@@ -1998,11 +2288,46 @@ export function App(): React.ReactElement {
     showToast('Screen sharing stopped.');
   };
 
+  const handleToggleHostPeerMic = () => {
+    const ctrl = webrtcControllerRef.current;
+    if (!ctrl || !webrtcSnap) return;
+    if (
+      webrtcSnap.remoteViewerMicActive ||
+      webrtcSnap.hostReceivedViewerMicStream
+    ) {
+      ctrl.setHostViewerMicrophoneMuted(!webrtcSnap.hostViewerMicMutedLocally);
+      return;
+    }
+    const sent = ctrl.requestViewerMicrophone();
+    if (sent) {
+      showToast('Requested Viewer to turn on microphone.');
+    } else {
+      showToast('DataChannel is not open yet.', 'error');
+    }
+  };
+
+  const handleToggleViewerMic = async () => {
+    const ctrl = webrtcControllerRef.current;
+    if (!ctrl) return;
+    const nextSnap = await ctrl.toggleViewerMicrophone();
+    if (nextSnap.viewerMicStatus === 'permission_denied') {
+      showToast(
+        nextSnap.lastStatusBanner || 'Microphone permission denied or unavailable.',
+        'error'
+      );
+    } else if (nextSnap.viewerMicActive) {
+      showToast('Your microphone is now ON.');
+    } else {
+      showToast('Your microphone is now OFF.');
+    }
+  };
+
   // Subscribe in Main Window to actions dispatched from independent Host overlay windows
   const hostActionHandlersRef = useRef({
     toggleMic: () => void handleToggleHostMic(),
     stopMic: () => void webrtcControllerRef.current?.stopHostSource('microphoneAudio'),
     toggleDeviceSound: () => void handleToggleHostDeviceSound(),
+    togglePeerMic: () => handleToggleHostPeerMic(),
     startScreen: () => void handleStartOrRestartHostScreen(),
     stopScreen: () => void handleStopHostScreen(),
     selectSource: (sourceId: string) => void handleSelectHostSource(sourceId),
@@ -2014,6 +2339,7 @@ export function App(): React.ReactElement {
     toggleMic: () => void handleToggleHostMic(),
     stopMic: () => void webrtcControllerRef.current?.stopHostSource('microphoneAudio'),
     toggleDeviceSound: () => void handleToggleHostDeviceSound(),
+    togglePeerMic: () => handleToggleHostPeerMic(),
     startScreen: () => void handleStartOrRestartHostScreen(),
     stopScreen: () => void handleStopHostScreen(),
     selectSource: (sourceId: string) => void handleSelectHostSource(sourceId),
@@ -2034,6 +2360,9 @@ export function App(): React.ReactElement {
           break;
         case 'toggle-device-sound':
           hostActionHandlersRef.current.toggleDeviceSound();
+          break;
+        case 'toggle-peer-mic':
+          hostActionHandlersRef.current.togglePeerMic();
           break;
         case 'start-screen':
           hostActionHandlersRef.current.startScreen();
@@ -2295,7 +2624,7 @@ export function App(): React.ReactElement {
     settingsDraftTheme !== themeState.mode;
 
   return (
-    <main className="app-shell">
+    <main className={isLocalHost ? 'app-shell host-ui-scope' : 'app-shell'}>
       {/* SIMPLE CUSTOM ELECTRON TITLE BAR */}
       <header className="top-bar chrome-titlebar" data-testid="chrome-titlebar">
         <div className="titlebar-brand">
@@ -2328,7 +2657,7 @@ export function App(): React.ReactElement {
             data-testid="win-minimize-button"
             className="win-control-btn no-drag"
             aria-label="Minimize window"
-            title="Minimize"
+            title={isLocalHost ? undefined : 'Minimize'}
             onClick={() => void window.elmDesktop.minimizeWindow()}
           >
             <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
@@ -2340,7 +2669,13 @@ export function App(): React.ReactElement {
             data-testid="win-maximize-button"
             className="win-control-btn no-drag"
             aria-label={isWindowMaximized ? 'Restore window' : 'Maximize window'}
-            title={isWindowMaximized ? 'Restore' : 'Maximize'}
+            title={
+              isLocalHost
+                ? undefined
+                : isWindowMaximized
+                  ? 'Restore'
+                  : 'Maximize'
+            }
             onClick={() =>
               void window.elmDesktop
                 .toggleMaximizeWindow()
@@ -2363,7 +2698,7 @@ export function App(): React.ReactElement {
             data-testid="win-close-button"
             className="win-control-btn win-control-close no-drag"
             aria-label="Close window"
-            title="Close"
+            title={isLocalHost ? undefined : 'Close'}
             onClick={() => void window.elmDesktop.closeWindow()}
           >
             <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">
@@ -2378,6 +2713,9 @@ export function App(): React.ReactElement {
       <section className="device-header-strip" data-testid="device-header-strip">
         <div className="device-header-left">
           {(() => {
+            if (!account) {
+              return null;
+            }
             const isConfirmedOnline =
               Boolean(account) &&
               presenceRuntime.connectionState === 'online' &&
@@ -2414,7 +2752,7 @@ export function App(): React.ReactElement {
                 aria-live="polite"
                 data-testid="presence-status-pill"
                 className={`presence-pill no-drag ${pillVariant}`}
-                title={pillTitle}
+                title={isLocalHost ? undefined : pillTitle}
               >
                 <span className="presence-dot-inline" aria-hidden="true" />
                 <span>{pillLabel}</span>
@@ -2505,6 +2843,7 @@ export function App(): React.ReactElement {
           )}
           <ThemeToggleButton
             themeState={themeState}
+            suppressTooltip={isLocalHost}
             onToggle={() => void handleToggleTheme()}
           />
         </div>
@@ -2802,6 +3141,12 @@ export function App(): React.ReactElement {
               className="card card-full"
               data-testid="host-active-session-card"
             >
+              <audio
+                ref={hostViewerMicAudioRef}
+                autoPlay
+                playsInline
+                style={{ display: 'none' }}
+              />
               <div className="subcard-header">
                 <div>
                   <span
@@ -3030,6 +3375,13 @@ export function App(): React.ReactElement {
                       }
                     >
                       Chat
+                      {hasUnreadChat && (
+                        <span
+                          className="chat-unread-dot"
+                          data-testid="chat-unread-dot"
+                          aria-hidden="true"
+                        />
+                      )}
                     </button>
 
                     <button
@@ -3063,10 +3415,23 @@ export function App(): React.ReactElement {
                         <button
                           type="button"
                           data-testid="toolbar-my-mic-btn"
-                          className="toolbar-icon-btn"
-                          disabled
-                          title="Microphone sharing is available only to the Host"
-                          aria-label="My microphone (Host only)"
+                          className={
+                            webrtcSnap.viewerMicActive
+                              ? 'toolbar-icon-btn active'
+                              : 'toolbar-icon-btn'
+                          }
+                          aria-pressed={webrtcSnap.viewerMicActive}
+                          title={
+                            webrtcSnap.viewerMicActive
+                              ? 'Your microphone is ON. Click to turn OFF.'
+                              : 'Your microphone is OFF. Click to turn ON.'
+                          }
+                          aria-label={
+                            webrtcSnap.viewerMicActive
+                              ? 'Turn off my microphone'
+                              : 'Turn on my microphone'
+                          }
+                          onClick={() => void handleToggleViewerMic()}
                         >
                           <svg
                             width="15"
@@ -3079,12 +3444,23 @@ export function App(): React.ReactElement {
                             strokeLinejoin="round"
                             aria-hidden="true"
                           >
-                            <line x1="2" y1="2" x2="22" y2="22" />
-                            <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
-                            <path d="M5 10v2a7 7 0 0 0 12 5" />
-                            <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
-                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
-                            <line x1="12" y1="19" x2="12" y2="22" />
+                            {webrtcSnap.viewerMicActive ? (
+                              <>
+                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                                <line x1="12" y1="19" x2="12" y2="23" />
+                                <line x1="8" y1="23" x2="16" y2="23" />
+                              </>
+                            ) : (
+                              <>
+                                <line x1="2" y1="2" x2="22" y2="22" />
+                                <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
+                                <path d="M5 10v2a7 7 0 0 0 12 5" />
+                                <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
+                                <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
+                                <line x1="12" y1="19" x2="12" y2="22" />
+                              </>
+                            )}
                           </svg>
                         </button>
 
@@ -3278,6 +3654,56 @@ export function App(): React.ReactElement {
                       End Session
                     </button>
                   </div>
+
+                  {/* VIEWER MIC CONSENT PROMPT WHEN HOST CLICKS PEER MIC */}
+                  {!isLocalHost && webrtcSnap.viewerMicRequestPending && (
+                    <div
+                      className="floating-panel-chat"
+                      data-testid="viewer-mic-request-banner"
+                      style={{
+                        backgroundColor: buildBackgroundRgba(
+                          themeState.mode,
+                          panelAppearance.chatBgOpacity
+                        ),
+                        padding: '10px 12px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '10px',
+                      }}
+                    >
+                      <span style={{ fontSize: '0.82rem' }}>
+                        Host is asking to turn on your microphone.
+                      </span>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          type="button"
+                          data-testid="viewer-mic-allow-btn"
+                          className="primary-btn"
+                          style={{ height: '28px', padding: '0 10px', fontSize: '0.78rem' }}
+                          onClick={() =>
+                            void webrtcControllerRef.current?.respondToViewerMicRequest(
+                              true
+                            )
+                          }
+                        >
+                          Allow Mic
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="viewer-mic-decline-btn"
+                          className="small-secondary-btn"
+                          onClick={() =>
+                            void webrtcControllerRef.current?.respondToViewerMicRequest(
+                              false
+                            )
+                          }
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* EXPANDED CHAT DIRECTLY BELOW THE SAME BAR (NO SECOND TITLE BAR) */}
                   {floatingChatOpen && (
@@ -3494,42 +3920,6 @@ export function App(): React.ReactElement {
                           onChange={(e) =>
                             updateViewerAppearance({
                               chatBgOpacity: Number(e.target.value),
-                            })
-                          }
-                        />
-                      </label>
-
-                      <label className="sidebar-slider">
-                        <span>
-                          Bar Text Size: {panelAppearance.barTextSizePx}px
-                        </span>
-                        <input
-                          type="range"
-                          min={11}
-                          max={16}
-                          step={1}
-                          value={panelAppearance.barTextSizePx}
-                          onChange={(e) =>
-                            updateViewerAppearance({
-                              barTextSizePx: Number(e.target.value),
-                            })
-                          }
-                        />
-                      </label>
-
-                      <label className="sidebar-slider">
-                        <span>
-                          Chat Text Size: {panelAppearance.chatTextSizePx}px
-                        </span>
-                        <input
-                          type="range"
-                          min={12}
-                          max={18}
-                          step={1}
-                          value={panelAppearance.chatTextSizePx}
-                          onChange={(e) =>
-                            updateViewerAppearance({
-                              chatTextSizePx: Number(e.target.value),
                             })
                           }
                         />

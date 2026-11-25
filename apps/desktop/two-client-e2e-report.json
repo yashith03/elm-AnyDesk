@@ -1,28 +1,32 @@
 {
-  "timestamp": "2026-11-22T10:52:53.182Z",
-  "backendUrl": "http://127.0.0.1:59129",
+  "timestamp": "2026-11-25T08:32:30.980Z",
+  "backendUrl": "http://127.0.0.1:56795",
+  "clientLogs": {
+    "clientA": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795595460424-n3p9l5\\client-a.log",
+    "clientB": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795595460424-n3p9l5\\client-b.log"
+  },
   "passed": true,
   "results": {
     "registration_and_presence": {
       "status": "PASSED",
       "details": {
-        "pidA": 27348,
-        "pidB": 8020,
-        "codeA": "ELM-CC76-EM8F",
-        "codeB": "ELM-3ZSP-AV97"
+        "pidA": 30292,
+        "pidB": 32988,
+        "codeA": "ELM-23T5-9FA9",
+        "codeB": "ELM-RTPK-SHQX"
       }
     },
     "send_and_receive_request": {
       "status": "PASSED",
       "details": {
         "waitingCountdown": "02:00",
-        "incomingRequesterCode": "ELM-CC76-EM8F"
+        "incomingRequesterCode": "ELM-23T5-9FA9"
       }
     },
     "accept_and_webrtc_connect": {
       "status": "PASSED",
       "details": {
-        "sessionId": "2db53faa-8bee-43c6-be23-6d41f587aa2d",
+        "sessionId": "179c2232-392c-401b-9b4e-7d693c10a466",
         "roleA": "guest",
         "roleB": "host",
         "connectionStateA": "connected",
@@ -62,8 +66,38 @@
             "settings": false
           },
           "windowDisplayAffinities": {
-            "main": 1,
-            "hostToolbar": 1
+            "main": 17,
+            "hostToolbar": 17
+          }
+        },
+        "protAfterMinimize": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 17,
+            "hostToolbar": 17
+          }
+        },
+        "protAfterRestore": {
+          "enabled": true,
+          "toggleAllowed": true,
+          "windows": {
+            "main": true,
+            "hostToolbar": true,
+            "chat": false,
+            "sourcePicker": false,
+            "settings": false
+          },
+          "windowDisplayAffinities": {
+            "main": 17,
+            "hostToolbar": 17
           }
         },
         "postMinimizeConnectionState": "connected",
@@ -71,20 +105,24 @@
       }
     },
     "screen_sharing_b_to_a": {
-      "status": "BLOCKED_OS_CAPTURE_ZERO_FRAMES",
+      "status": "PASSED",
       "details": {
-        "selectedSourceName": "DISPLAYScreen 2",
+        "selectedSourceName": "DISPLAYScreen 1",
         "sharingStartedByHost": true,
-        "hostCaptureWidth": null,
-        "hostCaptureHeight": null,
-        "hostCaptureFps": 0,
-        "hostOutboundFramesSent": 0,
-        "guestDecodedWidth": null,
-        "guestDecodedHeight": null,
-        "guestInboundFramesDecoded": 0,
-        "guestInboundBytesReceived": 0,
+        "hostCaptureWidth": 1920,
+        "hostCaptureHeight": 1080,
+        "hostCaptureFps": 3,
+        "hostOutboundFramesSent": 1,
+        "guestDecodedWidth": 1920,
+        "guestDecodedHeight": 1080,
+        "guestInboundFramesDecoded": 1,
+        "guestInboundBytesReceived": 35611,
         "guestVideoTracksCount": 1,
-        "nonBlankFrame": null,
+        "nonBlankFrame": {
+          "width": 1920,
+          "height": 1080,
+          "nonZeroPixels": 255
+        },
         "captureProtection": {
           "enabled": true,
           "toggleAllowed": true,
@@ -96,11 +134,11 @@
             "settings": false
           },
           "windowDisplayAffinities": {
-            "main": 1,
-            "hostToolbar": 1
+            "main": 17,
+            "hostToolbar": 17
           }
         },
-        "rttMs": 2
+        "rttMs": 1
       }
     },
     "host_toolbar_controls_and_protection_toggle": {
@@ -132,8 +170,8 @@
             "settings": false
           },
           "windowDisplayAffinities": {
-            "main": 1,
-            "hostToolbar": 1
+            "main": 17,
+            "hostToolbar": 17
           }
         },
         "settingsProt": {
@@ -142,14 +180,15 @@
           "windows": {
             "main": true,
             "hostToolbar": true,
-            "chat": false,
+            "chat": true,
             "sourcePicker": false,
             "settings": true
           },
           "windowDisplayAffinities": {
-            "main": 1,
-            "hostToolbar": 1,
-            "settings": 1
+            "main": 17,
+            "hostToolbar": 17,
+            "chat": 17,
+            "settings": 17
           }
         },
         "mediaStatesAfterClicks": {
@@ -157,11 +196,10 @@
           "soundState": "active"
         },
         "micStateAfterMuteToggle": "muted",
-        "wasSharingBefore4b": false,
+        "wasSharingBefore4b": true,
         "restartOutcome": {
-          "started": false,
-          "status": "source_disappeared",
-          "message": "Screen Video could not start (Timeout starting video source). Other approved features and chat remain active."
+          "started": true,
+          "status": "active"
         }
       }
     },
@@ -193,17 +231,46 @@
         "note": "Live cross-process speaker playback not asserted on single PC to avoid same-endpoint feedback loop."
       }
     },
+    "session_stability_60s": {
+      "status": "PASSED",
+      "details": {
+        "sessionId": "179c2232-392c-401b-9b4e-7d693c10a466",
+        "holdSeconds": 60,
+        "samples": [
+          {
+            "elapsedSec": 15,
+            "connectionState": "connected",
+            "dataChannelState": "open"
+          },
+          {
+            "elapsedSec": 30,
+            "connectionState": "connected",
+            "dataChannelState": "open"
+          },
+          {
+            "elapsedSec": 45,
+            "connectionState": "connected",
+            "dataChannelState": "open"
+          },
+          {
+            "elapsedSec": 60,
+            "connectionState": "connected",
+            "dataChannelState": "open"
+          }
+        ]
+      }
+    },
     "disconnect_and_mutual_recent_presence": {
       "status": "PASSED",
       "details": {
         "cardOnA": {
-          "text": "☆Test Friend BOnlineELM-3ZSP-AV97friend.b@example.com+1 555-0202ConnectInvite⋮",
+          "text": "☆Test Friend BOnlineELM-RTPK-SHQXfriend.b@example.com+1 555-0202ConnectInvite⋮",
           "email": "friend.b@example.com",
           "phone": "+1 555-0202",
           "status": "Online"
         },
         "cardOnB": {
-          "text": "☆Test Friend AOnlineELM-CC76-EM8Ffriend.a@example.com+1 555-0101ConnectInvite⋮",
+          "text": "☆Test Friend AOnlineELM-23T5-9FA9friend.a@example.com+1 555-0101ConnectInvite⋮",
           "email": "friend.a@example.com",
           "phone": "+1 555-0101",
           "status": "Online"
@@ -218,24 +285,28 @@
       }
     },
     "reverse_roles_a_to_b": {
-      "status": "PASSED_SIGNALING_AND_CHAT_CAPTURE_BLOCKED",
+      "status": "PASSED",
       "details": {
-        "sessionId": "826b5498-fd89-432a-a2a4-73fecbff7704",
+        "sessionId": "83d4bd78-3259-45b7-ada9-774ed645b5a5",
         "roleA": "host",
         "roleB": "guest",
-        "videoCapturePassed": false,
-        "selectedSourceName": "DISPLAYScreen 2",
+        "videoCapturePassed": true,
+        "selectedSourceName": "DISPLAYScreen 1",
         "sharingStartedByHost": true,
-        "hostCaptureWidth": null,
-        "hostCaptureHeight": null,
-        "hostCaptureFps": 0,
-        "hostOutboundFramesSent": 0,
-        "guestDecodedWidth": null,
-        "guestDecodedHeight": null,
-        "guestInboundFramesDecoded": 0,
-        "guestInboundBytesReceived": 0,
+        "hostCaptureWidth": 1920,
+        "hostCaptureHeight": 1080,
+        "hostCaptureFps": 9,
+        "hostOutboundFramesSent": 2,
+        "guestDecodedWidth": 1920,
+        "guestDecodedHeight": 1080,
+        "guestInboundFramesDecoded": 2,
+        "guestInboundBytesReceived": 61730,
         "guestVideoTracksCount": 1,
-        "nonBlankFrame": null,
+        "nonBlankFrame": {
+          "width": 1920,
+          "height": 1080,
+          "nonZeroPixels": 255
+        },
         "captureProtection": {
           "enabled": true,
           "toggleAllowed": true,
@@ -247,17 +318,25 @@
             "settings": false
           },
           "windowDisplayAffinities": {
-            "main": 1,
-            "hostToolbar": 1
+            "main": 17,
+            "hostToolbar": 17
           }
         },
         "rttMs": 1
       }
     },
+    "reverse_invite_b_to_a": {
+      "status": "PASSED",
+      "details": {
+        "sessionId": "46673e0b-3768-486e-983f-1488eb7362d5",
+        "roleA": "guest",
+        "roleB": "host"
+      }
+    },
     "backend_privacy_audit": {
       "status": "PASSED",
       "details": {
-        "totalBackendRequests": 520,
+        "totalBackendRequests": 809,
         "leaksFound": 0
       }
     }

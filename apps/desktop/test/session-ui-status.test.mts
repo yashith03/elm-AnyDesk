@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { HostMediaRuntimeState } from '@elm/protocol';
 import {
+  computeUnreadChatState,
   getChatStatusDisplay,
   getSessionStageStatus,
   getTransportStatusDisplay,
@@ -227,5 +228,107 @@ test('getSessionStageStatus gives Guest status distinguishing connecting, waitin
       },
     }).headline,
     'Receiving Video'
+  );
+});
+
+test('computeUnreadChatState tracks incoming unread messages independently, ignores own messages, and clears on view or session end', () => {
+  const readIds = new Set<string>();
+  const myId = 'acct-self';
+  const peerId = 'acct-peer';
+
+  // 1. Message sent by current user does NOT trigger unread dot
+  assert.equal(
+    computeUnreadChatState({
+      messages: [{ messageId: 'm1', senderAccountId: myId }],
+      currentAccountId: myId,
+      chatVisible: false,
+      readIncomingIds: readIds,
+    }),
+    false
+  );
+
+  // 2. Incoming message while chat is closed triggers unread dot
+  assert.equal(
+    computeUnreadChatState({
+      messages: [
+        { messageId: 'm1', senderAccountId: myId },
+        { messageId: 'm2', senderAccountId: peerId },
+      ],
+      currentAccountId: myId,
+      chatVisible: false,
+      readIncomingIds: readIds,
+    }),
+    true
+  );
+
+  // 3. Opening/viewing chat marks incoming message as read and clears dot
+  assert.equal(
+    computeUnreadChatState({
+      messages: [
+        { messageId: 'm1', senderAccountId: myId },
+        { messageId: 'm2', senderAccountId: peerId },
+      ],
+      currentAccountId: myId,
+      chatVisible: true,
+      readIncomingIds: readIds,
+    }),
+    false
+  );
+
+  // 4. Closing chat without new incoming messages keeps dot cleared
+  assert.equal(
+    computeUnreadChatState({
+      messages: [
+        { messageId: 'm1', senderAccountId: myId },
+        { messageId: 'm2', senderAccountId: peerId },
+      ],
+      currentAccountId: myId,
+      chatVisible: false,
+      readIncomingIds: readIds,
+    }),
+    false
+  );
+
+  // 5. New incoming message while chat is already open & visible is marked read immediately
+  assert.equal(
+    computeUnreadChatState({
+      messages: [
+        { messageId: 'm1', senderAccountId: myId },
+        { messageId: 'm2', senderAccountId: peerId },
+        { messageId: 'm3', senderAccountId: peerId },
+      ],
+      currentAccountId: myId,
+      chatVisible: true,
+      readIncomingIds: readIds,
+    }),
+    false
+  );
+
+  // 6. New incoming message after chat closes again triggers unread dot
+  assert.equal(
+    computeUnreadChatState({
+      messages: [
+        { messageId: 'm1', senderAccountId: myId },
+        { messageId: 'm2', senderAccountId: peerId },
+        { messageId: 'm3', senderAccountId: peerId },
+        { messageId: 'm4', senderAccountId: peerId },
+      ],
+      currentAccountId: myId,
+      chatVisible: false,
+      readIncomingIds: readIds,
+    }),
+    true
+  );
+
+  // 7. Session end clears read set and unread state
+  readIds.clear();
+  assert.equal(
+    computeUnreadChatState({
+      messages: [],
+      currentAccountId: myId,
+      chatVisible: false,
+      readIncomingIds: readIds,
+    }),
+    false
   );
 });

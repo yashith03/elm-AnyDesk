@@ -8,12 +8,15 @@ import {
   DEFAULT_LIVENESS_CONFIG,
   INVITE_TIMEOUT_MS,
   PRESENCE_HEARTBEAT_INTERVAL_MS,
+  REQUIRED_API_CAPABILITIES,
   isValidFriendCode,
   normalizeFriendCode,
   sanitizeHostMediaSelection,
   type AccountProfile,
   type AnonymousDeviceRegistrationResponse,
+  type ApiHealthResponse,
   type ApprovedSessionSummary,
+  type BackendCompatibilityStatus,
   type DevicePresenceConnectionState,
   type DeviceRegistrationStatus,
   type HostMediaSelection,
@@ -156,6 +159,16 @@ export class DesktopAuthAndInviteController {
   private lastPresenceConfirmedAt: string | null = null;
   private presenceConsecutiveFailures = 0;
   private lastPresenceSnapshot: PresenceStateSnapshot | null = null;
+  private snapshotGeneration = 0;
+  private presenceInBackoff = false;
+  private legacyHeartbeatEndpointUnsupported = false;
+  private backendCompatibility: BackendCompatibilityStatus = {
+    checked: false,
+    compatible: true,
+    missingCapabilities: [],
+    serverProtocolVersion: null,
+    message: null,
+  };
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private activePresenceRequest: Promise<PresenceRuntimeStatus> | null = null;
   private shuttingDown = false;
@@ -688,11 +701,157 @@ export class DesktopAuthAndInviteController {
       lastConfirmedAt: this.lastPresenceConfirmedAt,
       consecutiveFailures: this.presenceConsecutiveFailures,
       snapshot: this.lastPresenceSnapshot,
+      snapshotGeneration: this.snapshotGeneration,
+      backendCompatibility: this.backendCompatibility,
     };
+  }
+
+  public async checkBackendCompatibility(): Promise<BackendCompatibilityStatus> {
+    if (!this.isRemoteDeviceMode()) {
+      this.backendCompatibility = {
+        checked: true,
+        compatible: true,
+        missingCapabilities: [],
+        serverProtocolVersion: null,
+        message: null,
+      };
+      return this.backendCompatibility;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      Math.min(this.requestTimeoutMs, 5000)
+    );
+    try {
+      const response = await fetch(`${this.apiBaseUrl}/health`, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) {
+        return this.backendCompatibility;
+      }
+      const health = (await response.json().catch(() => null)) as
+        | Partial<ApiHealthResponse>
+        | null;
+      if (!health || typeof health !== 'object') {
+        return this.backendCompatibility;
+      }
+      const advertised = Array.isArray(health.capabilities)
+        ? health.capabilities.filter((c): c is string => typeof c === 'string')
+        : [];
+      const missing = REQUIRED_API_CAPABILITIES.filter(
+        (cap) => !advertised.includes(cap)
+      );
+      if (
+        this.legacyHeartbeatEndpointUnsupported &&
+        !missing.includes('presence_heartbeat')
+      ) {
+        missing.push('presence_heartbeat');
+      }
+      const compatible = missing.length === 0;
+      this.backendCompatibility = {
+        checked: true,
+        compatible,
+        missingCapabilities: missing,
+        serverProtocolVersion:
+          typeof health.protocolVersion === 'string'
+            ? health.protocolVersion
+            : null,
+        message: compatible
+          ? null
+          : `Backend API is missing required capabilities (${missing.join(', ')}). Running in compatibility fallback mode; deploy the latest @elm/api Worker.`,
+      };
+      if (!compatible) {
+        this.emitPresenceStatus();
+      }
+      return this.backendCompatibility;
+    } catch {
+      return this.backendCompatibility;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   private emitPresenceStatus(): void {
     this.onPresenceStatusChanged?.(this.getPresenceRuntimeStatus());
+  }
+
+  /**
+   * Centralized monotonic snapshot commit guard.
+   * Rejects undefined/invalid snapshots and non-authoritative reads that started
+   * before a newer authoritative mutation (e.g., invite accept/disconnect), so
+   * delayed GET /presence/state or heartbeat responses can never overwrite an
+   * accepted activeSession with stale activeSession: null.
+   */
+  private commitSnapshot(
+    candidate: PresenceStateSnapshot | null | undefined,
+    requestGeneration: number,
+    options?: { readonly authoritative?: boolean; readonly emit?: boolean }
+  ): {
+    readonly applied: boolean;
+    readonly snapshot: PresenceStateSnapshot | null;
+  } {
+    if (!candidate || typeof candidate !== 'object' || !candidate.account) {
+      return { applied: false, snapshot: this.lastPresenceSnapshot };
+    }
+    const authoritative = Boolean(options?.authoritative);
+    if (!authoritative && requestGeneration < this.snapshotGeneration) {
+      return { applied: false, snapshot: this.lastPresenceSnapshot };
+    }
+    this.snapshotGeneration += 1;
+    this.lastPresenceSnapshot = candidate;
+    if (options?.emit !== false) {
+      this.emitPresenceStatus();
+    }
+    return { applied: true, snapshot: candidate };
+  }
+
+  /**
+   * Builds a safe, version-compatible snapshot when an older backend (e.g., pre-f7b8477)
+   * omits the optional `snapshot` field from invite/accept/disconnect responses.
+   * Never fabricates a session or bypasses server authorization — only reflects
+   * server-returned invite/session payloads.
+   */
+  private buildCompatibleSnapshotPatch(patch: {
+    readonly outgoingInvite?: InviteSummary | null;
+    readonly removeIncomingInviteId?: string;
+    readonly activeSession?: ApprovedSessionSummary | null;
+    readonly clearPendingInvites?: boolean;
+  }): PresenceStateSnapshot | null {
+    const account =
+      this.lastPresenceSnapshot?.account ??
+      this.persisted.registeredAccount ??
+      this.getCurrentAccount();
+    if (!account) {
+      return null;
+    }
+    const prev = this.lastPresenceSnapshot;
+    const incomingInvites = patch.clearPendingInvites
+      ? []
+      : (prev?.incomingInvites ?? []).filter(
+          (inv) => inv.inviteId !== patch.removeIncomingInviteId
+        );
+    return {
+      online: prev?.online ?? this.serverConfirmedOnline ?? true,
+      account,
+      incomingInvites,
+      outgoingInvite:
+        patch.outgoingInvite !== undefined
+          ? patch.outgoingInvite
+          : patch.clearPendingInvites
+          ? null
+          : prev?.outgoingInvite ?? null,
+      recentExpiredOutgoingInvite:
+        patch.activeSession || patch.outgoingInvite
+          ? null
+          : prev?.recentExpiredOutgoingInvite ?? null,
+      activeSession:
+        patch.activeSession !== undefined
+          ? patch.activeSession
+          : prev?.activeSession ?? null,
+    };
   }
 
   public stopPresenceHeartbeat(): void {
@@ -770,14 +929,42 @@ export class DesktopAuthAndInviteController {
       this.emitPresenceStatus();
     }
 
+    const useLegacyConnect =
+      mode === 'heartbeat' && this.legacyHeartbeatEndpointUnsupported;
     const endpoint =
-      mode === 'heartbeat' ? '/presence/heartbeat' : '/presence/connect';
+      mode === 'heartbeat' && !useLegacyConnect
+        ? '/presence/heartbeat'
+        : '/presence/connect';
+    const requestGeneration = this.snapshotGeneration;
 
     const task = (async (): Promise<PresenceRuntimeStatus> => {
-      const res = await this.fetchRemoteApi<{
+      let res = await this.fetchRemoteApi<{
         snapshot: PresenceStateSnapshot;
         serverTime?: string;
       }>(endpoint, { method: 'POST', body: '{}' });
+
+      // Safe backward-compatibility fallback for outdated backends lacking POST /presence/heartbeat (404)
+      if (!res.ok && res.status === 404 && endpoint === '/presence/heartbeat') {
+        this.legacyHeartbeatEndpointUnsupported = true;
+        const missing = Array.from(
+          new Set([
+            ...this.backendCompatibility.missingCapabilities,
+            'presence_heartbeat',
+          ])
+        );
+        this.backendCompatibility = {
+          ...this.backendCompatibility,
+          checked: true,
+          compatible: false,
+          missingCapabilities: missing,
+          message:
+            'Backend API does not support POST /presence/heartbeat (HTTP 404). Using /presence/connect compatibility fallback.',
+        };
+        res = await this.fetchRemoteApi<{
+          snapshot: PresenceStateSnapshot;
+          serverTime?: string;
+        }>('/presence/connect', { method: 'POST', body: '{}' });
+      }
 
       if (this.shuttingDown) {
         this.serverConfirmedOnline = false;
@@ -788,15 +975,27 @@ export class DesktopAuthAndInviteController {
 
       if (res.ok && res.data?.snapshot?.online === true) {
         this.presenceConsecutiveFailures = 0;
+        this.presenceInBackoff = false;
         this.serverConfirmedOnline = true;
         this.presenceConnectionState = 'online';
         this.lastPresenceConfirmedAt =
           res.data.serverTime ?? new Date().toISOString();
-        this.lastPresenceSnapshot = res.data.snapshot;
-        this.emitPresenceStatus();
+        const committed = this.commitSnapshot(
+          res.data.snapshot,
+          requestGeneration,
+          { authoritative: false, emit: true }
+        );
+        if (!committed.applied) {
+          // Even when snapshot was superseded by a newer mutation, keep online status synced
+          this.emitPresenceStatus();
+        }
+        if (!this.backendCompatibility.checked) {
+          void this.checkBackendCompatibility();
+        }
         this.scheduleNextPresenceTick(this.heartbeatIntervalMs);
       } else {
         this.presenceConsecutiveFailures += 1;
+        this.presenceInBackoff = true;
         this.serverConfirmedOnline = false;
         this.presenceConnectionState =
           this.presenceConsecutiveFailures >= 2 ? 'offline' : 'reconnecting';
@@ -1395,6 +1594,7 @@ export class DesktopAuthAndInviteController {
           errorMessage: 'Application is closing.',
         };
       }
+      const requestGeneration = this.snapshotGeneration;
       const res = await this.fetchRemoteApi<{
         snapshot: PresenceStateSnapshot;
         serverTime?: string;
@@ -1406,6 +1606,7 @@ export class DesktopAuthAndInviteController {
 
       if (!res.ok) {
         this.presenceConsecutiveFailures += 1;
+        this.presenceInBackoff = true;
         this.serverConfirmedOnline = false;
         this.presenceConnectionState =
           this.presenceConsecutiveFailures >= 2 ? 'offline' : 'reconnecting';
@@ -1426,13 +1627,38 @@ export class DesktopAuthAndInviteController {
 
       if (res.data?.snapshot) {
         if (res.data.snapshot.online) {
+          const wasRecovering =
+            this.presenceInBackoff ||
+            !this.serverConfirmedOnline ||
+            this.presenceTimer === null;
           this.presenceConsecutiveFailures = 0;
+          this.presenceInBackoff = false;
           this.serverConfirmedOnline = true;
           this.presenceConnectionState = 'online';
           this.lastPresenceConfirmedAt =
             res.data.serverTime ?? new Date().toISOString();
-          this.lastPresenceSnapshot = res.data.snapshot;
-          this.emitPresenceStatus();
+          if (wasRecovering && !this.activePresenceRequest) {
+            // Cancel any outdated retry backoff timer and resume normal heartbeat cadence
+            this.scheduleNextPresenceTick(this.heartbeatIntervalMs);
+          }
+          const committed = this.commitSnapshot(
+            res.data.snapshot,
+            requestGeneration,
+            { authoritative: false, emit: true }
+          );
+          if (!committed.applied && committed.snapshot) {
+            // Stale GET /presence/state superseded by a newer mutation: return authoritative snapshot
+            if (wasRecovering) {
+              this.emitPresenceStatus();
+            }
+            return {
+              ok: true,
+              status: 200,
+              data: {
+                snapshot: committed.snapshot,
+              },
+            };
+          }
         } else {
           // Server marked presence offline/stale; automatically re-establish presence
           const reconnected = await this.establishRemotePresence('connect');
@@ -1746,9 +1972,10 @@ export class DesktopAuthAndInviteController {
         : undefined;
 
     if (this.isRemoteDeviceMode()) {
-      return this.fetchRemoteApi<{
+      const mutationGeneration = ++this.snapshotGeneration;
+      const res = await this.fetchRemoteApi<{
         invite: InviteSummary;
-        snapshot: PresenceStateSnapshot;
+        snapshot?: PresenceStateSnapshot;
       }>('/invites', {
         method: 'POST',
         body: JSON.stringify({
@@ -1757,6 +1984,30 @@ export class DesktopAuthAndInviteController {
           hostMediaSelection,
         }),
       });
+      if (res.ok && res.data) {
+        const effectiveSnapshot =
+          res.data.snapshot ??
+          this.buildCompatibleSnapshotPatch({
+            outgoingInvite: res.data.invite,
+          });
+        if (effectiveSnapshot) {
+          this.commitSnapshot(effectiveSnapshot, mutationGeneration, {
+            authoritative: true,
+            emit: true,
+          });
+          return {
+            ...res,
+            data: {
+              invite: res.data.invite,
+              snapshot: effectiveSnapshot,
+            },
+          };
+        }
+      }
+      return res as ApiActionResult<{
+        invite: InviteSummary;
+        snapshot: PresenceStateSnapshot;
+      }>;
     }
     const requester = this.getCurrentAccount();
     if (!requester) {
@@ -1894,13 +2145,38 @@ export class DesktopAuthAndInviteController {
     ApiActionResult<{ invite: InviteSummary; snapshot: PresenceStateSnapshot }>
   > {
     if (this.isRemoteDeviceMode()) {
-      return this.fetchRemoteApi<{
+      const mutationGeneration = ++this.snapshotGeneration;
+      const res = await this.fetchRemoteApi<{
         invite: InviteSummary;
-        snapshot: PresenceStateSnapshot;
+        snapshot?: PresenceStateSnapshot;
       }>(`/invites/${encodeURIComponent(inviteId)}/cancel`, {
         method: 'POST',
         body: '{}',
       });
+      if (res.ok && res.data) {
+        const effectiveSnapshot =
+          res.data.snapshot ??
+          this.buildCompatibleSnapshotPatch({
+            outgoingInvite: null,
+          });
+        if (effectiveSnapshot) {
+          this.commitSnapshot(effectiveSnapshot, mutationGeneration, {
+            authoritative: true,
+            emit: true,
+          });
+          return {
+            ...res,
+            data: {
+              invite: res.data.invite,
+              snapshot: effectiveSnapshot,
+            },
+          };
+        }
+      }
+      return res as ApiActionResult<{
+        invite: InviteSummary;
+        snapshot: PresenceStateSnapshot;
+      }>;
     }
     const caller = this.getCurrentAccount();
     if (!caller) {
@@ -1963,10 +2239,11 @@ export class DesktopAuthAndInviteController {
     }>
   > {
     if (this.isRemoteDeviceMode()) {
-      return this.fetchRemoteApi<{
+      const mutationGeneration = ++this.snapshotGeneration;
+      const res = await this.fetchRemoteApi<{
         invite: InviteSummary;
         session: ApprovedSessionSummary | null;
-        snapshot: PresenceStateSnapshot;
+        snapshot?: PresenceStateSnapshot;
       }>(`/invites/${encodeURIComponent(params.inviteId)}/respond`, {
         method: 'POST',
         body: JSON.stringify({
@@ -1974,6 +2251,39 @@ export class DesktopAuthAndInviteController {
           mediaSelection: params.mediaSelection,
         }),
       });
+      if (res.ok && res.data) {
+        const effectiveSnapshot =
+          res.data.snapshot ??
+          this.buildCompatibleSnapshotPatch(
+            params.action === 'accept' && res.data.session
+              ? {
+                  activeSession: res.data.session,
+                  clearPendingInvites: true,
+                }
+              : {
+                  removeIncomingInviteId: params.inviteId,
+                }
+          );
+        if (effectiveSnapshot) {
+          this.commitSnapshot(effectiveSnapshot, mutationGeneration, {
+            authoritative: true,
+            emit: true,
+          });
+          return {
+            ...res,
+            data: {
+              invite: res.data.invite,
+              session: res.data.session,
+              snapshot: effectiveSnapshot,
+            },
+          };
+        }
+      }
+      return res as ApiActionResult<{
+        invite: InviteSummary;
+        session: ApprovedSessionSummary | null;
+        snapshot: PresenceStateSnapshot;
+      }>;
     }
     const responder = this.getCurrentAccount();
     if (!responder) {
@@ -2146,11 +2456,12 @@ export class DesktopAuthAndInviteController {
         : sessionIdOrOptions ?? {};
 
     if (this.isRemoteDeviceMode()) {
-      return this.fetchRemoteApi<{
+      const mutationGeneration = ++this.snapshotGeneration;
+      const res = await this.fetchRemoteApi<{
         disconnected: boolean;
         alreadyEnded: boolean;
         receipt: SessionTeardownReceipt;
-        snapshot: PresenceStateSnapshot;
+        snapshot?: PresenceStateSnapshot;
       }>('/sessions/disconnect', {
         method: 'POST',
         body: JSON.stringify({
@@ -2159,6 +2470,45 @@ export class DesktopAuthAndInviteController {
           subReason: opts.subReason,
         }),
       });
+      if (res.ok && res.data) {
+        const effectiveSnapshot =
+          res.data.snapshot ??
+          this.buildCompatibleSnapshotPatch({
+            activeSession: null,
+          });
+        if (effectiveSnapshot) {
+          this.commitSnapshot(effectiveSnapshot, mutationGeneration, {
+            authoritative: true,
+            emit: true,
+          });
+          return {
+            ...res,
+            data: {
+              ...res.data,
+              snapshot: effectiveSnapshot,
+            },
+          };
+        }
+      } else if (
+        !res.ok &&
+        (res.status === 409 || res.errorCode === 'SESSION_ALREADY_ENDED')
+      ) {
+        const effectiveSnapshot = this.buildCompatibleSnapshotPatch({
+          activeSession: null,
+        });
+        if (effectiveSnapshot) {
+          this.commitSnapshot(effectiveSnapshot, mutationGeneration, {
+            authoritative: true,
+            emit: true,
+          });
+        }
+      }
+      return res as ApiActionResult<{
+        disconnected: boolean;
+        alreadyEnded: boolean;
+        receipt: SessionTeardownReceipt;
+        snapshot: PresenceStateSnapshot;
+      }>;
     }
 
     const current = this.getCurrentAccount();
@@ -2208,15 +2558,49 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public recordSessionHeartbeat(params: {
+  public async recordSessionHeartbeat(params: {
     sessionId: string;
     callerAccountId?: string;
     timestampMs?: number;
-  }): ApiActionResult<{
-    ok: boolean;
-    sessionId: string;
-    heartbeatAtMs: number;
-  }> {
+  }): Promise<
+    ApiActionResult<{
+      ok: boolean;
+      sessionId: string;
+      heartbeatAtMs: number;
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      const nowMs = params.timestampMs ?? Date.now();
+      const res = await this.fetchRemoteApi<{
+        ok: boolean;
+        sessionId: string;
+        heartbeatAt?: string;
+      }>('/sessions/heartbeat', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: params.sessionId,
+          timestampIso: new Date(nowMs).toISOString(),
+        }),
+      });
+      if (res.ok && res.data) {
+        return {
+          ok: true,
+          status: res.status,
+          data: {
+            ok: true,
+            sessionId: res.data.sessionId ?? params.sessionId,
+            heartbeatAtMs: nowMs,
+          },
+        };
+      }
+      return {
+        ok: false,
+        status: res.status,
+        errorCode: res.errorCode,
+        errorMessage: res.errorMessage,
+      };
+    }
+
     const current = this.getCurrentAccount();
     const callerId = params.callerAccountId || current?.accountId;
     if (!callerId) {
@@ -2283,21 +2667,57 @@ export class DesktopAuthAndInviteController {
     };
   }
 
-  public checkSessionLiveness(params: {
+  public async checkSessionLiveness(params: {
     sessionId: string;
     callerAccountId?: string;
     nowMs?: number;
     livenessTimeoutMs?: number;
-  }): ApiActionResult<{
-    alive: boolean;
-    alreadyEnded: boolean;
-    sessionId: string;
-    hostHeartbeatAgeMs: number;
-    guestHeartbeatAgeMs: number;
-    livenessTimeoutMs: number;
-    sessionDurationMs: number;
-    receipt?: SessionTeardownReceipt;
-  }> {
+  }): Promise<
+    ApiActionResult<{
+      alive: boolean;
+      alreadyEnded: boolean;
+      sessionId: string;
+      hostHeartbeatAgeMs: number;
+      guestHeartbeatAgeMs: number;
+      livenessTimeoutMs: number;
+      sessionDurationMs: number;
+      receipt?: SessionTeardownReceipt;
+    }>
+  > {
+    if (this.isRemoteDeviceMode()) {
+      // In remote mode, P2P DataChannel liveness + 409 SESSION_ALREADY_ENDED on
+      // /sessions/signals and /sessions/heartbeat are authoritative. Avoid firing
+      // destructive server-side 3.5s check-liveness kills against mixed-version peers
+      // or transient HTTP latency.
+      const timeoutMs =
+        params.livenessTimeoutMs ?? DEFAULT_LIVENESS_CONFIG.livenessTimeoutMs;
+      const active = this.lastPresenceSnapshot?.activeSession;
+      if (active && active.sessionId === params.sessionId) {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            alive: true,
+            alreadyEnded: false,
+            sessionId: params.sessionId,
+            hostHeartbeatAgeMs: 0,
+            guestHeartbeatAgeMs: 0,
+            livenessTimeoutMs: timeoutMs,
+            sessionDurationMs: Math.max(
+              0,
+              (params.nowMs ?? Date.now()) - Date.parse(active.createdAt)
+            ),
+          },
+        };
+      }
+      return {
+        ok: false,
+        status: 403,
+        errorCode: 'SIGNALING_NOT_ADMITTED_BEFORE_ACCEPTANCE',
+        errorMessage: 'Session not active in remote presence state.',
+      };
+    }
+
     const current = this.getCurrentAccount();
     const callerId = params.callerAccountId || current?.accountId;
     if (!callerId) {

@@ -205,3 +205,38 @@ export function getSessionStageStatus(params: {
     showHostControls: false,
   };
 }
+
+/**
+ * Evaluates whether the Chat icon should display an unread dot for the current
+ * user. Marks all currently present incoming messages as read when `chatVisible`
+ * is true, and ignores messages sent by the current user.
+ */
+export function computeUnreadChatState(params: {
+  readonly messages: readonly {
+    readonly messageId: string;
+    readonly senderAccountId: string;
+  }[];
+  readonly currentAccountId: string | null | undefined;
+  readonly chatVisible: boolean;
+  readonly readIncomingIds: Set<string>;
+}): boolean {
+  const { messages, currentAccountId, chatVisible, readIncomingIds } = params;
+  if (chatVisible) {
+    for (const msg of messages) {
+      if (msg.senderAccountId !== currentAccountId) {
+        readIncomingIds.add(msg.messageId);
+      }
+    }
+    return false;
+  }
+
+  for (const msg of messages) {
+    if (
+      msg.senderAccountId !== currentAccountId &&
+      !readIncomingIds.has(msg.messageId)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}

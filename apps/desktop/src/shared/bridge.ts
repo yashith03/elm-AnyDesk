@@ -2,6 +2,7 @@ import type {
   AccountProfile,
   AllowedScreenSurface,
   ApprovedSessionSummary,
+  BackendCompatibilityStatus,
   DevicePresenceConnectionState,
   DeviceRegistrationStatus,
   EphemeralChatMessage,
@@ -153,6 +154,9 @@ export interface HostOverlayUiState {
   readonly dataChannelState: 'closed' | 'connecting' | 'open';
   readonly hostMediaState: HostMediaRuntimeState | null;
   readonly hostMicMutedLocally: boolean;
+  readonly peerMicActive?: boolean;
+  readonly peerMicMutedLocally?: boolean;
+  readonly peerMicRequestPending?: boolean;
   readonly isStartingShare: boolean;
   readonly isStartingMic: boolean;
   readonly isStartingDeviceSound: boolean;
@@ -160,6 +164,7 @@ export interface HostOverlayUiState {
   readonly selectedSourceId: string | null;
   readonly playWasapiTestTone: boolean;
   readonly chatOpen: boolean;
+  readonly hasUnreadChat?: boolean;
   readonly sourcePickerOpen: boolean;
   readonly settingsOpen: boolean;
   readonly appearance: FloatingPanelAppearance;
@@ -170,6 +175,7 @@ export type HostToolbarActionPayload =
   | { type: 'toggle-mic' }
   | { type: 'stop-mic' }
   | { type: 'toggle-device-sound' }
+  | { type: 'toggle-peer-mic' }
   | { type: 'start-screen' }
   | { type: 'stop-screen' }
   | { type: 'select-source'; sourceId: string }
@@ -196,6 +202,8 @@ export interface PresenceRuntimeStatus {
   readonly lastConfirmedAt: string | null;
   readonly consecutiveFailures: number;
   readonly snapshot: PresenceStateSnapshot | null;
+  readonly snapshotGeneration?: number;
+  readonly backendCompatibility?: BackendCompatibilityStatus;
 }
 
 export interface ElmDesktopBridge {

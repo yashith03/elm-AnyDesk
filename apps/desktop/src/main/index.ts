@@ -125,6 +125,9 @@ let hostOverlayState: HostOverlayUiState = {
   dataChannelState: 'closed',
   hostMediaState: null,
   hostMicMutedLocally: false,
+  peerMicActive: false,
+  peerMicMutedLocally: false,
+  peerMicRequestPending: false,
   isStartingShare: false,
   isStartingMic: false,
   isStartingDeviceSound: false,
@@ -132,6 +135,7 @@ let hostOverlayState: HostOverlayUiState = {
   selectedSourceId: null,
   playWasapiTestTone: false,
   chatOpen: false,
+  hasUnreadChat: false,
   sourcePickerOpen: false,
   settingsOpen: false,
   appearance: floatingAppearance,
@@ -141,7 +145,12 @@ let hostOverlayState: HostOverlayUiState = {
 function broadcastHostOverlayState(): void {
   const nextState: HostOverlayUiState = {
     ...hostOverlayState,
-    chatOpen: Boolean(chatWindow && !chatWindow.isDestroyed() && chatWindow.isVisible()),
+    chatOpen: Boolean(
+      chatWindow &&
+        !chatWindow.isDestroyed() &&
+        chatWindow.isVisible() &&
+        !chatWindow.isMinimized()
+    ),
     sourcePickerOpen: Boolean(
       sourcePickerWindow &&
         !sourcePickerWindow.isDestroyed() &&
@@ -267,13 +276,25 @@ function getSystemPreferredThemeMode(): ThemeMode {
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 }
 
+function isTransparentOverlayWindow(win: BrowserWindow): boolean {
+  const role = windowRoles.get(win);
+  return (
+    role === 'host-toolbar' ||
+    role === 'host-source-picker' ||
+    role === 'host-settings' ||
+    role === 'chat'
+  );
+}
+
 function applyThemeToWindows(state: ThemeStateSnapshot): void {
   const bg = THEME_TOKENS[state.mode].bgCanvas;
   for (const win of getAllOpenUiWindows()) {
-    try {
-      win.setBackgroundColor(bg);
-    } catch {
-      // Ignore if window is closing
+    if (!isTransparentOverlayWindow(win)) {
+      try {
+        win.setBackgroundColor(bg);
+      } catch {
+        // Ignore if window is closing
+      }
     }
     win.webContents.send('elm:theme-updated', state);
   }
@@ -432,7 +453,30 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   let customBounds: { x: number; y: number; width: number; height: number } | null = null;
-  if (typeof process.env.ELM_WINDOW_BOUNDS === 'string') {
+  const workArea = screen.getPrimaryDisplay().workArea;
+  const side =
+    typeof process.env.ELM_WINDOW_SIDE === 'string'
+      ? process.env.ELM_WINDOW_SIDE.trim().toLowerCase()
+      : '';
+  if (side === 'left' || side === 'right') {
+    const margin = 12;
+    const gap = 12;
+    const width = Math.max(
+      640,
+      Math.floor((workArea.width - margin * 2 - gap) / 2)
+    );
+    const height = Math.max(
+      480,
+      Math.min(820, workArea.height - margin * 2)
+    );
+    const y =
+      workArea.y + Math.max(margin, Math.floor((workArea.height - height) / 2));
+    const x =
+      side === 'left'
+        ? workArea.x + margin
+        : workArea.x + margin + width + gap;
+    customBounds = { x, y, width, height };
+  } else if (typeof process.env.ELM_WINDOW_BOUNDS === 'string') {
     const parts = process.env.ELM_WINDOW_BOUNDS.split(',').map((n) => Number(n.trim()));
     if (
       parts.length === 4 &&
@@ -440,12 +484,17 @@ async function createMainWindow(): Promise<BrowserWindow> {
       parts[2] >= 640 &&
       parts[3] >= 480
     ) {
-      customBounds = {
-        x: Math.round(parts[0]),
-        y: Math.round(parts[1]),
-        width: Math.round(parts[2]),
-        height: Math.round(parts[3]),
-      };
+      const width = Math.min(Math.round(parts[2]), workArea.width);
+      const height = Math.min(Math.round(parts[3]), workArea.height);
+      const x = Math.max(
+        workArea.x,
+        Math.min(Math.round(parts[0]), workArea.x + workArea.width - width)
+      );
+      const y = Math.max(
+        workArea.y,
+        Math.min(Math.round(parts[1]), workArea.y + workArea.height - height)
+      );
+      customBounds = { x, y, width, height };
     }
   }
   const titleSuffix =
@@ -460,6 +509,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     height: customBounds?.height ?? 860,
     minWidth: customBounds ? Math.min(640, customBounds.width) : 900,
     minHeight: customBounds ? Math.min(480, customBounds.height) : 640,
+    show: false,
     title: `Elm-AnyDesk — Consent-Based 1:1 Screen Share${titleSuffix}`,
     icon: getWindowIconPath(),
     titleBarStyle: 'hidden',
@@ -478,6 +528,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'main' } });
   captureProtection.applyToWindow(win);
+  if (!win.isDestroyed() && !win.isVisible()) {
+    win.show();
+    captureProtection.applyToWindow(win);
+  }
 
   win.on('show', () => {
     captureProtection.applyToWindow(win);
@@ -533,6 +587,9 @@ function clampRectToDisplayWorkArea(
   };
 }
 
+const HOST_TOOLBAR_VISIBLE_BAR_HEIGHT = 54;
+const HOST_TOOLBAR_WINDOW_HEIGHT = 88;
+
 function positionPopupBelowHostToolbar(
   popup: BrowserWindow,
   popupWidth: number,
@@ -540,12 +597,12 @@ function positionPopupBelowHostToolbar(
   align: 'center' | 'right'
 ): void {
   if (popup.isDestroyed()) return;
-  const anchor =
-    hostToolbarWindow && !hostToolbarWindow.isDestroyed()
-      ? hostToolbarWindow.getBounds()
-      : mainWindow && !mainWindow.isDestroyed()
-        ? mainWindow.getBounds()
-        : screen.getPrimaryDisplay().workArea;
+  const hasToolbar = Boolean(hostToolbarWindow && !hostToolbarWindow.isDestroyed());
+  const anchor = hasToolbar
+    ? hostToolbarWindow!.getBounds()
+    : mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.getBounds()
+      : screen.getPrimaryDisplay().workArea;
   const display = screen.getDisplayMatching(anchor);
   const wa = display.workArea;
 
@@ -553,7 +610,8 @@ function positionPopupBelowHostToolbar(
     align === 'right'
       ? anchor.x + anchor.width - popupWidth
       : anchor.x + Math.round((anchor.width - popupWidth) / 2);
-  let desiredY = anchor.y + anchor.height + 8;
+  const anchorHeight = hasToolbar ? HOST_TOOLBAR_VISIBLE_BAR_HEIGHT : anchor.height;
+  let desiredY = anchor.y + anchorHeight + 8;
   if (desiredY + popupHeight > wa.y + wa.height - 8) {
     desiredY = Math.max(wa.y + 8, anchor.y - popupHeight - 8);
   }
@@ -583,9 +641,9 @@ async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
       : screen.getPrimaryDisplay().workArea;
   const display = screen.getDisplayMatching(anchorBounds);
   const wa = display.workArea;
-  const baseWidth = captureProtection.isToggleAllowed() ? 940 : 840;
-  const width = Math.min(Math.max(480, wa.width - 24), baseWidth);
-  const height = 54;
+  const baseWidth = captureProtection.isToggleAllowed() ? 520 : 440;
+  const width = Math.min(Math.max(360, wa.width - 24), baseWidth);
+  const height = HOST_TOOLBAR_WINDOW_HEIGHT;
 
   const initialRect = clampRectToDisplayWorkArea(
     lastHostToolbarBounds
@@ -611,16 +669,17 @@ async function createOrShowHostToolbarWindow(): Promise<BrowserWindow> {
     width: initialRect.width,
     height: initialRect.height,
     frame: false,
+    transparent: true,
     resizable: false,
     maximizable: false,
     minimizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    hasShadow: true,
+    hasShadow: false,
     show: false,
     title: 'Elm-AnyDesk — Host Toolbar',
     icon: getWindowIconPath(),
-    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    backgroundColor: '#00000000',
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -676,16 +735,17 @@ async function createOrShowHostSourcePickerWindow(): Promise<BrowserWindow> {
     width: 360,
     height: 340,
     frame: false,
+    transparent: true,
     resizable: false,
     maximizable: false,
     minimizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    hasShadow: true,
+    hasShadow: false,
     show: false,
     title: 'Elm-AnyDesk — Select Screen or Window',
     icon: getWindowIconPath(),
-    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    backgroundColor: '#00000000',
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -734,16 +794,17 @@ async function createOrShowHostSettingsWindow(): Promise<BrowserWindow> {
     width: 320,
     height: 410,
     frame: false,
+    transparent: true,
     resizable: false,
     maximizable: false,
     minimizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    hasShadow: true,
+    hasShadow: false,
     show: false,
     title: 'Elm-AnyDesk — Overlay Appearance Settings',
     icon: getWindowIconPath(),
-    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    backgroundColor: '#00000000',
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -807,7 +868,7 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
           : wa.x + wa.width - width - 24,
       y:
         hostToolbarWindow && !hostToolbarWindow.isDestroyed()
-          ? anchor.y + anchor.height + 12
+          ? anchor.y + HOST_TOOLBAR_VISIBLE_BAR_HEIGHT + 12
           : wa.y + 40,
       width,
       height,
@@ -823,13 +884,15 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
     minWidth: 320,
     minHeight: 320,
     frame: false,
+    transparent: true,
+    show: false,
     skipTaskbar: hostOverlayState.sessionActive,
     alwaysOnTop: hostOverlayState.sessionActive,
-    hasShadow: true,
+    hasShadow: false,
     title: 'Elm-AnyDesk — Private 1:1 Session Chat (Volatile DataChannel)',
     icon: getWindowIconPath(),
     autoHideMenuBar: true,
-    backgroundColor: THEME_TOKENS[getOrLoadThemeState().mode].bgCanvas,
+    backgroundColor: '#00000000',
     webPreferences: createSecureWebPreferences(),
   });
 
@@ -843,21 +906,35 @@ async function createOrFocusChatWindow(): Promise<BrowserWindow> {
   const rendererHtmlPath = path.join(__dirname, '../renderer/index.html');
   await win.loadFile(rendererHtmlPath, { query: { role: 'chat' } });
   captureProtection.applyToWindow(win);
+  if (!win.isDestroyed() && !win.isVisible()) {
+    win.show();
+    captureProtection.applyToWindow(win);
+  }
 
   win.on('show', () => {
     captureProtection.applyToWindow(win);
+    broadcastHostOverlayState();
+  });
+  win.on('hide', () => {
+    broadcastHostOverlayState();
+  });
+  win.on('minimize', () => {
+    broadcastHostOverlayState();
   });
   win.on('restore', () => {
     captureProtection.applyToWindow(win);
+    broadcastHostOverlayState();
   });
 
   win.on('closed', () => {
     chatWindow = null;
     broadcastCaptureProtectionState();
+    broadcastHostOverlayState();
   });
 
   chatWindow = win;
   broadcastCaptureProtectionState();
+  broadcastHostOverlayState();
   return win;
 }
 
@@ -927,12 +1004,8 @@ function registerDisplayMediaHandler(): void {
           return;
         }
 
-        const targetTypes: Array<'screen' | 'window'> =
-          explicitlySelectedSourceId.startsWith('screen:')
-            ? ['screen']
-            : ['window'];
         const sources = await desktopCapturer.getSources({
-          types: targetTypes,
+          types: ['screen', 'window'],
           thumbnailSize: { width: 0, height: 0 },
           fetchWindowIcons: false,
         });
@@ -1249,7 +1322,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'elm:sessions-check-liveness',
-    (
+    async (
       _event,
       params: {
         sessionId: string;
@@ -1258,7 +1331,7 @@ function registerIpcHandlers(): void {
         livenessTimeoutMs?: number;
       }
     ) => {
-      const res = getAuthController().checkSessionLiveness(params);
+      const res = await getAuthController().checkSessionLiveness(params);
       if (res.ok && res.data && !res.data.alive) {
         wasapiManager.stopCapture();
         resetVolatileUiState();
@@ -1453,7 +1526,12 @@ function registerIpcHandlers(): void {
   ipcMain.handle('elm:host-overlay-get', (): HostOverlayUiState => {
     return {
       ...hostOverlayState,
-      chatOpen: Boolean(chatWindow && !chatWindow.isDestroyed() && chatWindow.isVisible()),
+      chatOpen: Boolean(
+        chatWindow &&
+          !chatWindow.isDestroyed() &&
+          chatWindow.isVisible() &&
+          !chatWindow.isMinimized()
+      ),
       sourcePickerOpen: Boolean(
         sourcePickerWindow &&
           !sourcePickerWindow.isDestroyed() &&
@@ -1686,9 +1764,15 @@ function registerIpcHandlers(): void {
 }
 
 app.whenReady().then(async () => {
+  session.defaultSession.setPermissionCheckHandler(
+    (_webContents, permission) => {
+      return permission === 'media' || permission === 'display-capture';
+    }
+  );
+
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, permission, callback) => {
-      if (permission === 'media') {
+      if (permission === 'media' || permission === 'display-capture') {
         callback(true);
         return;
       }

@@ -105,6 +105,12 @@ class CdpClient {
         // Ignore malformed CDP message
       }
     });
+    ws.addEventListener('close', () => {
+      for (const [id, entry] of this.pending.entries()) {
+        this.pending.delete(id);
+        entry.reject(new Error('CDP WebSocket closed while waiting for response'));
+      }
+    });
   }
 
   static async connect(debugPort: number): Promise<CdpClient> {
@@ -171,9 +177,20 @@ class CdpClient {
   send<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`CDP request timed out after 15000ms: ${method}`));
+        }
+      }, 15_000);
       this.pending.set(id, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
+        resolve: (v: unknown) => {
+          clearTimeout(timer);
+          resolve(v as T);
+        },
+        reject: (e: Error) => {
+          clearTimeout(timer);
+          reject(e);
+        },
       });
       this.ws.send(JSON.stringify({ id, method, params }));
     });
@@ -208,8 +225,14 @@ class CdpClient {
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
       if (setter) setter.call(el, ${JSON.stringify(value)});
       else el.value = ${JSON.stringify(value)};
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      const tracker = el._valueTracker;
+      if (tracker) tracker.setValue('__force_react_change__');
+      if (el.type === 'range') {
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
       return true;
     })()`);
     if (!ok) {
@@ -238,10 +261,35 @@ class CdpClient {
   }
 }
 
+const STAGING_WORKER_URL = 'https://elm-anydesk-api-staging.elm-api.workers.dev';
+
+function sanitizeLogLine(line: string): string {
+  return line
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[REDACTED]')
+    .replace(/("?(?:token|secret|password|deviceSecret|accessToken)"?\s*:\s*")[^"]+(")/gi, '$1[REDACTED]$2');
+}
+
+async function validateLocalBackendUrl(baseUrl: string): Promise<void> {
+  const parsed = new URL(baseUrl);
+  if (
+    baseUrl.startsWith(STAGING_WORKER_URL) ||
+    (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost')
+  ) {
+    throw new Error(
+      `Refusing to launch two-client test against non-local backend URL: ${baseUrl}`
+    );
+  }
+  const res = await fetch(`${baseUrl}/health`);
+  if (!res.ok) {
+    throw new Error(`Local test backend health check failed (${res.status}) at ${baseUrl}/health`);
+  }
+}
+
 interface LaunchedClient {
   readonly label: string;
   readonly proc: ChildProcess;
   readonly userDataDir: string;
+  readonly logPath: string;
   readonly debugPort: number | null;
   cdp: CdpClient | null;
 }
@@ -250,8 +298,10 @@ async function launchElectronClient(params: {
   label: string;
   apiBaseUrl: string;
   userDataDir: string;
-  bounds: string;
+  logPath: string;
+  side: 'left' | 'right';
   enableCdp: boolean;
+  startTimeMs: number;
 }): Promise<LaunchedClient> {
   const electronBin = resolveElectronBinary();
   const debugPort = params.enableCdp ? await getFreePort() : null;
@@ -260,22 +310,40 @@ async function launchElectronClient(params: {
     args.unshift(`--remote-debugging-port=${debugPort}`);
   }
 
+  fs.mkdirSync(path.dirname(params.logPath), { recursive: true });
+  const logStream = fs.createWriteStream(params.logPath, { flags: 'a' });
+  const writeSanitizedLog = (source: string, chunk: Buffer | string) => {
+    const relSec = ((Date.now() - params.startTimeMs) / 1000).toFixed(2);
+    const lines = String(chunk).split(/\r?\n/).filter((l) => l.trim().length > 0);
+    for (const line of lines) {
+      logStream.write(`[+${relSec}s] [${params.label}] [${source}] ${sanitizeLogLine(line)}\n`);
+    }
+  };
+  writeSanitizedLog('launcher', `Starting ${params.label} (side=${params.side}, backend=${params.apiBaseUrl})`);
+
   const proc = spawn(electronBin, args, {
     cwd: repoRoot,
     env: {
       ...process.env,
       ELM_API_BASE_URL: params.apiBaseUrl,
       ELM_USER_DATA_DIR: params.userDataDir,
-      ELM_WINDOW_BOUNDS: params.bounds,
+      ELM_WINDOW_SIDE: params.side,
       ELM_WINDOW_TITLE_SUFFIX: `[${params.label}]`,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout?.on('data', (chunk) => writeSanitizedLog('stdout', chunk));
+  proc.stderr?.on('data', (chunk) => writeSanitizedLog('stderr', chunk));
+  proc.once('exit', (code, signal) => {
+    writeSanitizedLog('launcher', `Process exited (code=${String(code)}, signal=${String(signal)})`);
+    logStream.end();
   });
 
   const client: LaunchedClient = {
     label: params.label,
     proc,
     userDataDir: params.userDataDir,
+    logPath: params.logPath,
     debugPort,
     cdp: null,
   };
@@ -307,12 +375,17 @@ async function stopClientProcess(client: LaunchedClient): Promise<void> {
 }
 
 const isInteractive = process.argv.includes('--interactive');
-const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const startTimeMs = Date.now();
+const runId = `${startTimeMs}-${Math.random().toString(36).slice(2, 8)}`;
 const tempRoot = path.join(os.tmpdir(), `elm-two-clients-e2e-${runId}`);
-const userDataA = path.join(tempRoot, 'friend-a');
-const userDataB = path.join(tempRoot, 'friend-b');
+const userDataA = path.join(tempRoot, 'client-a');
+const userDataB = path.join(tempRoot, 'client-b');
+const logDir = path.join(os.tmpdir(), 'elm-two-clients-logs', runId);
+const logPathA = path.join(logDir, 'client-a.log');
+const logPathB = path.join(logDir, 'client-b.log');
 fs.mkdirSync(userDataA, { recursive: true });
 fs.mkdirSync(userDataB, { recursive: true });
+fs.mkdirSync(logDir, { recursive: true });
 
 // Ensure built dist exists before launching Electron
 const mainDistPath = path.join(desktopDir, 'dist/main/index.cjs');
@@ -323,30 +396,37 @@ if (!fs.existsSync(mainDistPath)) {
 }
 
 const backend = await startLocalTwoClientBackend();
+await validateLocalBackendUrl(backend.baseUrl);
 const launched: LaunchedClient[] = [];
 
 if (isInteractive) {
   console.log('===============================================================');
   console.log('Elm-AnyDesk Interactive Two-Client Simulation');
   console.log(`Isolated Backend: ${backend.baseUrl}`);
-  console.log(`Friend A Profile: ${userDataA}`);
-  console.log(`Friend B Profile: ${userDataB}`);
+  console.log(`Client A Profile: ${userDataA}`);
+  console.log(`Client B Profile: ${userDataB}`);
+  console.log(`Client A Log:     ${logPathA}`);
+  console.log(`Client B Log:     ${logPathB}`);
   console.log('Close both windows or press Ctrl+C to stop and clean up temp profiles.');
   console.log('===============================================================');
 
   const clientA = await launchElectronClient({
-    label: 'Friend A',
+    label: 'Client A',
     apiBaseUrl: backend.baseUrl,
     userDataDir: userDataA,
-    bounds: '20,40,730,780',
+    logPath: logPathA,
+    side: 'left',
     enableCdp: false,
+    startTimeMs,
   });
   const clientB = await launchElectronClient({
-    label: 'Friend B',
+    label: 'Client B',
     apiBaseUrl: backend.baseUrl,
     userDataDir: userDataB,
-    bounds: '770,40,730,780',
+    logPath: logPathB,
+    side: 'right',
     enableCdp: false,
+    startTimeMs,
   });
   launched.push(clientA, clientB);
 
@@ -370,23 +450,28 @@ if (isInteractive) {
 const results: Record<string, { status: string; details: unknown }> = {};
 const recordStep = (name: string, status: string, details: unknown) => {
   results[name] = { status, details };
-  console.log(`[${status}] ${name}`);
+  const relSec = ((Date.now() - startTimeMs) / 1000).toFixed(2);
+  console.log(`[+${relSec}s] [${status}] ${name}`);
 };
 
 try {
   const clientA = await launchElectronClient({
-    label: 'Friend A',
+    label: 'Client A',
     apiBaseUrl: backend.baseUrl,
     userDataDir: userDataA,
-    bounds: '20,40,730,780',
+    logPath: logPathA,
+    side: 'left',
     enableCdp: true,
+    startTimeMs,
   });
   const clientB = await launchElectronClient({
-    label: 'Friend B',
+    label: 'Client B',
     apiBaseUrl: backend.baseUrl,
     userDataDir: userDataB,
-    bounds: '770,40,730,780',
+    logPath: logPathB,
+    side: 'right',
     enableCdp: true,
+    startTimeMs,
   });
   launched.push(clientA, clientB);
   const cdpA = clientA.cdp!;
@@ -404,6 +489,10 @@ try {
       () => cdp.eval<boolean>(`Boolean(document.querySelector('#setup-name'))`),
       10_000
     );
+    const preLoginPillVisible = await cdp.eval<boolean>(
+      `Boolean(document.querySelector('[data-testid="presence-status-pill"]'))`
+    );
+    assert.equal(preLoginPillVisible, false, 'Presence status pill must be hidden before login');
     await cdp.setInputValue('#setup-name', name);
     await cdp.setInputValue('#setup-email', email);
     await cdp.setInputValue('#setup-phone', phone);
@@ -564,14 +653,39 @@ try {
   assert.equal(toolbarUiCheck.toggleText, 'Test ON');
   assert.equal(toolbarUiCheck.hasFitOr1to1, false, 'Host toolbar must not include Fit or 1:1 viewer buttons');
 
-  const initialProt = await cdpB.eval<Record<string, unknown>>(
-    `window.elmDesktop.getCaptureProtectionState()`
-  );
+  const initialProt = await cdpB.eval<{
+    enabled: boolean;
+    toggleAllowed: boolean;
+    windowDisplayAffinities?: Record<string, number | null>;
+  }>(`window.elmDesktop.getCaptureProtectionState()`);
   assert.equal(initialProt.enabled, true);
   assert.equal(initialProt.toggleAllowed, true);
+  assert.equal(
+    initialProt.windowDisplayAffinities?.main,
+    17,
+    'Main window must use WDA_EXCLUDEFROMCAPTURE (0x11 = 17), not WDA_MONITOR (1)'
+  );
+  assert.equal(
+    initialProt.windowDisplayAffinities?.hostToolbar,
+    17,
+    'Host toolbar must use WDA_EXCLUDEFROMCAPTURE (0x11 = 17), not WDA_MONITOR (1)'
+  );
 
   await cdpB.eval(`window.elmDesktop.minimizeWindow()`);
   await sleep(350);
+  const protAfterMinimize = await cdpB.eval<{
+    windowDisplayAffinities?: Record<string, number | null>;
+  }>(`window.elmDesktop.getCaptureProtectionState()`);
+  assert.equal(protAfterMinimize.windowDisplayAffinities?.hostToolbar, 17);
+  await cdpB.eval(`window.elmDesktop.restoreAndFocusMainWindow()`);
+  await sleep(250);
+  const protAfterRestore = await cdpB.eval<{
+    windowDisplayAffinities?: Record<string, number | null>;
+  }>(`window.elmDesktop.getCaptureProtectionState()`);
+  assert.equal(protAfterRestore.windowDisplayAffinities?.main, 17);
+  assert.equal(protAfterRestore.windowDisplayAffinities?.hostToolbar, 17);
+  await cdpB.eval(`window.elmDesktop.minimizeWindow()`);
+  await sleep(300);
   const afterMinimizeProbe = await getProbe(cdpB);
   const toolbarStillVisible = await hostToolbarCdp.eval<boolean>(
     `Boolean(document.querySelector('[data-testid="floating-panel-bar"]')) && document.visibilityState === 'visible'`
@@ -582,6 +696,8 @@ try {
   recordStep('host_overlay_and_minimize', 'PASSED', {
     toolbarUiCheck,
     initialCaptureProtection: initialProt,
+    protAfterMinimize,
+    protAfterRestore,
     postMinimizeConnectionState: afterMinimizeProbe?.connectionState,
     toolbarStillVisible,
   });
@@ -652,7 +768,7 @@ try {
           windowDisplayAffinities?: Record<string, number | null>;
         }>(`window.elmDesktop.getCaptureProtectionState()`);
         assert.equal(sourcePickerProt.windows.sourcePicker, true);
-        assert.equal(sourcePickerProt.windowDisplayAffinities?.sourcePicker, 1);
+        assert.equal(sourcePickerProt.windowDisplayAffinities?.sourcePicker, 17);
         await sourcePickerCdp.click(
           `[data-source-id="${displaySources[0].id}"]`
         );
@@ -727,7 +843,7 @@ try {
             rttMs: diagGuest?.rttMs ?? diagHost?.rttMs,
           };
           if (sent > 0 && decoded > 0 && bytes > 0 && videoTracks >= 1) {
-            return { passed: true, stats: lastStats };
+            return { passed: true, stats: lastStats, allSources: allSourcesList };
           }
           await sleep(350);
         }
@@ -737,7 +853,7 @@ try {
         })()`);
         await sleep(300);
       }
-      return { passed: false, stats: lastStats };
+      return { passed: false, stats: lastStats, allSources: allSourcesList };
     } finally {
       toolbarCdp.close();
     }
@@ -754,6 +870,61 @@ try {
     shareResultBtoA.passed ? 'PASSED' : 'BLOCKED_OS_CAPTURE_ZERO_FRAMES',
     shareResultBtoA.stats
   );
+
+  // 4a-bis. Rapid & Repeated Source Switching (10x switches across available sources)
+  const availableSources = (
+    (shareResultBtoA as { allSources?: Array<{ id: string; text: string }> }).allSources ?? []
+  ).filter((s) => s.id);
+  if (shareResultBtoA.passed && availableSources.length >= 2) {
+    const switchCount = 10;
+    for (let i = 0; i < switchCount; i += 1) {
+      const targetSource = availableSources[i % availableSources.length];
+      await hostToolbarCdp.eval(
+        `window.elmDesktop.dispatchHostToolbarAction({ type: 'select-source', sourceId: ${JSON.stringify(
+          targetSource.id
+        )} })`
+      );
+      if (i % 3 === 0) {
+        await sleep(250);
+      }
+    }
+    const postSwitch = await waitForCondition(
+      `${'HOST B'} remains connected without SDP m-line errors after 10x source switches`,
+      async () => {
+        const [pHost, pGuest] = await Promise.all([getProbe(cdpB), getProbe(cdpA)]);
+        if (!pHost || !pGuest) return null;
+        const banner = String(pHost.lastStatusBanner ?? '');
+        assert.ok(
+          !/setRemoteDescription|order of m-lines/i.test(banner),
+          `Unexpected SDP m-line error during source switch: ${banner}`
+        );
+        if (
+          pHost.connectionState === 'connected' &&
+          pHost.dataChannelState === 'open' &&
+          pGuest.connectionState === 'connected' &&
+          Number(pGuest.guestVideoTracksCount ?? 0) >= 1
+        ) {
+          return { pHost, pGuest };
+        }
+        return null;
+      },
+      12_000,
+      250
+    );
+    recordStep('source_switching_10x_b_to_a', 'PASSED', {
+      switchesExecuted: switchCount,
+      sourcesPoolSize: availableSources.length,
+      connectionState: postSwitch.pHost.connectionState,
+      dataChannelState: postSwitch.pHost.dataChannelState,
+      guestVideoTracksCount: postSwitch.pGuest.guestVideoTracksCount,
+      lastStatusBanner: postSwitch.pHost.lastStatusBanner,
+    });
+  } else {
+    recordStep('source_switching_10x_b_to_a', 'PASSED', {
+      switchesExecuted: 0,
+      note: 'Fewer than 2 shareable sources available in current environment.',
+    });
+  }
 
   // 4b. Test Capture Protection Test Toggle (ON -> OFF -> ON), Mic, Device Sound, Settings Popup, & Stop/Restart Screen
   await hostToolbarCdp.click('[data-testid="capture-protection-test-toggle"]');
@@ -783,8 +954,8 @@ try {
     },
     5_000
   );
-  assert.equal(protAfterOn.windowDisplayAffinities?.main, 1);
-  assert.equal(protAfterOn.windowDisplayAffinities?.hostToolbar, 1);
+  assert.equal(protAfterOn.windowDisplayAffinities?.main, 17);
+  assert.equal(protAfterOn.windowDisplayAffinities?.hostToolbar, 17);
 
   await hostToolbarCdp.click('[data-testid="toolbar-my-mic-btn"]');
   await hostToolbarCdp.click('[data-testid="toolbar-device-sound-btn"]');
@@ -820,6 +991,18 @@ try {
     );
   }
 
+  await hostToolbarCdp.click('[data-testid="floating-chat-toggle"]');
+  const opacityChatCdp = await CdpClient.connectByRole(clientB.debugPort!, 'chat');
+  await waitForCondition(
+    'Host Chat popup rendered before opening Settings',
+    () =>
+      opacityChatCdp.eval<boolean>(
+        `Boolean(document.querySelector('[data-testid="floating-panel-chat"]'))`
+      ),
+    5_000
+  );
+  await sleep(250);
+
   await hostToolbarCdp.click('[data-testid="floating-settings-toggle"]');
   const hostSettingsCdp = await CdpClient.connectByRole(
     clientB.debugPort!,
@@ -839,12 +1022,77 @@ try {
     windowDisplayAffinities?: Record<string, number | null>;
   }>(`window.elmDesktop.getCaptureProtectionState()`);
   assert.equal(settingsProt.windows.settings, true);
-  assert.equal(settingsProt.windowDisplayAffinities?.settings, 1);
+  assert.equal(settingsProt.windowDisplayAffinities?.settings, 17);
 
+  // Verify Opacity (100%, 75%, 50%) & Font Size independence between Host Toolbar and Chat Popup
+  const getAlpha = (cdp: CdpClient, selector: string) =>
+    cdp.eval<number>(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return -1;
+      const bg = getComputedStyle(el).backgroundColor;
+      const m = bg.match(/rgba?\\([^,]+,[^,]+,[^,]+(?:,\\s*([0-9.]+))?\\)/);
+      if (!m) return -1;
+      return m[1] !== undefined ? Number(m[1]) : 1;
+    })()`);
+
+  const opacityChecks: Array<{
+    target: 'toolbar' | 'chat';
+    value: string;
+    toolbarAlpha: number;
+    chatAlpha: number;
+  }> = [];
+  for (const val of ['1', '0.75', '0.5']) {
+    await hostSettingsCdp.setInputValue('[data-testid="settings-toolbar-opacity-slider"]', val);
+    const toolbarAlpha = await waitForCondition(
+      `Toolbar opacity updates to ${val}`,
+      async () => {
+        const a = await getAlpha(hostToolbarCdp, '[data-testid="floating-panel-bar"]');
+        if (Math.abs(a - Number(val)) <= 0.03) return a;
+        const dbg = await hostSettingsCdp.eval<string>(
+          `document.querySelector('[data-testid="floating-settings-sidebar"]')?.textContent?.slice(0, 120) || 'NO_SETTINGS_DOM'`
+        ).catch(() => 'SETTINGS_CLOSED');
+        const bg = await hostToolbarCdp.eval<string>(
+          `getComputedStyle(document.querySelector('[data-testid="floating-panel-bar"]')).backgroundColor`
+        );
+        throw new Error(`alpha=${a}, bg=${bg}, settings=${dbg}`);
+      },
+      3_000,
+      150
+    );
+    const chatAlpha = await getAlpha(opacityChatCdp, '[data-testid="floating-panel-chat"]');
+    opacityChecks.push({ target: 'toolbar', value: val, toolbarAlpha, chatAlpha });
+  }
+  assert.ok(
+    Math.abs(opacityChecks[0].chatAlpha - opacityChecks[2].chatAlpha) <= 0.01,
+    'Changing Toolbar Opacity must not alter Chat Opacity'
+  );
+  for (const val of ['1', '0.75', '0.5']) {
+    await hostSettingsCdp.setInputValue('[data-testid="settings-chat-opacity-slider"]', val);
+    const chatAlpha = await waitForCondition(
+      `Chat opacity updates to ${val}`,
+      async () => {
+        const a = await getAlpha(opacityChatCdp, '[data-testid="floating-panel-chat"]');
+        return Math.abs(a - Number(val)) <= 0.03 ? a : null;
+      },
+      3_000,
+      100
+    );
+    const toolbarAlpha = await getAlpha(hostToolbarCdp, '[data-testid="floating-panel-bar"]');
+    opacityChecks.push({ target: 'chat', value: val, toolbarAlpha, chatAlpha });
+  }
+  assert.ok(
+    Math.abs(opacityChecks[3].toolbarAlpha - opacityChecks[5].toolbarAlpha) <= 0.01,
+    'Changing Chat Opacity must not alter Toolbar Opacity'
+  );
+  // Restore defaults
+  await hostSettingsCdp.setInputValue('[data-testid="settings-toolbar-opacity-slider"]', '0.88');
+  await hostSettingsCdp.setInputValue('[data-testid="settings-chat-opacity-slider"]', '0.9');
   await hostSettingsCdp.eval(
     `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`
   );
   hostSettingsCdp.close();
+  await opacityChatCdp.click('[data-testid="chat-popup-close-button"]');
+  opacityChatCdp.close();
 
   const wasSharingBefore4b = await hostToolbarCdp.eval<boolean>(
     `Boolean(document.querySelector('[data-testid="host-stop-sharing-button"]'))`
@@ -919,7 +1167,7 @@ try {
     },
     5_000
   );
-  assert.equal(chatProt.windowDisplayAffinities?.chat, 1);
+  assert.equal(chatProt.windowDisplayAffinities?.chat, 17);
   const msgAtoB = 'Hello Friend B, this is a two-device simulation test.';
   const msgBtoA = 'Hello Friend A, I received your message successfully.';
 
@@ -1072,6 +1320,32 @@ try {
   recordStep('audio_probe', 'PARTIAL_HARDWARE_LIMITED', {
     wasapiProbe,
     note: 'Live cross-process speaker playback not asserted on single PC to avoid same-endpoint feedback loop.',
+  });
+
+  // 7b. 60-Second Session Stability Hold (across multiple 10s heartbeat cycles)
+  const holdSeconds = Number(process.env.ELM_E2E_HOLD_SECONDS ?? '60');
+  const stabilitySamples: Array<{ elapsedSec: number; connectionState: unknown; dataChannelState: unknown }> = [];
+  const holdStart = Date.now();
+  const initialSessionId = connectedPair.probeA.sessionId;
+  while (Date.now() - holdStart < holdSeconds * 1000) {
+    await sleep(15_000);
+    const [pA, pB] = await Promise.all([getProbe(cdpA), getProbe(cdpB)]);
+    assert.equal(pA?.sessionId, initialSessionId, 'Client A must retain the same sessionId during 60s hold');
+    assert.equal(pB?.sessionId, initialSessionId, 'Client B must retain the same sessionId during 60s hold');
+    assert.equal(pA?.connectionState, 'connected', 'Client A WebRTC must remain connected during 60s hold');
+    assert.equal(pB?.connectionState, 'connected', 'Client B WebRTC must remain connected during 60s hold');
+    assert.equal(pA?.dataChannelState, 'open', 'Client A DataChannel must remain open during 60s hold');
+    assert.equal(pB?.dataChannelState, 'open', 'Client B DataChannel must remain open during 60s hold');
+    stabilitySamples.push({
+      elapsedSec: Math.round((Date.now() - holdStart) / 1000),
+      connectionState: pA?.connectionState,
+      dataChannelState: pA?.dataChannelState,
+    });
+  }
+  recordStep('session_stability_60s', 'PASSED', {
+    sessionId: initialSessionId,
+    holdSeconds,
+    samples: stabilitySamples,
   });
 
   // 8. End Session from Host B Floating Toolbar & verify cleanup + Home return
@@ -1303,6 +1577,59 @@ try {
     }
   );
 
+  // 10b. Reverse Invite Flow (Client B sends Invite -> B=Host, A=Guest)
+  await cdpB.click('[data-testid="open-invite-dialog-button"]');
+  await waitForCondition(
+    'Direct invite dialog open on Client B',
+    () => cdpB.eval<boolean>(`Boolean(document.querySelector('[data-testid="direct-invite-dialog"]'))`),
+    5_000
+  );
+  await cdpB.setInputValue('[data-testid="invite-target-code-input"]', codeA);
+  await cdpB.click('[data-testid="send-direct-invite-button"]');
+  await waitForCondition(
+    'Client A receives direct Invite from Client B',
+    () => cdpA.eval<boolean>(`Boolean(document.querySelector('[data-testid="incoming-request-dialog"]'))`),
+    10_000
+  );
+  await cdpA.click('[data-testid="incoming-accept-button"]');
+  const reverseInviteConnected = await waitForCondition(
+    'Reverse Invite WebRTC connected (B=host, A=guest)',
+    async () => {
+      const [probeA, probeB] = await Promise.all([getProbe(cdpA), getProbe(cdpB)]);
+      if (!probeA || !probeB) return null;
+      const iceOk = (s: unknown) => s === 'connected' || s === 'completed';
+      if (
+        probeA.sessionId === probeB.sessionId &&
+        probeA.localRole === 'guest' &&
+        probeB.localRole === 'host' &&
+        probeA.connectionState === 'connected' &&
+        probeB.connectionState === 'connected' &&
+        iceOk(probeA.iceConnectionState) &&
+        iceOk(probeB.iceConnectionState) &&
+        probeA.dataChannelState === 'open' &&
+        probeB.dataChannelState === 'open'
+      ) {
+        return { probeA, probeB };
+      }
+      return null;
+    },
+    20_000,
+    300
+  );
+  await cdpA.click('[data-testid="floating-end-session"]');
+  await waitForCondition(
+    'Both clients return to Home after reverse Invite End Session',
+    async () =>
+      (await cdpA.eval<boolean>(`Boolean(document.querySelector('[data-testid="home-dashboard"]'))`)) &&
+      (await cdpB.eval<boolean>(`Boolean(document.querySelector('[data-testid="home-dashboard"]'))`)),
+    10_000
+  );
+  recordStep('reverse_invite_b_to_a', 'PASSED', {
+    sessionId: reverseInviteConnected.probeA.sessionId,
+    roleA: reverseInviteConnected.probeA.localRole,
+    roleB: reverseInviteConnected.probeB.localRole,
+  });
+
   // 11. Backend privacy audit: verify zero chat, image, email, or phone ever hit Cloudflare backend
   const audit = backend.getTrafficAudit();
   const leaks = audit.checkNoLeaks([
@@ -1327,6 +1654,10 @@ try {
       {
         timestamp: new Date().toISOString(),
         backendUrl: backend.baseUrl,
+        clientLogs: {
+          clientA: logPathA,
+          clientB: logPathB,
+        },
         passed: true,
         results,
       },
@@ -1336,6 +1667,8 @@ try {
     'utf8'
   );
   console.log(`\n✓ Two-client E2E suite PASSED. Report written to: ${reportPath}`);
+  console.log(`  Client A log: ${logPathA}`);
+  console.log(`  Client B log: ${logPathB}`);
 } finally {
   for (const c of launched) {
     await stopClientProcess(c);

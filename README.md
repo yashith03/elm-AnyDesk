@@ -69,10 +69,29 @@ npx electron apps/desktop --run-prototype-suite
 # 🤝 6. Run the automated two-client Electron CDP end-to-end suite (Host overlay, Chat popup, signaling, media controls)
 npm run test:e2e:two-clients
 
+# 🖥️ 6b. Launch two isolated Electron clients side-by-side for manual testing (local backend, separate profiles & logs)
+npm run dev:two-clients
+
 # 📦 7. Build the standalone Windows 11 unpacked app and Setup Installer (.exe) + SHA-256 + clean-install test
 npm run dist:win
 # (or: npm run build:installer)
 ```
+
+### 🖥️ Two-Client Local Testing Environment (Single Windows 11 PC)
+- **Start interactive two-client environment** (isolated local backend on `127.0.0.1:<port>`, separate `%TEMP%\elm-two-clients-e2e-<runId>\client-a|b` profiles, adaptive side-by-side `ELM_WINDOW_SIDE=left|right` layout):
+  ```powershell
+  npm run dev:two-clients
+  ```
+- **Run automated two-client E2E suite**:
+  ```powershell
+  npm run test:e2e:two-clients
+  ```
+- **Stop both test clients**: Close both Electron windows or press `Ctrl+C` in the launcher terminal (or `Get-Process electron -ErrorAction SilentlyContinue | Stop-Process` if needed).
+- **Inspect separate per-client logs**: Check `%TEMP%\elm-two-clients-logs\<runId>\client-a.log` and `client-b.log` (exact paths are printed when the launcher starts).
+- **Reset disposable test profiles** (never touches your real `%APPDATA%\@elm\desktop` profile):
+  ```powershell
+  Remove-Item "$env:TEMP\elm-two-clients-e2e-*" -Recurse -Force -ErrorAction SilentlyContinue
+  ```
 
 ### 📦 Installer Artifacts Output (`apps/desktop/release/`)
 - 💿 `apps/desktop/release/Elm-AnyDesk-Setup-0.5.0-x64.exe` — Self-contained Windows 11 x64 Setup Installer. Embeds the multi-resolution `elm-icon.ico`, installs `Elm-AnyDesk.exe` (with WASAPI & DWM helpers) to `%LOCALAPPDATA%\Programs\Elm-AnyDesk`, automatically creates the `Elm-AnyDesk` Desktop and Start Menu shortcuts (without pinning to the taskbar), and registers uninstallation.

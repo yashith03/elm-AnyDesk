@@ -81,6 +81,13 @@ export interface WebRtcSessionSnapshot {
   readonly dataChannelReliable: boolean;
   readonly sharingStartedByHost: boolean;
   readonly hostMicMutedLocally: boolean;
+  readonly viewerMicActive: boolean;
+  readonly viewerMicStatus: 'off' | 'active' | 'permission_denied';
+  readonly viewerMicRequestPending: boolean;
+  readonly remoteViewerMicActive: boolean;
+  readonly hostViewerMicMutedLocally: boolean;
+  readonly hostViewerMicRequestSent: boolean;
+  readonly hostReceivedViewerMicStream: MediaStream | null;
   readonly hostMediaState: HostMediaRuntimeState;
   readonly guestReceivedTracks: readonly GuestReceivedTrackInfo[];
   readonly guestVideoTracksCount: number;
@@ -108,6 +115,12 @@ export interface WebRtcControllerOptions {
   readonly onGuestViewerCleared?: () => void;
   readonly localContactCard?: PeerContactCardPayload;
   readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
+  readonly onSessionEndedRemotely?: (info: {
+    readonly sessionId: string;
+    readonly reason: SessionTerminationReason;
+    readonly subReason: string;
+    readonly message: string;
+  }) => void;
 }
 
 interface ActiveHostSenderEntry {
@@ -175,13 +188,33 @@ export class ApprovedWebRtcSessionController {
   private readonly pendingGuestIceCandidates: RTCIceCandidateInit[] = [];
   private remoteLivenessArmed = false;
   private negotiationQueue: Promise<void> = Promise.resolve();
+  private activeNegotiation: {
+    id: string;
+    resolve: () => void;
+    timerId: ReturnType<typeof setTimeout>;
+  } | null = null;
   private closed = false;
 
   private sharingStartedByHost = false;
   private hostMicMutedLocally = false;
+  private viewerMicSender: {
+    track: MediaStreamTrack;
+    stream: MediaStream;
+    sender: RTCRtpSender;
+  } | null = null;
+  private viewerMicActive = false;
+  private viewerMicStatus: 'off' | 'active' | 'permission_denied' = 'off';
+  private viewerMicRequestPending = false;
+  private remoteViewerMicActive = false;
+  private hostViewerMicMutedLocally = false;
+  private hostViewerMicRequestSent = false;
+  private hostReceivedViewerMicStream: MediaStream | null = null;
   private hostMediaState: Record<MediaSourceKind, MediaSourceStatusDescriptor>;
   private readonly hostSenders = new Map<MediaSourceKind, ActiveHostSenderEntry>();
   private readonly stoppingByHost = new Set<MediaSourceKind>();
+  private screenVideoSender: RTCRtpSender | null = null;
+  private screenVideoStream: MediaStream | null = null;
+  private screenCaptureOpSeq = 0;
 
   // Track metadata sent in the latest offer from Host A -> Guest B
   private latestAdvertisedTracks: WebRtcTrackDescriptor[] = [];
@@ -287,6 +320,14 @@ export class ApprovedWebRtcSessionController {
   private readonly onGuestViewerCleared?: () => void;
   private localContactCard: PeerContactCardPayload | null = null;
   private readonly onPeerContactReceived?: (contact: PeerContactCardPayload) => void;
+  private readonly onSessionEndedRemotely?: (info: {
+    readonly sessionId: string;
+    readonly reason: SessionTerminationReason;
+    readonly subReason: string;
+    readonly message: string;
+  }) => void;
+  private suppressPostDestroyEmissions = false;
+  private finalTeardownEmitted = false;
   private livenessTimerId: ReturnType<typeof setInterval> | null = null;
   private lastHostHeartbeatPerfMs = performance.now();
   private lastGuestHeartbeatPerfMs = performance.now();
@@ -318,6 +359,7 @@ export class ApprovedWebRtcSessionController {
     this.onGuestViewerCleared = options?.onGuestViewerCleared;
     this.localContactCard = options?.localContactCard ?? null;
     this.onPeerContactReceived = options?.onPeerContactReceived;
+    this.onSessionEndedRemotely = options?.onSessionEndedRemotely;
 
     this.hostMediaState = {
       ...createInitialHostMediaState(session.hostMediaSelection),
@@ -404,6 +446,22 @@ export class ApprovedWebRtcSessionController {
     if (this.pcHost) {
       this.pcHost.onconnectionstatechange = checkTransportHealth;
       this.pcHost.oniceconnectionstatechange = checkTransportHealth;
+      // Host A receives optional Viewer microphone audio when Viewer consents/enables mic
+      this.pcHost.ontrack = (event) => {
+        if (this.closed) return;
+        if (event.track.kind !== 'audio') return;
+        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        this.hostReceivedViewerMicStream = stream;
+        this.remoteViewerMicActive = true;
+        event.track.onended = () => {
+          if (this.hostReceivedViewerMicStream === stream) {
+            this.hostReceivedViewerMicStream = null;
+          }
+          this.remoteViewerMicActive = false;
+          this.emitChange();
+        };
+        this.emitChange();
+      };
       // Host A ICE candidates -> Coordinator -> Guest B
       this.pcHost.onicecandidate = (event) => {
         if (this.closed || !event.candidate) return;
@@ -525,12 +583,59 @@ export class ApprovedWebRtcSessionController {
       if (this.closed) return;
       try {
         const parsed = JSON.parse(String(event.data)) as (EphemeralChatMessage | ChatImageChunkFrame) & {
-          __elmControl?: 'liveness-heartbeat' | 'teardown-notice' | 'peer-contact-card';
+          __elmControl?:
+            | 'liveness-heartbeat'
+            | 'teardown-notice'
+            | 'peer-contact-card'
+            | 'peer-mic-request'
+            | 'peer-mic-response'
+            | 'viewer-mic-state';
           __elmImageChunk?: true;
           sender?: 'host' | 'guest';
+          accepted?: boolean;
+          active?: boolean;
           reason?: SessionTerminationReason;
           subReason?: string;
         };
+
+        if (parsed && parsed.__elmControl === 'peer-mic-request') {
+          if (side === 'guest' && parsed.sender === 'host') {
+            if (!this.viewerMicActive) {
+              this.viewerMicRequestPending = true;
+              this.emitChange();
+            } else {
+              this.sendControlFrame('guest', {
+                __elmControl: 'peer-mic-response',
+                sender: 'guest',
+                accepted: true,
+              });
+            }
+          }
+          return;
+        }
+
+        if (parsed && parsed.__elmControl === 'peer-mic-response') {
+          if (side === 'host' && parsed.sender === 'guest') {
+            this.hostViewerMicRequestSent = false;
+            if (!parsed.accepted) {
+              this.lastStatusBanner = 'Viewer declined the microphone request.';
+            }
+            this.emitChange();
+          }
+          return;
+        }
+
+        if (parsed && parsed.__elmControl === 'viewer-mic-state') {
+          if (side === 'host' && parsed.sender === 'guest') {
+            this.remoteViewerMicActive = Boolean(parsed.active);
+            if (!this.remoteViewerMicActive) {
+              this.hostReceivedViewerMicStream = null;
+            }
+            this.hostViewerMicRequestSent = false;
+            this.emitChange();
+          }
+          return;
+        }
 
         if (parsed && parsed.__elmControl === 'peer-contact-card') {
           const validated = sanitizePeerContactFrame(parsed);
@@ -705,11 +810,20 @@ export class ApprovedWebRtcSessionController {
           // Ignore send failure; liveness check below will catch it
         }
       }
-      void window.elmDesktop.recordSessionHeartbeat({
-        sessionId: this.session.sessionId,
-        callerAccountId: this.session.hostAccountId,
-        timestampMs: nowEpoch,
-      });
+      void window.elmDesktop
+        .recordSessionHeartbeat({
+          sessionId: this.session.sessionId,
+          callerAccountId: this.session.hostAccountId,
+          timestampMs: nowEpoch,
+        })
+        .then((hbRes) => {
+          if (!this.closed && this.isTerminalSessionEndedError(hbRes)) {
+            this.handleAuthoritativeRemoteSessionEnded(hbRes.errorMessage);
+          }
+        })
+        .catch(() => {
+          // Ignore transient heartbeat IPC/network error; P2P liveness continues
+        });
     }
 
     if (shouldSendGuest) {
@@ -727,11 +841,20 @@ export class ApprovedWebRtcSessionController {
           // Ignore send failure
         }
       }
-      void window.elmDesktop.recordSessionHeartbeat({
-        sessionId: this.session.sessionId,
-        callerAccountId: this.session.guestAccountId,
-        timestampMs: nowEpoch,
-      });
+      void window.elmDesktop
+        .recordSessionHeartbeat({
+          sessionId: this.session.sessionId,
+          callerAccountId: this.session.guestAccountId,
+          timestampMs: nowEpoch,
+        })
+        .then((hbRes) => {
+          if (!this.closed && this.isTerminalSessionEndedError(hbRes)) {
+            this.handleAuthoritativeRemoteSessionEnded(hbRes.errorMessage);
+          }
+        })
+        .catch(() => {
+          // Ignore transient heartbeat IPC/network error; P2P liveness continues
+        });
     }
 
     // 2. Check peer-to-peer liveness silence against threshold
@@ -767,7 +890,10 @@ export class ApprovedWebRtcSessionController {
     // 3. Check coordinator liveness & presence state (detects abrupt offline/internet drop on coordinator)
     const coordCheck = await window.elmDesktop.checkSessionLiveness({
       sessionId: this.session.sessionId,
-      callerAccountId: this.session.hostAccountId,
+      callerAccountId:
+        this.localRole === 'guest'
+          ? this.session.guestAccountId
+          : this.session.hostAccountId,
       nowMs: nowEpoch,
       livenessTimeoutMs: this.livenessTimeoutMs,
     });
@@ -842,16 +968,47 @@ export class ApprovedWebRtcSessionController {
   private isPumpingSignals = false;
   private pumpAgainRequested = false;
 
+  private isTerminalSessionEndedError(res: {
+    readonly ok: boolean;
+    readonly status: number;
+    readonly errorCode?: string;
+  }): boolean {
+    return (
+      !res.ok &&
+      (res.status === 409 || res.errorCode === 'SESSION_ALREADY_ENDED')
+    );
+  }
+
+  private handleAuthoritativeRemoteSessionEnded(message?: string): void {
+    if (this.closed) return;
+    const summary =
+      message && message.trim().length > 0
+        ? message.trim()
+        : 'Session ended on server. Permissions invalidated — send a fresh invite to connect again.';
+    this.destroyLocalOnly('connection_lost', 'session_already_ended_on_server');
+    this.onSessionEndedRemotely?.({
+      sessionId: this.session.sessionId,
+      reason: 'connection_lost',
+      subReason: 'session_already_ended_on_server',
+      message: summary,
+    });
+  }
+
   private async sendSignalFrom(
     senderAccountId: string,
     payload: WebRtcSignalPayload
   ): Promise<void> {
     if (this.closed) return;
-    await window.elmDesktop.sendSessionSignal({
+    const sendRes = await window.elmDesktop.sendSessionSignal({
       sessionId: this.session.sessionId,
       senderAccountId,
       payload,
     });
+    if (this.closed) return;
+    if (this.isTerminalSessionEndedError(sendRes)) {
+      this.handleAuthoritativeRemoteSessionEnded(sendRes.errorMessage);
+      return;
+    }
     await this.pumpSignalsOnce();
   }
 
@@ -874,8 +1031,14 @@ export class ApprovedWebRtcSessionController {
             receiverAccountId: this.session.guestAccountId,
             afterSeq: this.guestAfterSeq,
           });
+          if (this.closed) return;
+          if (this.isTerminalSessionEndedError(guestPoll)) {
+            this.handleAuthoritativeRemoteSessionEnded(guestPoll.errorMessage);
+            return;
+          }
           if (guestPoll.ok && guestPoll.data) {
             for (const env of guestPoll.data.signals) {
+              if (this.closed) return;
               if (env.seq <= this.guestAfterSeq) continue;
               this.guestAfterSeq = env.seq;
               await this.handleSignalForGuest(env.payload);
@@ -890,8 +1053,14 @@ export class ApprovedWebRtcSessionController {
             receiverAccountId: this.session.hostAccountId,
             afterSeq: this.hostAfterSeq,
           });
+          if (this.closed) return;
+          if (this.isTerminalSessionEndedError(hostPoll)) {
+            this.handleAuthoritativeRemoteSessionEnded(hostPoll.errorMessage);
+            return;
+          }
           if (hostPoll.ok && hostPoll.data) {
             for (const env of hostPoll.data.signals) {
+              if (this.closed) return;
               if (env.seq <= this.hostAfterSeq) continue;
               this.hostAfterSeq = env.seq;
               await this.handleSignalForHost(env.payload);
@@ -904,10 +1073,26 @@ export class ApprovedWebRtcSessionController {
     }
   }
 
+  private settleActiveNegotiation(expectedId?: string): void {
+    const active = this.activeNegotiation;
+    if (!active) return;
+    if (expectedId && active.id !== expectedId) return;
+    clearTimeout(active.timerId);
+    this.activeNegotiation = null;
+    active.resolve();
+  }
+
   private async handleSignalForGuest(payload: WebRtcSignalPayload): Promise<void> {
     if (this.closed || !this.pcGuest) return;
     if (payload.type === 'offer') {
       this.latestAdvertisedTracks = [...payload.activeTracks];
+      if (this.pcGuest.signalingState === 'have-local-offer') {
+        try {
+          await this.pcGuest.setLocalDescription({ type: 'rollback' });
+        } catch {
+          // Ignore rollback if state already transitioned
+        }
+      }
       await this.pcGuest.setRemoteDescription({
         type: 'offer',
         sdp: payload.sdp,
@@ -928,9 +1113,40 @@ export class ApprovedWebRtcSessionController {
         payload: {
           type: 'answer',
           sdp: answer.sdp ?? '',
+          ...(payload.negotiationId ? { negotiationId: payload.negotiationId } : {}),
         },
       });
       this.pumpAgainRequested = true;
+      this.emitChange();
+    } else if (payload.type === 'answer') {
+      if (this.pcGuest.signalingState !== 'have-local-offer') {
+        return;
+      }
+      if (
+        payload.negotiationId &&
+        this.activeNegotiation &&
+        payload.negotiationId !== this.activeNegotiation.id
+      ) {
+        return;
+      }
+      try {
+        await this.pcGuest.setRemoteDescription({
+          type: 'answer',
+          sdp: payload.sdp,
+        });
+        while (this.pendingGuestIceCandidates.length > 0 && !this.closed) {
+          const queued = this.pendingGuestIceCandidates.shift()!;
+          try {
+            await this.pcGuest.addIceCandidate(queued);
+          } catch {
+            // Ignore stale/duplicate queued ICE candidates
+          }
+        }
+      } catch {
+        // Ignore stale answer
+      } finally {
+        this.settleActiveNegotiation(payload.negotiationId);
+      }
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
       const candidateInit: RTCIceCandidateInit = {
@@ -956,7 +1172,18 @@ export class ApprovedWebRtcSessionController {
   private async handleSignalForHost(payload: WebRtcSignalPayload): Promise<void> {
     if (this.closed || !this.pcHost) return;
     if (payload.type === 'answer') {
-      if (this.pcHost.signalingState === 'have-local-offer') {
+      if (this.pcHost.signalingState !== 'have-local-offer') {
+        return;
+      }
+      if (
+        payload.negotiationId &&
+        this.activeNegotiation &&
+        payload.negotiationId !== this.activeNegotiation.id
+      ) {
+        // Ignore stale answer belonging to an earlier offer
+        return;
+      }
+      try {
         await this.pcHost.setRemoteDescription({
           type: 'answer',
           sdp: payload.sdp,
@@ -969,7 +1196,45 @@ export class ApprovedWebRtcSessionController {
             // Ignore stale/duplicate queued ICE candidates
           }
         }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.lastStatusBanner = `Signaling answer ignored (${msg}).`;
+      } finally {
+        this.settleActiveNegotiation(payload.negotiationId);
       }
+      this.emitChange();
+    } else if (payload.type === 'offer') {
+      if (this.pcHost.signalingState === 'have-local-offer') {
+        try {
+          await this.pcHost.setLocalDescription({ type: 'rollback' });
+        } catch {
+          // Ignore rollback if state already transitioned
+        }
+      }
+      await this.pcHost.setRemoteDescription({
+        type: 'offer',
+        sdp: payload.sdp,
+      });
+      while (this.pendingHostIceCandidates.length > 0 && !this.closed) {
+        const queued = this.pendingHostIceCandidates.shift()!;
+        try {
+          await this.pcHost.addIceCandidate(queued);
+        } catch {
+          // Ignore stale/duplicate queued ICE candidates
+        }
+      }
+      const answer = await this.pcHost.createAnswer();
+      await this.pcHost.setLocalDescription(answer);
+      await window.elmDesktop.sendSessionSignal({
+        sessionId: this.session.sessionId,
+        senderAccountId: this.session.hostAccountId,
+        payload: {
+          type: 'answer',
+          sdp: answer.sdp ?? '',
+          ...(payload.negotiationId ? { negotiationId: payload.negotiationId } : {}),
+        },
+      });
+      this.pumpAgainRequested = true;
       this.emitChange();
     } else if (payload.type === 'ice-candidate') {
       const candidateInit: RTCIceCandidateInit = {
@@ -992,29 +1257,71 @@ export class ApprovedWebRtcSessionController {
   private async renegotiateHostToGuest(): Promise<void> {
     const run = async () => {
       if (this.closed || !this.pcHost) return;
+      if (this.pcHost.signalingState !== 'stable') {
+        const currentSignalingState = (): RTCSignalingState | null =>
+          this.pcHost?.signalingState ?? null;
+        // Wait briefly for any in-flight negotiation to settle before creating a new offer
+        for (let i = 0; i < 40; i++) {
+          if (this.closed || !this.pcHost || currentSignalingState() === 'stable') {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        if (this.closed || !this.pcHost || currentSignalingState() !== 'stable') {
+          return;
+        }
+      }
+
       const activeTracks = this.buildActiveTrackDescriptors();
       this.latestAdvertisedTracks = activeTracks;
+      const negotiationId = crypto.randomUUID();
 
       const offer = await this.pcHost.createOffer();
+      if (this.closed || !this.pcHost) return;
+
+      const waitForAnswer = new Promise<void>((resolve) => {
+        const timerId = setTimeout(() => {
+          this.settleActiveNegotiation(negotiationId);
+        }, 10_000);
+        this.activeNegotiation = { id: negotiationId, resolve, timerId };
+      });
+
       await this.pcHost.setLocalDescription(offer);
+      if (this.closed || !this.pcHost) {
+        this.settleActiveNegotiation(negotiationId);
+        return;
+      }
 
       await this.sendSignalFrom(this.session.hostAccountId, {
         type: 'offer',
         sdp: offer.sdp ?? '',
         activeTracks,
+        negotiationId,
       });
+      if (this.closed || !this.pcHost) {
+        this.settleActiveNegotiation(negotiationId);
+        return;
+      }
 
       if (this.mode === 'loopback') {
         // Pump signals until Guest B's answer and any pending ICE candidates are processed
         for (let i = 0; i < 10; i++) {
+          if (this.closed || !this.pcHost) break;
           await this.pumpSignalsOnce();
-          if (this.pcHost.signalingState === 'stable') {
+          if (this.closed || !this.pcHost || this.pcHost.signalingState === 'stable') {
             break;
           }
           await new Promise((r) => setTimeout(r, 15));
         }
-        await this.pumpSignalsOnce();
+        if (!this.closed) {
+          await this.pumpSignalsOnce();
+        }
+        this.settleActiveNegotiation(negotiationId);
+      } else {
+        // In remote mode, hold the negotiationQueue until the matching answer arrives (or times out)
+        await waitForAnswer;
       }
+      if (this.closed) return;
       this.emitChange();
     };
 
@@ -1028,6 +1335,72 @@ export class ApprovedWebRtcSessionController {
    * permission is denied or a combination is unsupported, a specific status is shown,
    * no fallback source or video is substituted, and other approved features keep working.
    */
+  private async renegotiateGuestToHost(): Promise<void> {
+    const run = async () => {
+      if (this.closed || !this.pcGuest) return;
+      if (this.pcGuest.signalingState !== 'stable') {
+        const currentSignalingState = (): RTCSignalingState | null =>
+          this.pcGuest?.signalingState ?? null;
+        for (let i = 0; i < 40; i++) {
+          if (this.closed || !this.pcGuest || currentSignalingState() === 'stable') {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      }
+      if (this.closed || !this.pcGuest) return;
+
+      const negotiationId = crypto.randomUUID();
+      const offer = await this.pcGuest.createOffer();
+      if (this.closed || !this.pcGuest) return;
+      await this.pcGuest.setLocalDescription(offer);
+      if (this.closed || !this.pcGuest) return;
+
+      const answerPromise = new Promise<void>((resolve) => {
+        const timerId = setTimeout(() => {
+          if (this.activeNegotiation?.id === negotiationId) {
+            this.activeNegotiation = null;
+          }
+          resolve();
+        }, 4000);
+        this.activeNegotiation = { id: negotiationId, resolve, timerId };
+      });
+
+      await this.sendSignalFrom(this.session.guestAccountId, {
+        type: 'offer',
+        sdp: offer.sdp ?? '',
+        activeTracks: this.buildActiveTrackDescriptors(),
+        negotiationId,
+      });
+      if (this.closed || !this.pcGuest) {
+        this.settleActiveNegotiation(negotiationId);
+        return;
+      }
+
+      if (this.mode === 'loopback') {
+        for (let i = 0; i < 10; i++) {
+          if (this.closed || !this.pcGuest) break;
+          await this.pumpSignalsOnce();
+          if (this.closed || !this.pcGuest || this.pcGuest.signalingState === 'stable') {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        if (!this.closed) {
+          await this.pumpSignalsOnce();
+        }
+        this.settleActiveNegotiation(negotiationId);
+      } else {
+        await answerPromise;
+      }
+      if (this.closed) return;
+      this.emitChange();
+    };
+
+    this.negotiationQueue = this.negotiationQueue.then(run, run);
+    return this.negotiationQueue;
+  }
+
   public setSimulatedSourceFault(
     source: MediaSourceKind,
     fault: 'permission_denied' | 'unsupported' | null
@@ -1121,9 +1494,22 @@ export class ApprovedWebRtcSessionController {
     return this.getSnapshot();
   }
 
-  private async startScreenVideoCapture(
-    selectedSourceId: string | null
-  ): Promise<void> {
+  private attachScreenEndedListener(videoTrack: MediaStreamTrack): void {
+    videoTrack.addEventListener('ended', () => {
+      if (this.stoppingByHost.has('screenVideo')) return;
+      // Ignore ended events from an older track that was already replaced or stopped
+      if (this.hostSenders.get('screenVideo')?.track !== videoTrack) return;
+      void this.handleUnexpectedSourceDisappearance(
+        'screenVideo',
+        'Shared window or display was closed or disappeared. Other approved sources and private chat remain active; no fallback source was substituted.'
+      );
+    });
+  }
+
+  private async acquireScreenVideoTrack(
+    selectedSourceId: string | null,
+    opSeq: number
+  ): Promise<MediaStreamTrack | null> {
     const fault = this.simulatedPreStartFaults.get('screenVideo');
     if (fault === 'permission_denied') {
       this.simulatedPreStartFaults.delete('screenVideo');
@@ -1136,7 +1522,7 @@ export class ApprovedWebRtcSessionController {
       );
       this.lastStatusBanner =
         'Screen Video permission denied — continuing with remaining approved features.';
-      return;
+      return null;
     }
     if (fault === 'unsupported') {
       this.simulatedPreStartFaults.delete('screenVideo');
@@ -1149,7 +1535,7 @@ export class ApprovedWebRtcSessionController {
       );
       this.lastStatusBanner =
         'Screen Video surface unsupported — continuing with remaining approved features.';
-      return;
+      return null;
     }
 
     if (!selectedSourceId) {
@@ -1162,53 +1548,96 @@ export class ApprovedWebRtcSessionController {
       );
       this.lastStatusBanner =
         'Screen Video not started: select a shareable window or display first. Other approved features remain active.';
-      return;
+      return null;
     }
 
+    await window.elmDesktop.selectShareableSource(selectedSourceId);
+    if (this.closed || opSeq !== this.screenCaptureOpSeq) {
+      return null;
+    }
+
+    let timedOut = false;
+    const stream = await Promise.race([
+      navigator.mediaDevices
+        .getDisplayMedia({
+          video: true,
+          audio: false,
+        })
+        .then((s) => {
+          if (timedOut) {
+            for (const t of s.getTracks()) t.stop();
+          }
+          return s;
+        }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => {
+          timedOut = true;
+          reject(new Error('Screen capture request timed out after 12s.'));
+        }, 12_000)
+      ),
+    ]);
+
+    // Ensure no audio track is ever bundled with the screen video track
+    for (const strayAudio of stream.getAudioTracks()) {
+      strayAudio.stop();
+      stream.removeTrack(strayAudio);
+    }
+
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) {
+      this.updateSourceStatus(
+        'screenVideo',
+        true,
+        false,
+        'source_disappeared',
+        'Selected window or display disappeared before capture could start. No fallback source was substituted.'
+      );
+      return null;
+    }
+
+    if (this.closed || opSeq !== this.screenCaptureOpSeq) {
+      videoTrack.stop();
+      return null;
+    }
+
+    return videoTrack;
+  }
+
+  private async startScreenVideoCapture(
+    selectedSourceId: string | null
+  ): Promise<boolean> {
+    const opSeq = ++this.screenCaptureOpSeq;
     try {
-      await window.elmDesktop.selectShareableSource(selectedSourceId);
-      let timedOut = false;
-      const stream = await Promise.race([
-        navigator.mediaDevices
-          .getDisplayMedia({
-            video: true,
-            audio: false,
-          })
-          .then((s) => {
-            if (timedOut) {
-              for (const t of s.getTracks()) t.stop();
-            }
-            return s;
-          }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => {
-            timedOut = true;
-            reject(new Error('Screen capture request timed out after 12s.'));
-          }, 12_000)
-        ),
-      ]);
-
-      // Ensure no audio track is ever bundled with the screen video track
-      for (const strayAudio of stream.getAudioTracks()) {
-        strayAudio.stop();
-        stream.removeTrack(strayAudio);
-      }
-
-      const videoTrack = stream.getVideoTracks()[0];
+      const videoTrack = await this.acquireScreenVideoTrack(selectedSourceId, opSeq);
       if (!videoTrack) {
-        this.updateSourceStatus(
-          'screenVideo',
-          true,
-          false,
-          'source_disappeared',
-          'Selected window or display disappeared before capture could start. No fallback source was substituted.'
-        );
-        return;
+        return false;
       }
 
-      const dedicatedStream = new MediaStream([videoTrack]);
-      if (!this.pcHost) throw new Error('Host peer connection not initialized.');
-      const sender = this.pcHost.addTrack(videoTrack, dedicatedStream);
+      if (!this.pcHost) {
+        videoTrack.stop();
+        throw new Error('Host peer connection not initialized.');
+      }
+
+      let sender = this.screenVideoSender;
+      let dedicatedStream = this.screenVideoStream;
+      let needsRenegotiation = false;
+
+      if (sender && dedicatedStream) {
+        await sender.replaceTrack(videoTrack);
+        const transceiver = this.pcHost
+          .getTransceivers()
+          .find((t) => t.sender === sender);
+        if (transceiver && transceiver.direction !== 'sendonly') {
+          transceiver.direction = 'sendonly';
+          needsRenegotiation = true;
+        }
+      } else {
+        dedicatedStream = new MediaStream([videoTrack]);
+        sender = this.pcHost.addTrack(videoTrack, dedicatedStream);
+        this.screenVideoSender = sender;
+        this.screenVideoStream = dedicatedStream;
+        needsRenegotiation = true;
+      }
 
       this.hostSenders.set('screenVideo', {
         source: 'screenVideo',
@@ -1217,13 +1646,7 @@ export class ApprovedWebRtcSessionController {
         sender,
       });
 
-      videoTrack.addEventListener('ended', () => {
-        if (this.stoppingByHost.has('screenVideo')) return;
-        void this.handleUnexpectedSourceDisappearance(
-          'screenVideo',
-          'Shared window or display was closed or disappeared. Other approved sources and private chat remain active; no fallback source was substituted.'
-        );
-      });
+      this.attachScreenEndedListener(videoTrack);
 
       this.updateSourceStatus(
         'screenVideo',
@@ -1235,6 +1658,7 @@ export class ApprovedWebRtcSessionController {
         dedicatedStream.id,
         videoTrack.label || 'Screen Video'
       );
+      return needsRenegotiation;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isDenied =
@@ -1248,7 +1672,99 @@ export class ApprovedWebRtcSessionController {
         `Screen Video could not start (${msg}). Other approved features and chat remain active.`
       );
       this.lastStatusBanner = `Screen Video status: ${msg}`;
+      return false;
     }
+  }
+
+  /**
+   * Switches the active shared screen/window without tearing down or
+   * renegotiating the RTCPeerConnection when `replaceTrack` succeeds.
+   */
+  public async switchScreenSource(
+    selectedSourceId: string | null
+  ): Promise<WebRtcSessionSnapshot> {
+    if (this.closed) return this.getSnapshot();
+    if (!this.session.hostMediaSelection.screenVideo) {
+      return this.getSnapshot();
+    }
+
+    const existingEntry = this.hostSenders.get('screenVideo');
+    if (!existingEntry) {
+      return this.startHostSource('screenVideo', { selectedSourceId });
+    }
+
+    const opSeq = ++this.screenCaptureOpSeq;
+    const oldTrack = existingEntry.track;
+    let newVideoTrack: MediaStreamTrack | null = null;
+
+    try {
+      newVideoTrack = await this.acquireScreenVideoTrack(selectedSourceId, opSeq);
+      if (!newVideoTrack) {
+        return this.getSnapshot();
+      }
+      if (this.closed || opSeq !== this.screenCaptureOpSeq) {
+        newVideoTrack.stop();
+        return this.getSnapshot();
+      }
+
+      await existingEntry.sender.replaceTrack(newVideoTrack);
+
+      this.hostSenders.set('screenVideo', {
+        source: 'screenVideo',
+        track: newVideoTrack,
+        stream: existingEntry.stream,
+        sender: existingEntry.sender,
+      });
+      this.attachScreenEndedListener(newVideoTrack);
+
+      // Stop old track only after replaceTrack succeeds and hostSenders points to newVideoTrack
+      if (oldTrack !== newVideoTrack) {
+        try {
+          oldTrack.stop();
+        } catch {
+          // Ignore stop errors on superseded track
+        }
+        existingEntry.cleanup?.();
+      }
+
+      this.updateSourceStatus(
+        'screenVideo',
+        true,
+        true,
+        'active',
+        `Sharing Screen Video (${newVideoTrack.label || selectedSourceId}).`,
+        newVideoTrack.id,
+        existingEntry.stream.id,
+        newVideoTrack.label || 'Screen Video'
+      );
+      this.lastStatusBanner = `Switched screen source to ${newVideoTrack.label || selectedSourceId || 'new source'}.`;
+
+      await this.sendSignalFrom(this.session.hostAccountId, {
+        type: 'media-status',
+        activeTracks: this.buildActiveTrackDescriptors(),
+        sourceStatuses: {
+          screenVideo: {
+            status: 'active',
+            message: this.hostMediaState.screenVideo.message,
+          },
+        },
+      });
+    } catch (err) {
+      if (newVideoTrack) {
+        try {
+          newVideoTrack.stop();
+        } catch {
+          // Ignore
+        }
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      this.lastStatusBanner = `Screen Video switch failed (${msg}). Preserving active stream.`;
+    }
+
+    if (!this.closed) {
+      this.emitChange();
+    }
+    return this.getSnapshot();
   }
 
   private async startMicrophoneAudioCapture(): Promise<void> {
@@ -1549,21 +2065,53 @@ export class ApprovedWebRtcSessionController {
 
     if (!this.hostDataChannel) {
       await this.connectAcceptedSession();
+      if (this.closed) return this.getSnapshot();
     }
 
     this.sharingStartedByHost = true;
 
+    if (source === 'screenVideo' && this.hostSenders.has('screenVideo') && options?.selectedSourceId) {
+      return this.switchScreenSource(options.selectedSourceId);
+    }
+
     if (!this.hostSenders.has(source)) {
+      let needsRenegotiation = true;
       if (source === 'screenVideo') {
-        await this.startScreenVideoCapture(options?.selectedSourceId ?? null);
+        needsRenegotiation = await this.startScreenVideoCapture(
+          options?.selectedSourceId ?? null
+        );
       } else if (source === 'microphoneAudio') {
         await this.startMicrophoneAudioCapture();
       } else if (source === 'deviceAudio') {
         await this.startDeviceAudioCapture(Boolean(options?.playWasapiTestTone));
       }
-      await this.renegotiateHostToGuest();
+      if (this.closed) {
+        // Controller was closed while capture was in flight — stop any newly acquired track immediately
+        const leaked = this.hostSenders.get(source);
+        if (leaked) {
+          leaked.track.stop();
+          leaked.cleanup?.();
+          this.hostSenders.delete(source);
+        }
+        return this.getSnapshot();
+      }
+      if (needsRenegotiation) {
+        await this.renegotiateHostToGuest();
+      } else {
+        await this.sendSignalFrom(this.session.hostAccountId, {
+          type: 'media-status',
+          activeTracks: this.buildActiveTrackDescriptors(),
+          sourceStatuses: {
+            [source]: {
+              status: this.hostMediaState[source].status,
+              message: this.hostMediaState[source].message,
+            },
+          },
+        });
+      }
     }
 
+    if (this.closed) return this.getSnapshot();
     this.emitChange();
     return this.getSnapshot();
   }
@@ -1587,10 +2135,20 @@ export class ApprovedWebRtcSessionController {
       if (source === 'microphoneAudio') {
         this.hostMicMutedLocally = false;
       }
-      try {
-        this.pcHost?.removeTrack(entry.sender);
-      } catch {
-        // Ignore if pcHost already closed
+      if (source === 'screenVideo') {
+        // Keep the existing screen-video RTCRtpSender and transceiver intact via replaceTrack(null)
+        // so m-line order and MID never change across stop/start or source switches.
+        try {
+          await entry.sender.replaceTrack(null);
+        } catch {
+          // Ignore if pcHost already closed
+        }
+      } else {
+        try {
+          this.pcHost?.removeTrack(entry.sender);
+        } catch {
+          // Ignore if pcHost already closed
+        }
       }
       entry.track.stop();
       entry.cleanup?.();
@@ -1604,7 +2162,20 @@ export class ApprovedWebRtcSessionController {
       );
       this.lastStatusBanner = `Host A stopped ${source} independently.`;
 
-      await this.renegotiateHostToGuest();
+      if (source === 'screenVideo') {
+        await this.sendSignalFrom(this.session.hostAccountId, {
+          type: 'media-status',
+          activeTracks: this.buildActiveTrackDescriptors(),
+          sourceStatuses: {
+            screenVideo: {
+              status: 'stopped_by_host',
+              message: this.hostMediaState.screenVideo.message,
+            },
+          },
+        });
+      } else {
+        await this.renegotiateHostToGuest();
+      }
     } finally {
       this.stoppingByHost.delete(source);
     }
@@ -1641,10 +2212,18 @@ export class ApprovedWebRtcSessionController {
       this.stoppingByHost.add(source);
       try {
         this.hostSenders.delete(source);
-        try {
-          this.pcHost?.removeTrack(entry.sender);
-        } catch {
-          // Ignore
+        if (source === 'screenVideo') {
+          try {
+            await entry.sender.replaceTrack(null);
+          } catch {
+            // Ignore
+          }
+        } else {
+          try {
+            this.pcHost?.removeTrack(entry.sender);
+          } catch {
+            // Ignore
+          }
         }
         entry.track.stop();
         entry.cleanup?.();
@@ -1666,7 +2245,9 @@ export class ApprovedWebRtcSessionController {
     );
     this.lastStatusBanner = message;
 
-    await this.renegotiateHostToGuest();
+    if (source !== 'screenVideo') {
+      await this.renegotiateHostToGuest();
+    }
     await this.sendSignalFrom(this.session.hostAccountId, {
       type: 'media-status',
       activeTracks: this.buildActiveTrackDescriptors(),
@@ -1738,12 +2319,155 @@ export class ApprovedWebRtcSessionController {
     return msg;
   }
 
+  private sendControlFrame(
+    side: 'host' | 'guest',
+    frame: Record<string, unknown>
+  ): boolean {
+    if (this.closed) return false;
+    const channel =
+      side === 'host' ? this.hostDataChannel : this.guestDataChannel;
+    if (!channel || channel.readyState !== 'open') {
+      return false;
+    }
+    try {
+      channel.send(JSON.stringify(frame));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   public setHostMicrophoneMuted(muted: boolean): WebRtcSessionSnapshot {
     this.hostMicMutedLocally = Boolean(muted);
     const micEntry = this.hostSenders.get('microphoneAudio');
     if (micEntry) {
       micEntry.track.enabled = !this.hostMicMutedLocally;
     }
+    this.emitChange();
+    return this.getSnapshot();
+  }
+
+  public async startViewerMicrophone(): Promise<WebRtcSessionSnapshot> {
+    if (this.closed || !this.pcGuest) return this.getSnapshot();
+    if (this.viewerMicSender && this.viewerMicActive) {
+      return this.getSnapshot();
+    }
+    if (!this.guestDataChannel) {
+      await this.connectAcceptedSession();
+      if (this.closed || !this.pcGuest) return this.getSnapshot();
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (this.closed || !this.pcGuest) {
+        for (const t of stream.getTracks()) t.stop();
+        return this.getSnapshot();
+      }
+      const track = stream.getAudioTracks()[0];
+      if (!track) {
+        throw new Error('No microphone audio track returned.');
+      }
+      const sender = this.pcGuest.addTrack(track, stream);
+      this.viewerMicSender = { track, stream, sender };
+      this.viewerMicActive = true;
+      this.viewerMicStatus = 'active';
+      this.viewerMicRequestPending = false;
+      this.sendControlFrame('guest', {
+        __elmControl: 'viewer-mic-state',
+        sender: 'guest',
+        active: true,
+      });
+      await this.renegotiateGuestToHost();
+      this.emitChange();
+      return this.getSnapshot();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.viewerMicActive = false;
+      this.viewerMicStatus = 'permission_denied';
+      this.viewerMicRequestPending = false;
+      this.lastStatusBanner = `Viewer microphone unavailable (${msg}).`;
+      this.emitChange();
+      return this.getSnapshot();
+    }
+  }
+
+  public async stopViewerMicrophone(): Promise<WebRtcSessionSnapshot> {
+    const entry = this.viewerMicSender;
+    this.viewerMicSender = null;
+    this.viewerMicActive = false;
+    this.viewerMicStatus = 'off';
+    if (entry) {
+      try {
+        this.pcGuest?.removeTrack(entry.sender);
+      } catch {
+        // Ignore if pcGuest already closed
+      }
+      try {
+        entry.track.stop();
+      } catch {
+        // Ignore
+      }
+      this.sendControlFrame('guest', {
+        __elmControl: 'viewer-mic-state',
+        sender: 'guest',
+        active: false,
+      });
+      await this.renegotiateGuestToHost();
+    }
+    this.emitChange();
+    return this.getSnapshot();
+  }
+
+  public async toggleViewerMicrophone(): Promise<WebRtcSessionSnapshot> {
+    if (this.viewerMicActive) {
+      return this.stopViewerMicrophone();
+    }
+    return this.startViewerMicrophone();
+  }
+
+  public requestViewerMicrophone(): boolean {
+    if (this.closed || this.remoteViewerMicActive) return false;
+    const sent = this.sendControlFrame('host', {
+      __elmControl: 'peer-mic-request',
+      sender: 'host',
+    });
+    if (sent) {
+      this.hostViewerMicRequestSent = true;
+      this.emitChange();
+    }
+    return sent;
+  }
+
+  public async respondToViewerMicRequest(
+    accepted: boolean
+  ): Promise<WebRtcSessionSnapshot> {
+    this.viewerMicRequestPending = false;
+    if (!accepted) {
+      this.sendControlFrame('guest', {
+        __elmControl: 'peer-mic-response',
+        sender: 'guest',
+        accepted: false,
+      });
+      this.emitChange();
+      return this.getSnapshot();
+    }
+    this.sendControlFrame('guest', {
+      __elmControl: 'peer-mic-response',
+      sender: 'guest',
+      accepted: true,
+    });
+    return this.startViewerMicrophone();
+  }
+
+  public setHostViewerMicrophoneMuted(muted: boolean): WebRtcSessionSnapshot {
+    this.hostViewerMicMutedLocally = Boolean(muted);
     this.emitChange();
     return this.getSnapshot();
   }
@@ -1878,6 +2602,13 @@ export class ApprovedWebRtcSessionController {
         dcForMeta.maxRetransmits === null,
       sharingStartedByHost: this.sharingStartedByHost,
       hostMicMutedLocally: this.hostMicMutedLocally,
+      viewerMicActive: this.viewerMicActive,
+      viewerMicStatus: this.viewerMicStatus,
+      viewerMicRequestPending: this.viewerMicRequestPending,
+      remoteViewerMicActive: this.remoteViewerMicActive,
+      hostViewerMicMutedLocally: this.hostViewerMicMutedLocally,
+      hostViewerMicRequestSent: this.hostViewerMicRequestSent,
+      hostReceivedViewerMicStream: this.hostReceivedViewerMicStream,
       hostMediaState: { ...this.hostMediaState },
       guestReceivedTracks,
       guestVideoTracksCount,
@@ -2062,6 +2793,9 @@ export class ApprovedWebRtcSessionController {
       }, intervalMs);
     } else if (!enabled && this.diagnosticsPollingActive) {
       this.diagnosticsPollingActive = false;
+    this.settleActiveNegotiation();
+    this.screenVideoSender = null;
+    this.screenVideoStream = null;
       if (this.diagnosticsTimerId) {
         clearInterval(this.diagnosticsTimerId);
         this.diagnosticsTimerId = null;
@@ -2069,7 +2803,16 @@ export class ApprovedWebRtcSessionController {
     }
   }
 
-  private emitChange(): void {
+  private emitChange(forceTeardownEmit = false): void {
+    if (this.suppressPostDestroyEmissions) {
+      return;
+    }
+    if (this.closed) {
+      if (!forceTeardownEmit || this.finalTeardownEmitted) {
+        return;
+      }
+      this.finalTeardownEmitted = true;
+    }
     const snap = this.getSnapshot();
     this.onChange(snap);
   }
@@ -2105,6 +2848,9 @@ export class ApprovedWebRtcSessionController {
       this.diagnosticsTimerId = null;
     }
     this.diagnosticsPollingActive = false;
+    this.settleActiveNegotiation();
+    this.screenVideoSender = null;
+    this.screenVideoStream = null;
 
     // 1. Stop all of Host A's active media capture tracks & native WASAPI helper
     let stoppedCount = 0;
@@ -2122,9 +2868,29 @@ export class ApprovedWebRtcSessionController {
     this.hostSenders.clear();
     void window.elmDesktop.stopWasapiLoopback();
 
-    // 2. Invalidate old session media permissions on Host A
+    // 2. Invalidate old session media permissions on Host A & stop Viewer mic if active
     this.sharingStartedByHost = false;
     this.hostMicMutedLocally = false;
+    if (this.viewerMicSender) {
+      try {
+        this.pcGuest?.removeTrack(this.viewerMicSender.sender);
+      } catch {
+        // Ignore
+      }
+      try {
+        this.viewerMicSender.track.stop();
+      } catch {
+        // Ignore
+      }
+      this.viewerMicSender = null;
+    }
+    this.viewerMicActive = false;
+    this.viewerMicStatus = 'off';
+    this.viewerMicRequestPending = false;
+    this.remoteViewerMicActive = false;
+    this.hostViewerMicMutedLocally = false;
+    this.hostViewerMicRequestSent = false;
+    this.hostReceivedViewerMicStream = null;
     this.permissionsInvalidated = true;
     for (const src of [
       'screenVideo',
@@ -2218,8 +2984,28 @@ export class ApprovedWebRtcSessionController {
     } else {
       this.lastStatusBanner = `Session ended (${reason} / ${subReason}). All tracks stopped, viewer cleared, and permissions invalidated. Send a fresh invite to connect again.`;
     }
-    this.emitChange();
+    this.emitChange(true);
     return { receipt, isFirstCall: true };
+  }
+
+  /**
+   * Local-only cleanup path used when the server has already ended the session
+   * (e.g., 409 SESSION_ALREADY_ENDED) or when React unmounts/replaces a controller.
+   * Releases all local media tracks, PeerConnections, DataChannels, and timers
+   * WITHOUT sending POST /sessions/disconnect to the backend.
+   */
+  public destroyLocalOnly(
+    reason: SessionTerminationReason = 'connection_lost',
+    subReason: string = 'local_cleanup',
+    options?: { readonly silent?: boolean }
+  ): SessionTeardownReceipt {
+    if (options?.silent) {
+      this.suppressPostDestroyEmissions = true;
+    }
+    const { receipt } = this.performLocalTeardownOnce(reason, {
+      subReason,
+    });
+    return receipt;
   }
 
   /**
@@ -2246,7 +3032,10 @@ export class ApprovedWebRtcSessionController {
       reason: receipt.reason,
       subReason: receipt.subReason,
       callerAccountId:
-        options?.initiatedByAccountId ?? this.session.hostAccountId,
+        options?.initiatedByAccountId ??
+        (this.localRole === 'guest'
+          ? this.session.guestAccountId
+          : this.session.hostAccountId),
       detectionTimeMs: receipt.detectionTimeMs,
     });
 
