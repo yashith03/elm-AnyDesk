@@ -198,6 +198,9 @@ export class ApprovedWebRtcSessionController {
     timerId: ReturnType<typeof setTimeout>;
   } | null = null;
   private closed = false;
+  private preOpenIceRestartAttempted = false;
+  private iceRestartInProgress = false;
+  private iceRestartTimerId: ReturnType<typeof setTimeout> | null = null;
 
   private sharingStartedByHost = false;
   private hostMicMutedLocally = false;
@@ -514,6 +517,7 @@ export class ApprovedWebRtcSessionController {
 
     const rtcConfig: RTCConfiguration = {
       iceServers: STUN_ICE_SERVERS.map((s) => ({ urls: s.urls })),
+      iceCandidatePoolSize: 2,
     };
 
     this.mode = options?.mode ?? 'loopback';
@@ -568,6 +572,24 @@ export class ApprovedWebRtcSessionController {
             ? this.guestDataChannel
             : this.hostDataChannel;
         if (activeDc?.readyState !== 'open') {
+          if (this.iceRestartInProgress) {
+            this.emitChange();
+            return;
+          }
+          if (!this.preOpenIceRestartAttempted) {
+            this.preOpenIceRestartAttempted = true;
+            this.iceRestartInProgress = true;
+            this.emitChange();
+            this.iceRestartTimerId = setTimeout(() => {
+              this.iceRestartTimerId = null;
+              if (this.closed) {
+                this.iceRestartInProgress = false;
+                return;
+              }
+              void this.performControlledPreOpenIceRestart();
+            }, 250);
+            return;
+          }
           void this.reportRestrictiveNetworkDirectConnectionFailure(
             `ICE=${hostIce}/${guestIce}, PC=${hostConn}/${guestConn}`
           );
@@ -1229,12 +1251,69 @@ export class ApprovedWebRtcSessionController {
     );
   }
 
+  private async performControlledPreOpenIceRestart(): Promise<void> {
+    try {
+      if (this.closed) return;
+      if (this.mode === 'remote' && this.localRole === 'guest') {
+        if (this.pcGuest && typeof this.pcGuest.restartIce === 'function') {
+          this.pcGuest.restartIce();
+        }
+        await this.renegotiateGuestToHost({ iceRestart: true });
+      } else {
+        if (this.pcHost && typeof this.pcHost.restartIce === 'function') {
+          this.pcHost.restartIce();
+        }
+        await this.renegotiateHostToGuest({ iceRestart: true });
+      }
+    } catch {
+      // Fall through to post-restart health check in finally.
+    } finally {
+      this.iceRestartInProgress = false;
+      if (!this.closed) {
+        const hostConn = this.pcHost?.connectionState ?? 'new';
+        const guestConn = this.pcGuest?.connectionState ?? 'new';
+        const hostIce = this.pcHost?.iceConnectionState ?? 'new';
+        const guestIce = this.pcGuest?.iceConnectionState ?? 'new';
+        const activeDc =
+          this.mode === 'remote' && this.localRole === 'guest'
+            ? this.guestDataChannel
+            : this.hostDataChannel;
+        if (
+          activeDc?.readyState !== 'open' &&
+          (hostConn === 'failed' ||
+            guestConn === 'failed' ||
+            hostIce === 'failed' ||
+            guestIce === 'failed')
+        ) {
+          void this.reportRestrictiveNetworkDirectConnectionFailure(
+            `ICE=${hostIce}/${guestIce}, PC=${hostConn}/${guestConn} (after ICE restart)`
+          );
+        }
+      }
+    }
+  }
+
   private handleAuthoritativeRemoteSessionEnded(message?: string): void {
     if (this.closed) return;
-    const summary =
-      message && message.trim().length > 0
-        ? message.trim()
-        : 'Session ended on server. Permissions invalidated — send a fresh invite to connect again.';
+    const raw = (message ?? '').toLowerCase();
+    let summary: string;
+    if (
+      raw.includes('user_top_bar_disconnect') ||
+      raw.includes('user_ended') ||
+      raw.includes('declined')
+    ) {
+      summary =
+        'The other participant ended the session. All media and chat have been cleared. Send a fresh invite to connect again.';
+    } else if (raw.includes('connection_lost')) {
+      summary =
+        'Connection lost — peer disconnected or network connectivity dropped. All media and chat have been cleared. Send a fresh invite to connect again.';
+    } else if (raw.includes('app_closed')) {
+      summary =
+        'The other participant closed Elm-AnyDesk. All media and chat have been cleared. Send a fresh invite to connect again.';
+    } else {
+      summary =
+        'Session ended on the server. All media and chat have been cleared. Send a fresh invite to connect again.';
+    }
     this.destroyLocalOnly('connection_lost', 'session_already_ended_on_server');
     this.onSessionEndedRemotely?.({
       sessionId: this.session.sessionId,
@@ -1504,7 +1583,9 @@ export class ApprovedWebRtcSessionController {
     }
   }
 
-  private async renegotiateHostToGuest(): Promise<void> {
+  private async renegotiateHostToGuest(options?: {
+    readonly iceRestart?: boolean;
+  }): Promise<void> {
     const run = async () => {
       if (this.closed || !this.pcHost) return;
       if (this.pcHost.signalingState !== 'stable') {
@@ -1526,7 +1607,9 @@ export class ApprovedWebRtcSessionController {
       this.latestAdvertisedTracks = activeTracks;
       const negotiationId = crypto.randomUUID();
 
-      const offer = await this.pcHost.createOffer();
+      const offer = await this.pcHost.createOffer(
+        options?.iceRestart ? { iceRestart: true } : undefined
+      );
       if (this.closed || !this.pcHost) return;
 
       const waitForAnswer = new Promise<void>((resolve) => {
@@ -1585,7 +1668,9 @@ export class ApprovedWebRtcSessionController {
    * permission is denied or a combination is unsupported, a specific status is shown,
    * no fallback source or video is substituted, and other approved features keep working.
    */
-  private async renegotiateGuestToHost(): Promise<void> {
+  private async renegotiateGuestToHost(options?: {
+    readonly iceRestart?: boolean;
+  }): Promise<void> {
     const run = async () => {
       if (this.closed || !this.pcGuest) return;
       if (this.pcGuest.signalingState !== 'stable') {
@@ -1601,7 +1686,9 @@ export class ApprovedWebRtcSessionController {
       if (this.closed || !this.pcGuest) return;
 
       const negotiationId = crypto.randomUUID();
-      const offer = await this.pcGuest.createOffer();
+      const offer = await this.pcGuest.createOffer(
+        options?.iceRestart ? { iceRestart: true } : undefined
+      );
       if (this.closed || !this.pcGuest) return;
       await this.pcGuest.setLocalDescription(offer);
       if (this.closed || !this.pcGuest) return;
@@ -2400,10 +2487,14 @@ export class ApprovedWebRtcSessionController {
 
   /**
    * Automatically activates approved audio sources (microphoneAudio and deviceAudio)
-   * once per accepted session on the Host, batching them into a single WebRTC
-   * renegotiation. Screen Video remains strictly manual until the Host clicks Start Sharing.
+   * and, when an explicit screen source was authorized by the Host before session start,
+   * screenVideo — batching all initial tracks into a single WebRTC renegotiation.
+   * If screenVideo is approved without an explicit source, it stays manual until the Host
+   * selects a source and clicks Start Sharing.
    */
-  public async startApprovedInitialAudio(): Promise<WebRtcSessionSnapshot> {
+  public async startApprovedInitialMedia(options?: {
+    explicitScreenSourceId?: string | null;
+  }): Promise<WebRtcSessionSnapshot> {
     if (
       this.closed ||
       this.localRole !== 'host' ||
@@ -2413,9 +2504,13 @@ export class ApprovedWebRtcSessionController {
     }
     this.initialApprovedAudioStarted = true;
 
+    const wantScreen = Boolean(
+      this.session.hostMediaSelection.screenVideo &&
+        options?.explicitScreenSourceId
+    );
     const wantMic = Boolean(this.session.hostMediaSelection.microphoneAudio);
     const wantDeviceSound = Boolean(this.session.hostMediaSelection.deviceAudio);
-    if (!wantMic && !wantDeviceSound) {
+    if (!wantScreen && !wantMic && !wantDeviceSound) {
       return this.getSnapshot();
     }
 
@@ -2425,6 +2520,15 @@ export class ApprovedWebRtcSessionController {
     }
 
     this.sharingStartedByHost = true;
+
+    if (
+      wantScreen &&
+      options?.explicitScreenSourceId &&
+      !this.hostSenders.has('screenVideo')
+    ) {
+      await this.startScreenVideoCapture(options.explicitScreenSourceId);
+      if (this.closed) return this.getSnapshot();
+    }
 
     if (wantMic && !this.hostSenders.has('microphoneAudio')) {
       await this.startMicrophoneAudioCapture();
@@ -2436,11 +2540,12 @@ export class ApprovedWebRtcSessionController {
       if (this.closed) return this.getSnapshot();
     }
 
-    const hasNewAudioSender =
+    const hasNewSender =
+      (wantScreen && this.hostSenders.has('screenVideo')) ||
       (wantMic && this.hostSenders.has('microphoneAudio')) ||
       (wantDeviceSound && this.hostSenders.has('deviceAudio'));
 
-    if (hasNewAudioSender) {
+    if (hasNewSender) {
       await this.renegotiateHostToGuest();
     } else {
       const sourceStatuses: Partial<
@@ -2449,6 +2554,12 @@ export class ApprovedWebRtcSessionController {
           { readonly status: MediaSourceStatusKind; readonly message: string }
         >
       > = {};
+      if (wantScreen) {
+        sourceStatuses.screenVideo = {
+          status: this.hostMediaState.screenVideo.status,
+          message: this.hostMediaState.screenVideo.message,
+        };
+      }
       if (wantMic) {
         sourceStatuses.microphoneAudio = {
           status: this.hostMediaState.microphoneAudio.status,
@@ -2471,6 +2582,10 @@ export class ApprovedWebRtcSessionController {
     if (this.closed) return this.getSnapshot();
     this.emitChange();
     return this.getSnapshot();
+  }
+
+  public async startApprovedInitialAudio(): Promise<WebRtcSessionSnapshot> {
+    return this.startApprovedInitialMedia();
   }
 
   /**
@@ -3291,6 +3406,11 @@ export class ApprovedWebRtcSessionController {
     this.onGuestViewerCleared?.();
 
     // 4. Close both chat DataChannels and both WebRTC PeerConnections
+    if (this.iceRestartTimerId !== null) {
+      clearTimeout(this.iceRestartTimerId);
+      this.iceRestartTimerId = null;
+    }
+    this.iceRestartInProgress = false;
     if (this.signalPollTimerId !== null) {
       clearInterval(this.signalPollTimerId);
       this.signalPollTimerId = null;

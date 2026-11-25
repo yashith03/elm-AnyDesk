@@ -141,6 +141,8 @@ class FakeDataChannel {
 }
 
 class FakeRTCPeerConnection {
+  static instances: FakeRTCPeerConnection[] = [];
+  config: RTCConfiguration | undefined;
   connectionState: string = 'new';
   iceConnectionState: string = 'new';
   signalingState: string = 'stable';
@@ -153,12 +155,22 @@ class FakeRTCPeerConnection {
   ontrack: ((ev: unknown) => void) | null = null;
   closed = false;
   channels: FakeDataChannel[] = [];
+  restartIceCalls = 0;
+  createOfferCalls: Array<RTCOfferOptions | undefined> = [];
+  constructor(config?: RTCConfiguration) {
+    this.config = config;
+    FakeRTCPeerConnection.instances.push(this);
+  }
   createDataChannel(label: string) {
     const ch = new FakeDataChannel(label);
     this.channels.push(ch);
     return ch;
   }
-  async createOffer() {
+  restartIce() {
+    this.restartIceCalls += 1;
+  }
+  async createOffer(options?: RTCOfferOptions) {
+    this.createOfferCalls.push(options);
     return { type: 'offer', sdp: 'v=0\r\nfake-offer\r\n' };
   }
   async createAnswer() {
@@ -980,5 +992,288 @@ test('Phase 8E/8F & Phase 7: Missing snapshot on POST /invites and POST /session
   } finally {
     controller.stopPresenceHeartbeat();
     server.close();
+  }
+});
+
+test('Pre-open ICE failure attempts one controlled ICE restart and recovers without teardown', async () => {
+  FakeRTCPeerConnection.instances = [];
+  let disconnectCalls = 0;
+  let seqCounter = 0;
+  const pendingSignals: Array<{
+    seq: number;
+    senderAccountId: string;
+    payload: { type: string; sdp?: string; negotiationId?: string };
+  }> = [];
+
+  const restore = installFakeBrowserGlobals({
+    sendSessionSignal: async (input: {
+      senderAccountId?: string;
+      payload: { type: string; negotiationId?: string };
+    }) => {
+      if (input.payload.type === 'offer') {
+        seqCounter += 1;
+        pendingSignals.push({
+          seq: seqCounter,
+          senderAccountId: 'acct-guest',
+          payload: {
+            type: 'answer',
+            sdp: 'v=0\r\nfake-answer\r\n',
+            negotiationId: input.payload.negotiationId,
+          },
+        });
+      }
+      return { ok: true, status: 200, data: { admitted: true } };
+    },
+    pollSessionSignals: async (input: { afterSeq: number }) => {
+      const signals = pendingSignals.filter((s) => s.seq > input.afterSeq);
+      return { ok: true, status: 200, data: { signals } };
+    },
+    disconnectActiveSession: async () => {
+      disconnectCalls += 1;
+      return { ok: true, status: 200, data: { disconnected: true, alreadyEnded: false } };
+    },
+  });
+
+  try {
+    const ctrl = new ApprovedWebRtcSessionController(
+      makeSession('sess-ice-recover'),
+      () => {},
+      { mode: 'remote', localRole: 'host', enableBackgroundLivenessTimer: false }
+    );
+    const pcHost = FakeRTCPeerConnection.instances[0];
+    assert.ok(pcHost);
+    assert.equal(pcHost.config?.iceCandidatePoolSize, 2);
+
+    // Connect initially (poll delivers answer)
+    const connectPromise = ctrl.connectAcceptedSession();
+    await new Promise((r) => setTimeout(r, 80));
+    await (ctrl as unknown as { pumpSignalsOnce: () => Promise<void> }).pumpSignalsOnce();
+    await connectPromise;
+
+    // Simulate pre-open ICE failure before DataChannel opens
+    pcHost.iceConnectionState = 'failed';
+    pcHost.oniceconnectionstatechange?.();
+
+    // Wait for 250ms controlled ICE restart timer to fire; while negotiating, simulate ICE recovering
+    await new Promise((r) => setTimeout(r, 150));
+    const origCreateOffer = pcHost.createOffer.bind(pcHost);
+    pcHost.createOffer = async (options?: RTCOfferOptions) => {
+      if (options?.iceRestart) {
+        pcHost.iceConnectionState = 'connected';
+        pcHost.connectionState = 'connected';
+      }
+      return origCreateOffer(options);
+    };
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.equal(pcHost.restartIceCalls, 1, 'Must attempt exactly one controlled ICE restart');
+    assert.ok(
+      pcHost.createOfferCalls.some((opt) => opt?.iceRestart === true),
+      'Must create an offer with { iceRestart: true }'
+    );
+    assert.equal(disconnectCalls, 0, 'Recovered ICE restart must not terminate session');
+    assert.notEqual(ctrl.getSnapshot().connectionState, 'closed');
+    ctrl.destroyLocalOnly('user_top_bar_disconnect', 'test_cleanup', { silent: true });
+  } finally {
+    restore();
+  }
+});
+
+test('Pre-open ICE failure after one ICE restart terminates session cleanly', async () => {
+  FakeRTCPeerConnection.instances = [];
+  let disconnectReason: string | null = null;
+  let disconnectSubReason: string | null = null;
+
+  const restore = installFakeBrowserGlobals({
+    sendSessionSignal: async () => ({ ok: true, status: 200, data: { admitted: true } }),
+    pollSessionSignals: async () => ({ ok: true, status: 200, data: { signals: [] } }),
+    disconnectActiveSession: async (input: { reason: string; subReason?: string }) => {
+      disconnectReason = input.reason;
+      disconnectSubReason = input.subReason ?? null;
+      return { ok: true, status: 200, data: { disconnected: true, alreadyEnded: false } };
+    },
+  });
+
+  try {
+    const ctrl = new ApprovedWebRtcSessionController(
+      makeSession('sess-ice-fail-twice'),
+      () => {},
+      { mode: 'remote', localRole: 'host', enableBackgroundLivenessTimer: false }
+    );
+    const pcHost = FakeRTCPeerConnection.instances[0];
+    assert.ok(pcHost);
+
+    // First pre-open ICE failure schedules 250ms ICE restart
+    pcHost.iceConnectionState = 'failed';
+    pcHost.oniceconnectionstatechange?.();
+
+    // Wait for restart timer + 10s? No, trigger settle or simulate second failure after restart starts
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(pcHost.restartIceCalls, 1);
+
+    // Settle active negotiation so performControlledPreOpenIceRestart finishes while ICE is still failed
+    const activeNeg = (ctrl as unknown as { activeNegotiation: { id: string } | null }).activeNegotiation;
+    if (activeNeg) {
+      (ctrl as unknown as { settleActiveNegotiation: (id: string) => void }).settleActiveNegotiation(activeNeg.id);
+    }
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(disconnectReason, 'connection_lost');
+    assert.equal(
+      disconnectSubReason,
+      'restrictive_network_stun_only_direct_connection_failed'
+    );
+    assert.equal(ctrl.getSnapshot().connectionState, 'closed');
+  } finally {
+    restore();
+  }
+});
+
+test('Concurrent renegotiation and ICE restart are serialized without offer collisions', async () => {
+  FakeRTCPeerConnection.instances = [];
+  let inFlightCreateOffer = 0;
+  let maxConcurrentOffers = 0;
+  let seqCounter = 0;
+  const pendingSignals: Array<{
+    seq: number;
+    senderAccountId: string;
+    payload: { type: string; sdp?: string; negotiationId?: string };
+  }> = [];
+
+  const restore = installFakeBrowserGlobals({
+    sendSessionSignal: async (input: {
+      payload: { type: string; negotiationId?: string };
+    }) => {
+      if (input.payload.type === 'offer') {
+        seqCounter += 1;
+        pendingSignals.push({
+          seq: seqCounter,
+          senderAccountId: 'acct-guest',
+          payload: {
+            type: 'answer',
+            sdp: 'v=0\r\nfake-answer\r\n',
+            negotiationId: input.payload.negotiationId,
+          },
+        });
+      }
+      return { ok: true, status: 200, data: { admitted: true } };
+    },
+    pollSessionSignals: async (input: { afterSeq: number }) => {
+      const signals = pendingSignals.filter((s) => s.seq > input.afterSeq);
+      return { ok: true, status: 200, data: { signals } };
+    },
+  });
+
+  try {
+    const ctrl = new ApprovedWebRtcSessionController(
+      makeSession('sess-serialize'),
+      () => {},
+      { mode: 'remote', localRole: 'host', enableBackgroundLivenessTimer: false }
+    );
+    const pcHost = FakeRTCPeerConnection.instances[0];
+    assert.ok(pcHost);
+    const origCreateOffer = pcHost.createOffer.bind(pcHost);
+    pcHost.createOffer = async (options?: RTCOfferOptions) => {
+      inFlightCreateOffer += 1;
+      maxConcurrentOffers = Math.max(maxConcurrentOffers, inFlightCreateOffer);
+      await new Promise((r) => setTimeout(r, 20));
+      const res = await origCreateOffer(options);
+      inFlightCreateOffer -= 1;
+      return res;
+    };
+
+    const p1 = (ctrl as unknown as { renegotiateHostToGuest: () => Promise<void> }).renegotiateHostToGuest();
+    const p2 = (ctrl as unknown as { renegotiateHostToGuest: (o?: { iceRestart?: boolean }) => Promise<void> }).renegotiateHostToGuest({ iceRestart: true });
+
+    // Pump answers for both serialized negotiations
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      await (ctrl as unknown as { pumpSignalsOnce: () => Promise<void> }).pumpSignalsOnce();
+    }
+    await Promise.all([p1, p2]);
+
+    assert.equal(maxConcurrentOffers, 1, 'Negotiations must be strictly serialized');
+    assert.equal(pcHost.createOfferCalls.length, 2);
+    assert.equal(pcHost.createOfferCalls[1]?.iceRestart, true);
+    ctrl.destroyLocalOnly('user_top_bar_disconnect', 'test_cleanup', { silent: true });
+  } finally {
+    restore();
+  }
+});
+
+test('409 SESSION_ALREADY_ENDED maps to clear user-facing disconnect vs connection-loss messages', async () => {
+  for (const tc of [
+    {
+      serverMsg: 'Stale session event rejected: session s1 has already ended (user_top_bar_disconnect) at 2026-11-26T00:00:00Z',
+      expectedSubstr: 'The other participant ended the session',
+    },
+    {
+      serverMsg: 'Stale session event rejected: session s1 has already ended (connection_lost) at 2026-11-26T00:00:00Z',
+      expectedSubstr: 'Connection lost',
+    },
+  ]) {
+    FakeRTCPeerConnection.instances = [];
+    let endedMsg: string | null = null;
+    const restore = installFakeBrowserGlobals({
+      sendSessionSignal: async () => ({
+        ok: false,
+        status: 409,
+        errorCode: 'SESSION_ALREADY_ENDED',
+        errorMessage: tc.serverMsg,
+      }),
+    });
+    try {
+      const ctrl = new ApprovedWebRtcSessionController(
+        makeSession('sess-409-msg'),
+        () => {},
+        {
+          mode: 'remote',
+          localRole: 'host',
+          enableBackgroundLivenessTimer: false,
+          onSessionEndedRemotely: (ev) => {
+            endedMsg = ev.message;
+          },
+        }
+      );
+      await ctrl.connectAcceptedSession();
+      assert.ok(endedMsg, 'onSessionEndedRemotely must fire');
+      assert.ok((endedMsg as string).includes(tc.expectedSubstr));
+      assert.ok(!(endedMsg as string).includes('Stale session event rejected'));
+    } finally {
+      restore();
+    }
+  }
+});
+
+test('Rapid reconnect cancels pending ICE restart timer cleanly on teardown', async () => {
+  FakeRTCPeerConnection.instances = [];
+  let disconnectCalls = 0;
+  const restore = installFakeBrowserGlobals({
+    disconnectActiveSession: async () => {
+      disconnectCalls += 1;
+      return { ok: true, status: 200, data: { disconnected: true, alreadyEnded: false } };
+    },
+  });
+
+  try {
+    const ctrl = new ApprovedWebRtcSessionController(
+      makeSession('sess-rapid-teardown'),
+      () => {},
+      { mode: 'remote', localRole: 'host', enableBackgroundLivenessTimer: false }
+    );
+    const pcHost = FakeRTCPeerConnection.instances[0];
+    assert.ok(pcHost);
+
+    pcHost.iceConnectionState = 'failed';
+    pcHost.oniceconnectionstatechange?.();
+
+    // Destroy immediately before the 250ms ICE restart timer fires
+    ctrl.destroyLocalOnly('user_top_bar_disconnect', 'rapid_reconnect', { silent: true });
+    await new Promise((r) => setTimeout(r, 320));
+
+    assert.equal(pcHost.restartIceCalls, 0, 'Cancelled timer must not trigger restartIce after teardown');
+    assert.equal(disconnectCalls, 0, 'destroyLocalOnly must not send server disconnect');
+  } finally {
+    restore();
   }
 });

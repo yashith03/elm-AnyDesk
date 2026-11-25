@@ -204,14 +204,35 @@ export function App(): React.ReactElement {
     microphoneAudio: false,
     deviceAudio: false,
   });
+  const [preAcceptScreenSourceId, setPreAcceptScreenSourceId] = useState<
+    string | null
+  >(null);
+  const [inviteHostScreenSourceId, setInviteHostScreenSourceId] = useState<
+    string | null
+  >(null);
+  const pendingExplicitScreenSourceByInviteIdRef = useRef<Map<string, string>>(
+    new Map()
+  );
   const activeIncomingInviteId = snapshot?.incomingInvites[0]?.inviteId ?? null;
+  const activeIncomingInviteIntent =
+    snapshot?.incomingInvites[0]?.intent ?? 'connect';
   useEffect(() => {
     setPreAcceptMedia({
       screenVideo: false,
       microphoneAudio: false,
       deviceAudio: false,
     });
-  }, [activeIncomingInviteId]);
+    setPreAcceptScreenSourceId(null);
+    if (activeIncomingInviteId && activeIncomingInviteIntent !== 'invite') {
+      void window.elmDesktop.listShareableSources().then(setShareableSources);
+    }
+  }, [activeIncomingInviteId, activeIncomingInviteIntent]);
+  useEffect(() => {
+    if (inviteDialogOpen) {
+      setInviteHostScreenSourceId(null);
+      void window.elmDesktop.listShareableSources().then(setShareableSources);
+    }
+  }, [inviteDialogOpen]);
 
   // Shareable Windows & Displays for Host A
   const [shareableSources, setShareableSources] = useState<
@@ -981,31 +1002,63 @@ export function App(): React.ReactElement {
       };
     };
 
-    // Automatically load shareable sources so Host A can pick one before clicking Start Sharing
-    void window.elmDesktop.listShareableSources().then((sources) => {
+    // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance,
+    // then automatically activate approved audio sources (and Screen Video ONLY if the Host
+    // explicitly selected a valid source before session start). Otherwise, prompt Host confirmation.
+    let cancelled = false;
+    void (async () => {
+      const sources = await window.elmDesktop.listShareableSources();
+      if (cancelled || webrtcControllerRef.current !== controller) {
+        return;
+      }
       setShareableSources(sources);
+
+      const rawExplicitSourceId =
+        pendingExplicitScreenSourceByInviteIdRef.current.get(
+          currentSession.inviteId
+        ) ?? null;
+      pendingExplicitScreenSourceByInviteIdRef.current.delete(
+        currentSession.inviteId
+      );
+      const validExplicitSourceId =
+        currentSession.hostMediaSelection.screenVideo &&
+        rawExplicitSourceId &&
+        sources.some((s) => s.id === rawExplicitSourceId)
+          ? rawExplicitSourceId
+          : null;
+
       setSelectedSourceId((prev) => {
+        if (validExplicitSourceId) return validExplicitSourceId;
         if (sources.length === 0) return null;
         if (prev && sources.some((s) => s.id === prev)) return prev;
         return sources[0].id;
       });
-    });
 
-    // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance,
-    // then automatically activate any approved audio sources (Mic / Device Sound) on the Host.
-    // Screen Video remains strictly manual until Host clicks Start Sharing.
-    let cancelled = false;
-    void (async () => {
       await controller.connectAcceptedSession();
       if (cancelled || webrtcControllerRef.current !== controller) {
         return;
       }
-      if (
-        localRole === 'host' &&
-        (currentSession.hostMediaSelection.microphoneAudio ||
-          currentSession.hostMediaSelection.deviceAudio)
-      ) {
-        await controller.startApprovedInitialAudio();
+      if (localRole === 'host') {
+        if (
+          validExplicitSourceId ||
+          currentSession.hostMediaSelection.microphoneAudio ||
+          currentSession.hostMediaSelection.deviceAudio
+        ) {
+          await controller.startApprovedInitialMedia({
+            explicitScreenSourceId: validExplicitSourceId,
+          });
+        }
+        if (
+          !cancelled &&
+          webrtcControllerRef.current === controller &&
+          currentSession.hostMediaSelection.screenVideo &&
+          !validExplicitSourceId
+        ) {
+          showToast(
+            'Screen sharing approved — choose a display or window to start sharing.'
+          );
+          void window.elmDesktop.toggleHostSourcePickerPopup(true);
+        }
       }
     })();
 
@@ -2031,6 +2084,12 @@ export function App(): React.ReactElement {
         setErrorMessage(res.errorMessage ?? 'Could not send invite.');
         return;
       }
+      if (res.data.invite && params.intent === 'invite' && params.hostMediaSelection?.screenVideo && inviteHostScreenSourceId) {
+        pendingExplicitScreenSourceByInviteIdRef.current.set(
+          res.data.invite.inviteId,
+          inviteHostScreenSourceId
+        );
+      }
       if (isValidPresenceSnapshot(res.data.snapshot)) {
         applyAuthoritativeSnapshot(res.data.snapshot);
       } else if (res.data.invite) {
@@ -2132,6 +2191,17 @@ export function App(): React.ReactElement {
     action: 'accept' | 'decline'
   ) => {
     clearAlerts();
+    if (
+      action === 'accept' &&
+      invite.intent !== 'invite' &&
+      preAcceptMedia.screenVideo &&
+      preAcceptScreenSourceId
+    ) {
+      pendingExplicitScreenSourceByInviteIdRef.current.set(
+        invite.inviteId,
+        preAcceptScreenSourceId
+      );
+    }
     const res = await window.elmDesktop.respondToInvite({
       inviteId: invite.inviteId,
       action,
@@ -2193,7 +2263,9 @@ export function App(): React.ReactElement {
       snapshot?.activeSession?.sessionId ??
       volatileChatState?.session?.sessionId;
 
+    let hadController = false;
     if (webrtcControllerRef.current) {
+      hadController = true;
       await webrtcControllerRef.current.executeIdempotentTeardown(
         'user_top_bar_disconnect',
         {
@@ -2211,6 +2283,20 @@ export function App(): React.ReactElement {
     setFloatingChatOpen(false);
     setFloatingSettingsOpen(false);
     setWebrtcSnap(null);
+
+    if (hadController) {
+      snapshotEpochRef.current += 1;
+      setSnapshot((prev) => (prev ? { ...prev, activeSession: null } : prev));
+      const snapRes = await window.elmDesktop.getPresenceSnapshot();
+      if (snapRes.ok && snapRes.data && isValidPresenceSnapshot(snapRes.data)) {
+        applyAuthoritativeSnapshot(snapRes.data);
+      }
+      setStatusMessage(
+        'Session ended. All media and permissions have been cleared. Send a fresh invite to connect again.'
+      );
+      return;
+    }
+
     const res = await window.elmDesktop.disconnectActiveSession({
       sessionId: targetSessionId,
       reason: 'user_top_bar_disconnect',
@@ -4235,6 +4321,37 @@ export function App(): React.ReactElement {
                   </div>
                 )}
 
+                {!isReverseInvite && preAcceptMedia.screenVideo && (
+                  <div className="field-row" style={{ marginTop: '10px' }}>
+                    <label
+                      htmlFor="pre-accept-screen-source-select"
+                      className="muted"
+                      style={{ fontSize: '0.82rem' }}
+                    >
+                      Screen / Window to share on connect (optional)
+                    </label>
+                    <select
+                      id="pre-accept-screen-source-select"
+                      data-testid="pre-accept-screen-source-select"
+                      className="text-input"
+                      value={preAcceptScreenSourceId ?? ''}
+                      onChange={(e) =>
+                        setPreAcceptScreenSourceId(e.target.value || null)
+                      }
+                    >
+                      <option value="">
+                        Ask me after connecting (do not auto-share)
+                      </option>
+                      {shareableSources.map((src) => (
+                        <option key={src.id} value={src.id}>
+                          {src.surfaceType === 'display' ? '[Display] ' : '[Window] '}
+                          {src.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
                 <div className="actions-row" style={{ marginTop: '14px' }}>
                   <button
                     type="button"
@@ -4533,6 +4650,39 @@ export function App(): React.ReactElement {
                         </span>
                       </label>
                     </div>
+
+                    {inviteHostMedia.screenVideo && (
+                      <div className="field-row" style={{ marginTop: '10px' }}>
+                        <label
+                          htmlFor="invite-screen-source-select"
+                          className="muted"
+                          style={{ fontSize: '0.82rem' }}
+                        >
+                          Screen / Window to share on accept (optional)
+                        </label>
+                        <select
+                          id="invite-screen-source-select"
+                          data-testid="invite-screen-source-select"
+                          className="text-input"
+                          value={inviteHostScreenSourceId ?? ''}
+                          onChange={(e) =>
+                            setInviteHostScreenSourceId(e.target.value || null)
+                          }
+                        >
+                          <option value="">
+                            Ask me after connecting (do not auto-share)
+                          </option>
+                          {shareableSources.map((src) => (
+                            <option key={src.id} value={src.id}>
+                              {src.surfaceType === 'display'
+                                ? '[Display] '
+                                : '[Window] '}
+                              {src.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
                     <div className="actions-row" style={{ marginTop: '12px' }}>
                       <button

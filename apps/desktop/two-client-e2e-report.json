@@ -1,32 +1,32 @@
 {
-  "timestamp": "2026-11-25T20:57:44.889Z",
-  "backendUrl": "http://127.0.0.1:63485",
+  "timestamp": "2026-11-25T21:21:02.166Z",
+  "backendUrl": "http://127.0.0.1:59456",
   "clientLogs": {
-    "clientA": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795640172090-5mvtlt\\client-a.log",
-    "clientB": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795640172090-5mvtlt\\client-b.log"
+    "clientA": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795641556990-rc4fay\\client-a.log",
+    "clientB": "C:\\Users\\user\\AppData\\Local\\Temp\\elm-two-clients-logs\\1795641556990-rc4fay\\client-b.log"
   },
   "passed": true,
   "results": {
     "registration_and_presence": {
       "status": "PASSED",
       "details": {
-        "pidA": 28532,
-        "pidB": 32608,
-        "codeA": "ELM-QXYJ-25CX",
-        "codeB": "ELM-EJ5K-YXE6"
+        "pidA": 30440,
+        "pidB": 32144,
+        "codeA": "ELM-DDYQ-XU97",
+        "codeB": "ELM-PRH3-VUBE"
       }
     },
     "send_and_receive_request": {
       "status": "PASSED",
       "details": {
         "waitingCountdown": "02:00",
-        "incomingRequesterCode": "ELM-QXYJ-25CX"
+        "incomingRequesterCode": "ELM-DDYQ-XU97"
       }
     },
     "accept_and_webrtc_connect": {
       "status": "PASSED",
       "details": {
-        "sessionId": "deba93b6-50cd-4c9e-9248-22b0064124a0",
+        "sessionId": "802fa2cc-87d9-4043-b022-addbfad76e03",
         "roleA": "guest",
         "roleB": "host",
         "connectionStateA": "connected",
@@ -117,12 +117,12 @@
         "sharingStartedByHost": true,
         "hostCaptureWidth": 1920,
         "hostCaptureHeight": 1080,
-        "hostCaptureFps": 1,
-        "hostOutboundFramesSent": 1,
+        "hostCaptureFps": 3,
+        "hostOutboundFramesSent": 4,
         "guestDecodedWidth": 1920,
         "guestDecodedHeight": 1080,
-        "guestInboundFramesDecoded": 1,
-        "guestInboundBytesReceived": 55326,
+        "guestInboundFramesDecoded": 3,
+        "guestInboundBytesReceived": 116763,
         "guestVideoTracksCount": 1,
         "nonBlankFrame": {
           "width": 1920,
@@ -146,7 +146,7 @@
             "hostToolbar": 17
           }
         },
-        "rttMs": 0
+        "rttMs": 1
       }
     },
     "source_switching_10x_b_to_a": {
@@ -260,7 +260,7 @@
     "session_stability_60s": {
       "status": "PASSED",
       "details": {
-        "sessionId": "deba93b6-50cd-4c9e-9248-22b0064124a0",
+        "sessionId": "802fa2cc-87d9-4043-b022-addbfad76e03",
         "holdSeconds": 60,
         "samples": [
           {
@@ -290,13 +290,13 @@
       "status": "PASSED",
       "details": {
         "cardOnA": {
-          "text": "☆Test Friend BOnlineELM-EJ5K-YXE6friend.b@example.com+1 555-0202ConnectInvite⋮",
+          "text": "☆Test Friend BOnlineELM-PRH3-VUBEfriend.b@example.com+1 555-0202ConnectInvite⋮",
           "email": "friend.b@example.com",
           "phone": "+1 555-0202",
           "status": "Online"
         },
         "cardOnB": {
-          "text": "☆Test Friend AOnlineELM-QXYJ-25CXfriend.a@example.com+1 555-0101ConnectInvite⋮",
+          "text": "☆Test Friend AOnlineELM-DDYQ-XU97friend.a@example.com+1 555-0101ConnectInvite⋮",
           "email": "friend.a@example.com",
           "phone": "+1 555-0101",
           "status": "Online"
@@ -313,7 +313,7 @@
     "reverse_roles_a_to_b": {
       "status": "PASSED",
       "details": {
-        "sessionId": "2671e0e2-7364-4efc-b0ef-7cc9ec001016",
+        "sessionId": "699bfeb0-b8fe-4e9e-92da-2e0101613cc5",
         "roleA": "host",
         "roleB": "guest",
         "videoCapturePassed": true,
@@ -321,12 +321,12 @@
         "sharingStartedByHost": true,
         "hostCaptureWidth": 1920,
         "hostCaptureHeight": 1080,
-        "hostCaptureFps": 27,
-        "hostOutboundFramesSent": 2,
+        "hostCaptureFps": 3,
+        "hostOutboundFramesSent": 1,
         "guestDecodedWidth": 1920,
         "guestDecodedHeight": 1080,
-        "guestInboundFramesDecoded": 2,
-        "guestInboundBytesReceived": 69962,
+        "guestInboundFramesDecoded": 1,
+        "guestInboundBytesReceived": 48846,
         "guestVideoTracksCount": 1,
         "nonBlankFrame": {
           "width": 1920,
@@ -350,13 +350,13 @@
             "hostToolbar": 17
           }
         },
-        "rttMs": 1
+        "rttMs": 2
       }
     },
     "reverse_invite_b_to_a": {
       "status": "PASSED",
       "details": {
-        "sessionId": "3123c164-e606-4126-8173-2b53a7e39b4b",
+        "sessionId": "67e20db2-d8a8-44b2-918d-53a25aec925b",
         "roleA": "guest",
         "roleB": "host"
       }
@@ -364,7 +364,7 @@
     "backend_privacy_audit": {
       "status": "PASSED",
       "details": {
-        "totalBackendRequests": 841,
+        "totalBackendRequests": 853,
         "leaksFound": 0
       }
     }
