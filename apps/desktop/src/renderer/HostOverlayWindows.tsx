@@ -160,16 +160,28 @@ export function HostFloatingToolbarWindow(props: {
       ? 'Mute Mic'
       : controls?.myMic.state === 'muted'
         ? 'Unmute Mic'
-        : controls?.myMic.state === 'unavailable'
-          ? 'My Mic (Not Approved)'
-          : 'My Mic';
+        : controls?.myMic.state === 'starting'
+          ? 'Starting Mic…'
+          : controls?.myMic.state === 'denied'
+            ? 'My Mic (Denied)'
+            : controls?.myMic.state === 'unavailable'
+              ? hostMedia?.microphoneAudio.approved
+                ? 'My Mic (Unavailable)'
+                : 'My Mic (Not Approved)'
+              : 'My Mic (Ready)';
 
   const deviceSoundTooltipLabel =
     controls?.deviceSound.state === 'active'
       ? 'Stop Device Sound'
-      : controls?.deviceSound.state === 'unavailable'
-        ? 'Device Sound (Not Approved)'
-        : 'Device Sound';
+      : controls?.deviceSound.state === 'starting'
+        ? 'Starting Device Sound…'
+        : controls?.deviceSound.state === 'denied'
+          ? 'Device Sound (Denied)'
+          : controls?.deviceSound.state === 'unavailable'
+            ? hostMedia?.deviceAudio.approved
+              ? 'Device Sound (Unavailable)'
+              : 'Device Sound (Not Approved)'
+            : 'Device Sound (Ready)';
 
   const peerMicTooltipLabel = overlay.peerMicActive
     ? overlay.peerMicMutedLocally
@@ -184,9 +196,13 @@ export function HostFloatingToolbarWindow(props: {
       ? 'Stop Sharing'
       : controls?.myScreen.state === 'starting'
         ? 'Starting Share…'
-        : controls?.myScreen.state === 'unavailable'
-          ? 'Screen Sharing (Not Approved)'
-          : 'Start Sharing';
+        : controls?.myScreen.state === 'denied'
+          ? 'Screen Sharing (Denied)'
+          : controls?.myScreen.state === 'unavailable'
+            ? hostMedia?.screenVideo.approved
+              ? 'Screen Sharing (Unavailable)'
+              : 'Screen Sharing (Not Approved)'
+            : 'Start Sharing (Ready)';
 
   return (
     <main
@@ -270,13 +286,13 @@ export function HostFloatingToolbarWindow(props: {
           <button
             type="button"
             data-testid="toolbar-my-mic-btn"
-            data-state={controls?.myMic.state ?? 'stopped'}
+            data-state={controls?.myMic.state ?? 'approved'}
             className={
               controls?.myMic.state === 'active'
                 ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
                 : controls?.myMic.state === 'muted'
                   ? 'toolbar-icon-btn host-icon-only-btn no-drag muted-state'
-                  : 'toolbar-icon-btn host-icon-only-btn no-drag'
+                  : `toolbar-icon-btn host-icon-only-btn no-drag state-${controls?.myMic.state ?? 'approved'}`
             }
             disabled={!controls || controls.myMic.disabled}
             aria-pressed={controls?.myMic.pressed ?? false}
@@ -339,11 +355,11 @@ export function HostFloatingToolbarWindow(props: {
           <button
             type="button"
             data-testid="toolbar-device-sound-btn"
-            data-state={controls?.deviceSound.state ?? 'stopped'}
+            data-state={controls?.deviceSound.state ?? 'approved'}
             className={
               controls?.deviceSound.state === 'active'
                 ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
-                : 'toolbar-icon-btn host-icon-only-btn no-drag'
+                : `toolbar-icon-btn host-icon-only-btn no-drag state-${controls?.deviceSound.state ?? 'approved'}`
             }
             disabled={!controls || controls.deviceSound.disabled}
             aria-pressed={controls?.deviceSound.pressed ?? false}
@@ -515,7 +531,8 @@ export function HostFloatingToolbarWindow(props: {
             <button
               type="button"
               data-testid="host-start-sharing-button"
-              className="primary-btn host-icon-only-btn no-drag"
+              data-state={controls?.myScreen.state ?? 'approved'}
+              className={`primary-btn host-icon-only-btn no-drag state-${controls?.myScreen.state ?? 'approved'}`}
               disabled={!controls || controls.myScreen.disabled}
               aria-label={
                 controls?.myScreen.state === 'starting'

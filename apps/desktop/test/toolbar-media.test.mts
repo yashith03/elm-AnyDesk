@@ -10,47 +10,130 @@ function makeHostMediaState(
 ): HostMediaRuntimeState {
   return {
     screenVideo: {
+      source: 'screenVideo',
       approved: true,
       active: false,
-      status: 'stopped',
+      status: 'approved_awaiting_start',
       message: '',
+      trackId: null,
+      streamId: null,
+      label: null,
       ...(overrides?.screenVideo ?? {}),
     },
     microphoneAudio: {
+      source: 'microphoneAudio',
       approved: true,
       active: false,
-      status: 'stopped',
+      status: 'approved_awaiting_start',
       message: '',
+      trackId: null,
+      streamId: null,
+      label: null,
       ...(overrides?.microphoneAudio ?? {}),
     },
     deviceAudio: {
+      source: 'deviceAudio',
       approved: true,
       active: false,
-      status: 'stopped',
+      status: 'approved_awaiting_start',
       message: '',
+      trackId: null,
+      streamId: null,
+      label: null,
       ...(overrides?.deviceAudio ?? {}),
     },
   };
 }
 
-test('computeHostToolbarMediaControls maps mic, device sound, and screen states independently', () => {
-  const stoppedAll = computeHostToolbarMediaControls({
+test('computeHostToolbarMediaControls maps approved, starting, active, muted, unavailable, and denied states', () => {
+  const approvedAll = computeHostToolbarMediaControls({
     hostMediaState: makeHostMediaState(),
     hostMicMutedLocally: false,
     isStartingShare: false,
   });
-  assert.equal(stoppedAll.myMic.state, 'stopped');
-  assert.equal(stoppedAll.myMic.disabled, false);
-  assert.equal(stoppedAll.deviceSound.state, 'stopped');
-  assert.equal(stoppedAll.deviceSound.disabled, false);
-  assert.equal(stoppedAll.myScreen.state, 'stopped');
-  assert.equal(stoppedAll.sourcePicker.disabled, false);
+  assert.equal(approvedAll.myMic.state, 'approved');
+  assert.equal(approvedAll.myMic.disabled, false);
+  assert.equal(approvedAll.deviceSound.state, 'approved');
+  assert.equal(approvedAll.deviceSound.disabled, false);
+  assert.equal(approvedAll.myScreen.state, 'approved');
+  assert.equal(approvedAll.myScreen.disabled, false);
+  assert.equal(approvedAll.sourcePicker.disabled, false);
+
+  const startingAll = computeHostToolbarMediaControls({
+    hostMediaState: makeHostMediaState({
+      microphoneAudio: {
+        source: 'microphoneAudio',
+        approved: true,
+        active: false,
+        status: 'starting',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      deviceAudio: {
+        source: 'deviceAudio',
+        approved: true,
+        active: false,
+        status: 'starting',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      screenVideo: {
+        source: 'screenVideo',
+        approved: true,
+        active: false,
+        status: 'starting',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+    }),
+    hostMicMutedLocally: false,
+    isStartingShare: false,
+  });
+  assert.equal(startingAll.myMic.state, 'starting');
+  assert.equal(startingAll.myMic.disabled, true);
+  assert.equal(startingAll.deviceSound.state, 'starting');
+  assert.equal(startingAll.deviceSound.disabled, true);
+  assert.equal(startingAll.myScreen.state, 'starting');
+  assert.equal(startingAll.myScreen.disabled, true);
 
   const activeAll = computeHostToolbarMediaControls({
     hostMediaState: makeHostMediaState({
-      microphoneAudio: { approved: true, active: true, status: 'live', message: '' },
-      deviceAudio: { approved: true, active: true, status: 'live', message: '' },
-      screenVideo: { approved: true, active: true, status: 'live', message: '' },
+      microphoneAudio: {
+        source: 'microphoneAudio',
+        approved: true,
+        active: true,
+        status: 'active',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      deviceAudio: {
+        source: 'deviceAudio',
+        approved: true,
+        active: true,
+        status: 'active',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      screenVideo: {
+        source: 'screenVideo',
+        approved: true,
+        active: true,
+        status: 'active',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
     }),
     hostMicMutedLocally: true,
     isStartingShare: false,
@@ -59,11 +142,69 @@ test('computeHostToolbarMediaControls maps mic, device sound, and screen states 
   assert.equal(activeAll.deviceSound.state, 'active');
   assert.equal(activeAll.myScreen.state, 'sharing');
 
+  const deniedAndUnsupported = computeHostToolbarMediaControls({
+    hostMediaState: makeHostMediaState({
+      microphoneAudio: {
+        source: 'microphoneAudio',
+        approved: true,
+        active: false,
+        status: 'permission_denied',
+        message: 'Denied',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      deviceAudio: {
+        source: 'deviceAudio',
+        approved: true,
+        active: false,
+        status: 'unsupported',
+        message: 'No endpoint',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+    }),
+    hostMicMutedLocally: false,
+    isStartingShare: false,
+  });
+  assert.equal(deniedAndUnsupported.myMic.state, 'denied');
+  assert.equal(deniedAndUnsupported.myMic.disabled, true);
+  assert.equal(deniedAndUnsupported.deviceSound.state, 'unavailable');
+  assert.equal(deniedAndUnsupported.deviceSound.disabled, true);
+
   const unapprovedAll = computeHostToolbarMediaControls({
     hostMediaState: makeHostMediaState({
-      microphoneAudio: { approved: false, active: false, status: 'idle', message: '' },
-      deviceAudio: { approved: false, active: false, status: 'idle', message: '' },
-      screenVideo: { approved: false, active: false, status: 'idle', message: '' },
+      microphoneAudio: {
+        source: 'microphoneAudio',
+        approved: false,
+        active: false,
+        status: 'off',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      deviceAudio: {
+        source: 'deviceAudio',
+        approved: false,
+        active: false,
+        status: 'off',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
+      screenVideo: {
+        source: 'screenVideo',
+        approved: false,
+        active: false,
+        status: 'off',
+        message: '',
+        trackId: null,
+        streamId: null,
+        label: null,
+      },
     }),
     hostMicMutedLocally: false,
     isStartingShare: false,

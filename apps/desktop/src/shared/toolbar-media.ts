@@ -1,8 +1,24 @@
 import type { HostMediaRuntimeState } from '@elm/protocol';
 
-export type HostMicUiState = 'active' | 'muted' | 'stopped' | 'unavailable';
-export type HostSoundUiState = 'active' | 'stopped' | 'unavailable';
-export type HostScreenUiState = 'sharing' | 'starting' | 'stopped' | 'unavailable';
+export type HostMicUiState =
+  | 'approved'
+  | 'starting'
+  | 'active'
+  | 'muted'
+  | 'unavailable'
+  | 'denied';
+export type HostSoundUiState =
+  | 'approved'
+  | 'starting'
+  | 'active'
+  | 'unavailable'
+  | 'denied';
+export type HostScreenUiState =
+  | 'approved'
+  | 'starting'
+  | 'sharing'
+  | 'unavailable'
+  | 'denied';
 export type PeerAudioUiState = 'active' | 'muted' | 'unavailable';
 export type PeerScreenUiState = 'received' | 'hidden' | 'unavailable';
 
@@ -65,8 +81,17 @@ export function computeHostToolbarMediaControls(params: {
       disabled: true,
       pressed: false,
     };
+  } else if (mic.status === 'permission_denied') {
+    myMic = {
+      state: 'denied',
+      label: 'My Mic',
+      title:
+        mic.message ||
+        'Microphone permission was denied by the OS. Grant microphone access and start a new session.',
+      disabled: true,
+      pressed: false,
+    };
   } else if (
-    mic.status === 'permission_denied' ||
     mic.status === 'unsupported' ||
     mic.status === 'source_disappeared'
   ) {
@@ -74,6 +99,14 @@ export function computeHostToolbarMediaControls(params: {
       state: 'unavailable',
       label: 'My Mic',
       title: mic.message || 'Microphone is unavailable on this device.',
+      disabled: true,
+      pressed: false,
+    };
+  } else if (isStartingMic || mic.status === 'starting') {
+    myMic = {
+      state: 'starting',
+      label: 'My Mic',
+      title: 'Starting microphone capture...',
       disabled: true,
       pressed: false,
     };
@@ -97,12 +130,11 @@ export function computeHostToolbarMediaControls(params: {
     }
   } else {
     myMic = {
-      state: 'stopped',
+      state: 'approved',
       label: 'My Mic',
-      title: isStartingMic
-        ? 'Starting microphone capture...'
-        : 'Microphone is stopped. Click to start sharing your microphone.',
-      disabled: Boolean(isStartingMic),
+      title:
+        'Microphone is approved and ready. Click to start sharing your microphone.',
+      disabled: false,
       pressed: false,
     };
   }
@@ -117,8 +149,17 @@ export function computeHostToolbarMediaControls(params: {
       disabled: true,
       pressed: false,
     };
+  } else if (sound.status === 'permission_denied') {
+    deviceSound = {
+      state: 'denied',
+      label: 'Device Sound',
+      title:
+        sound.message ||
+        'Device sound capture permission was denied.',
+      disabled: true,
+      pressed: false,
+    };
   } else if (
-    sound.status === 'permission_denied' ||
     sound.status === 'unsupported' ||
     sound.status === 'source_disappeared'
   ) {
@@ -129,22 +170,29 @@ export function computeHostToolbarMediaControls(params: {
       disabled: true,
       pressed: false,
     };
+  } else if (isStartingDeviceSound || sound.status === 'starting') {
+    deviceSound = {
+      state: 'starting',
+      label: 'Device Sound',
+      title: 'Starting device sound capture...',
+      disabled: true,
+      pressed: false,
+    };
   } else if (sound.active) {
     deviceSound = {
       state: 'active',
       label: 'Device Sound',
       title: 'Sharing device sound. Click to stop device sound.',
-      disabled: Boolean(isStartingDeviceSound),
+      disabled: false,
       pressed: true,
     };
   } else {
     deviceSound = {
-      state: 'stopped',
+      state: 'approved',
       label: 'Device Sound',
-      title: isStartingDeviceSound
-        ? 'Starting device sound capture...'
-        : 'Device sound is stopped. Click to start sharing device sound.',
-      disabled: Boolean(isStartingDeviceSound),
+      title:
+        'Device sound is approved and ready. Click to start sharing device sound.',
+      disabled: false,
       pressed: false,
     };
   }
@@ -158,7 +206,28 @@ export function computeHostToolbarMediaControls(params: {
       disabled: true,
       pressed: false,
     };
-  } else if (isStartingShare) {
+  } else if (screen.status === 'permission_denied') {
+    myScreen = {
+      state: 'denied',
+      label: 'My Screen',
+      title:
+        screen.message ||
+        'Screen capture permission was denied.',
+      disabled: true,
+      pressed: false,
+    };
+  } else if (
+    screen.status === 'unsupported' ||
+    screen.status === 'source_disappeared'
+  ) {
+    myScreen = {
+      state: 'unavailable',
+      label: 'My Screen',
+      title: screen.message || 'Screen sharing is unavailable on this device.',
+      disabled: true,
+      pressed: false,
+    };
+  } else if (isStartingShare || screen.status === 'starting') {
     myScreen = {
       state: 'starting',
       label: 'Starting…',
@@ -176,9 +245,10 @@ export function computeHostToolbarMediaControls(params: {
     };
   } else {
     myScreen = {
-      state: 'stopped',
+      state: 'approved',
       label: 'My Screen',
-      title: 'Screen sharing is stopped. Click to start sharing your screen.',
+      title:
+        'Screen sharing is approved and ready. Select a source and click Start Sharing.',
       disabled: false,
       pressed: false,
     };

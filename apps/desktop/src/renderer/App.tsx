@@ -204,6 +204,14 @@ export function App(): React.ReactElement {
     microphoneAudio: false,
     deviceAudio: false,
   });
+  const activeIncomingInviteId = snapshot?.incomingInvites[0]?.inviteId ?? null;
+  useEffect(() => {
+    setPreAcceptMedia({
+      screenVideo: false,
+      microphoneAudio: false,
+      deviceAudio: false,
+    });
+  }, [activeIncomingInviteId]);
 
   // Shareable Windows & Displays for Host A
   const [shareableSources, setShareableSources] = useState<
@@ -983,11 +991,26 @@ export function App(): React.ReactElement {
       });
     });
 
-    // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance
-    // (Zero media tracks are captured or attached before Host A explicitly clicks Start Sharing)
-    void controller.connectAcceptedSession();
+    // Connect WebRTC PeerConnection & reliable DataChannel immediately upon acceptance,
+    // then automatically activate any approved audio sources (Mic / Device Sound) on the Host.
+    // Screen Video remains strictly manual until Host clicks Start Sharing.
+    let cancelled = false;
+    void (async () => {
+      await controller.connectAcceptedSession();
+      if (cancelled || webrtcControllerRef.current !== controller) {
+        return;
+      }
+      if (
+        localRole === 'host' &&
+        (currentSession.hostMediaSelection.microphoneAudio ||
+          currentSession.hostMediaSelection.deviceAudio)
+      ) {
+        await controller.startApprovedInitialAudio();
+      }
+    })();
 
     return () => {
+      cancelled = true;
       // Local-only cleanup on React unmount/re-run; never invoke POST /sessions/disconnect here.
       if (webrtcControllerRef.current === controller) {
         const snap = controller.getSnapshot();

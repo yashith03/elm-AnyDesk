@@ -648,6 +648,40 @@ try {
   assert.equal(toolbarUiCheck.hiddenBadgeText, 'Hidden: ON');
   assert.equal(toolbarUiCheck.hasFitOr1to1, false, 'Host toolbar must not include Fit or 1:1 viewer buttons');
 
+  // Verify approved Mic & Device Sound auto-start on Connect while Screen stays manual ('approved')
+  const initialConnectMedia = await waitForCondition(
+    'Host Connect initial approved audio settles and Screen remains manual (approved)',
+    () =>
+      hostToolbarCdp.eval<{
+        micState: string | null;
+        soundState: string | null;
+        screenState: string | null;
+      } | null>(`(() => {
+        const micState = document.querySelector('[data-testid="toolbar-my-mic-btn"]')?.getAttribute('data-state') || null;
+        const soundState = document.querySelector('[data-testid="toolbar-device-sound-btn"]')?.getAttribute('data-state') || null;
+        const screenState = document.querySelector('[data-testid="host-start-sharing-button"]')?.getAttribute('data-state') || null;
+        if (!micState || !soundState || !screenState) return null;
+        if (micState === 'approved' || micState === 'starting') return null;
+        if (soundState === 'approved' || soundState === 'starting') return null;
+        return { micState, soundState, screenState };
+      })()`),
+    10_000,
+    200
+  );
+  assert.equal(
+    initialConnectMedia.screenState,
+    'approved',
+    'Screen ON before Connect accept must start in manual approved state, not sharing'
+  );
+  assert.ok(
+    ['active', 'denied', 'unavailable'].includes(initialConnectMedia.micState ?? ''),
+    `Expected auto-started mic state to settle to active/denied/unavailable, got ${initialConnectMedia.micState}`
+  );
+  assert.ok(
+    ['active', 'denied', 'unavailable'].includes(initialConnectMedia.soundState ?? ''),
+    `Expected auto-started device sound state to settle to active/denied/unavailable, got ${initialConnectMedia.soundState}`
+  );
+
   const initialProt = await cdpB.eval<{
     enabled: boolean;
     toggleAllowed: boolean;
@@ -866,14 +900,23 @@ try {
     shareResultBtoA.stats
   );
 
-  // 4a-bis. Rapid & Repeated Source Switching (10x switches across available sources)
-  const availableSources = (
+  // 4a-bis. Rapid & Repeated Source Switching (10x switches across Display & non-transient Window sources)
+  const rawSources = (
     (shareResultBtoA as { allSources?: Array<{ id: string; text: string }> }).allSources ?? []
   ).filter((s) => s.id);
+  const stableSources = rawSources.filter(
+    (s) => s.text.startsWith('DISPLAY') || s.text.includes('Client A')
+  );
+  const availableSources = stableSources.length >= 2 ? stableSources : rawSources;
   if (shareResultBtoA.passed && availableSources.length >= 2) {
     const switchCount = 10;
+    const verifiedSource =
+      availableSources.find((s) => s.text.startsWith('DISPLAY')) ?? availableSources[0];
     for (let i = 0; i < switchCount; i += 1) {
-      const targetSource = availableSources[i % availableSources.length];
+      const targetSource =
+        i === switchCount - 1
+          ? verifiedSource
+          : availableSources[i % availableSources.length];
       await hostToolbarCdp.eval(
         `window.elmDesktop.dispatchHostToolbarAction({ type: 'select-source', sourceId: ${JSON.stringify(
           targetSource.id
@@ -884,7 +927,7 @@ try {
       }
     }
     const postSwitch = await waitForCondition(
-      `${'HOST B'} remains connected without SDP m-line errors after 10x source switches`,
+      `HOST B remains connected without SDP m-line errors after 10x source switches`,
       async () => {
         const [pHost, pGuest] = await Promise.all([getProbe(cdpB), getProbe(cdpA)]);
         if (!pHost || !pGuest) return null;
@@ -901,7 +944,9 @@ try {
         ) {
           return { pHost, pGuest };
         }
-        return null;
+        throw new Error(
+          `hostConn=${pHost.connectionState}, dc=${pHost.dataChannelState}, guestConn=${pGuest.connectionState}, guestVideo=${pGuest.guestVideoTracksCount}, banner=${banner}`
+        );
       },
       12_000,
       250
@@ -952,26 +997,17 @@ try {
   assert.equal(protAfterOn.windowDisplayAffinities?.main, 17);
   assert.equal(protAfterOn.windowDisplayAffinities?.hostToolbar, 17);
 
-  await hostToolbarCdp.click('[data-testid="toolbar-my-mic-btn"]');
-  await hostToolbarCdp.click('[data-testid="toolbar-device-sound-btn"]');
-  const mediaStatesAfterClicks = await waitForCondition(
-    'Host Mic and Device Sound transitions settle',
-    async () => {
-      const st = await hostToolbarCdp.eval<{
-        micState: string | null;
-        soundState: string | null;
-      }>(
-        `({
-          micState: document.querySelector('[data-testid="toolbar-my-mic-btn"]')?.getAttribute('data-state') || null,
-          soundState: document.querySelector('[data-testid="toolbar-device-sound-btn"]')?.getAttribute('data-state') || null,
-        })`
-      );
-      return st.micState !== 'stopped' && st.soundState !== 'stopped' ? st : null;
-    },
-    8_000
+  const mediaStatesBeforeClicks = await hostToolbarCdp.eval<{
+    micState: string | null;
+    soundState: string | null;
+  }>(
+    `({
+      micState: document.querySelector('[data-testid="toolbar-my-mic-btn"]')?.getAttribute('data-state') || null,
+      soundState: document.querySelector('[data-testid="toolbar-device-sound-btn"]')?.getAttribute('data-state') || null,
+    })`
   );
   let micStateAfterMuteToggle: string | null = null;
-  if (mediaStatesAfterClicks.micState === 'active') {
+  if (mediaStatesBeforeClicks.micState === 'active') {
     await hostToolbarCdp.click('[data-testid="toolbar-my-mic-btn"]');
     micStateAfterMuteToggle = await waitForCondition(
       'Host Mic locally muted',
@@ -985,6 +1021,7 @@ try {
       5_000
     );
   }
+  const mediaStatesAfterClicks = mediaStatesBeforeClicks;
 
   await hostToolbarCdp.click('[data-testid="floating-chat-toggle"]');
   const opacityChatCdp = await CdpClient.connectByRole(clientB.debugPort!, 'chat');
@@ -1567,6 +1604,35 @@ try {
     300
   );
 
+  // Verify OFF Mic and Device Sound remain unavailable & disabled on Host A when only Screen was approved
+  const hostAToolbarCdp = await CdpClient.connectByRole(clientA.debugPort!, 'host-toolbar');
+  const hostAOffControls = await waitForCondition(
+    'Host A unapproved Mic & Device Sound remain unavailable/disabled',
+    () =>
+      hostAToolbarCdp.eval<{
+        micState: string | null;
+        micDisabled: boolean;
+        soundState: string | null;
+        soundDisabled: boolean;
+      } | null>(`(() => {
+        const mic = document.querySelector('[data-testid="toolbar-my-mic-btn"]');
+        const snd = document.querySelector('[data-testid="toolbar-device-sound-btn"]');
+        if (!mic || !snd) return null;
+        return {
+          micState: mic.getAttribute('data-state'),
+          micDisabled: Boolean(mic.disabled),
+          soundState: snd.getAttribute('data-state'),
+          soundDisabled: Boolean(snd.disabled),
+        };
+      })()`),
+    8_000
+  );
+  hostAToolbarCdp.close();
+  assert.equal(hostAOffControls.micState, 'unavailable');
+  assert.equal(hostAOffControls.micDisabled, true);
+  assert.equal(hostAOffControls.soundState, 'unavailable');
+  assert.equal(hostAOffControls.soundDisabled, true);
+
   const shareResultAtoB = await tryScreenShare(
     cdpA,
     clientA.debugPort!,
@@ -1603,6 +1669,14 @@ try {
     5_000
   );
   await cdpB.setInputValue('[data-testid="invite-target-code-input"]', codeA);
+  // Enable Microphone and Device Sound (Screen is ON by default) in Reverse Invite dialog
+  await cdpB.eval(`(() => {
+    const dlg = document.querySelector('[data-testid="direct-invite-dialog"]');
+    const checkboxes = dlg?.querySelectorAll('input[type="checkbox"]') ?? [];
+    for (const cb of checkboxes) {
+      if (!cb.checked) cb.click();
+    }
+  })()`);
   await cdpB.click('[data-testid="send-direct-invite-button"]');
   await waitForCondition(
     'Client A receives direct Invite from Client B',
@@ -1611,11 +1685,21 @@ try {
   );
   await cdpA.click('[data-testid="incoming-accept-button"]');
   const reverseInviteConnected = await waitForCondition(
-    'Reverse Invite WebRTC connected (B=host, A=guest)',
+    'Reverse Invite WebRTC connected (B=host, A=guest) and approved audio settled',
     async () => {
       const [probeA, probeB] = await Promise.all([getProbe(cdpA), getProbe(cdpB)]);
       if (!probeA || !probeB) return null;
       const iceOk = (s: unknown) => s === 'connected' || s === 'completed';
+      const hm = probeB.hostMediaState as Record<
+        string,
+        { approved: boolean; active: boolean; status: string }
+      > | null;
+      if (!hm) return null;
+      const audioSettled =
+        hm.microphoneAudio.status !== 'approved_awaiting_start' &&
+        hm.microphoneAudio.status !== 'starting' &&
+        hm.deviceAudio.status !== 'approved_awaiting_start' &&
+        hm.deviceAudio.status !== 'starting';
       if (
         probeA.sessionId === probeB.sessionId &&
         probeA.localRole === 'guest' &&
@@ -1625,15 +1709,24 @@ try {
         iceOk(probeA.iceConnectionState) &&
         iceOk(probeB.iceConnectionState) &&
         probeA.dataChannelState === 'open' &&
-        probeB.dataChannelState === 'open'
+        probeB.dataChannelState === 'open' &&
+        audioSettled
       ) {
-        return { probeA, probeB };
+        return { probeA, probeB, hm };
       }
       return null;
     },
     20_000,
     300
   );
+  assert.equal(reverseInviteConnected.hm.screenVideo.approved, true);
+  assert.equal(
+    reverseInviteConnected.hm.screenVideo.active,
+    false,
+    'Reverse Invite Screen ON must stay manual until Host clicks Start Sharing'
+  );
+  assert.equal(reverseInviteConnected.hm.microphoneAudio.approved, true);
+  assert.equal(reverseInviteConnected.hm.deviceAudio.approved, true);
   await cdpA.click('[data-testid="floating-end-session"]');
   await waitForCondition(
     'Both clients return to Home after reverse Invite End Session',

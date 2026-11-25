@@ -2040,10 +2040,19 @@ select:focus-visible,
 }
 
 .toolbar-icon-btn.state-stopped,
+.toolbar-icon-btn.state-approved,
 .toolbar-icon-btn.state-starting {
   border-color: var(--border-strong);
   background-color: var(--surface-elevated);
   color: var(--text-primary);
+}
+
+.toolbar-icon-btn.state-denied {
+  border-color: var(--danger-border);
+  background-color: var(--danger-surface);
+  color: var(--status-offline-text);
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .toolbar-icon-btn:disabled,

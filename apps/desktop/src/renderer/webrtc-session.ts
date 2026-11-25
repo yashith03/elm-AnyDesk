@@ -190,6 +190,8 @@ export class ApprovedWebRtcSessionController {
   private readonly pendingGuestIceCandidates: RTCIceCandidateInit[] = [];
   private remoteLivenessArmed = false;
   private negotiationQueue: Promise<void> = Promise.resolve();
+  private connectInFlight: Promise<WebRtcSessionSnapshot> | null = null;
+  private initialApprovedAudioStarted = false;
   private activeNegotiation: {
     id: string;
     resolve: () => void;
@@ -941,51 +943,67 @@ export class ApprovedWebRtcSessionController {
    * explicitly clicks "Start Sharing".
    */
   public async connectAcceptedSession(): Promise<WebRtcSessionSnapshot> {
-    if (this.mode === 'remote') {
-      if (this.signalPollTimerId === null && !this.closed) {
-        this.signalPollTimerId = setInterval(() => {
-          void this.pumpSignalsOnce();
-        }, 350);
-      }
-      if (this.localRole === 'guest') {
-        await this.pumpSignalsOnce();
-        const nowPerf = performance.now();
-        this.lastHostHeartbeatPerfMs = nowPerf;
-        this.lastGuestHeartbeatPerfMs = nowPerf;
-        if (this.enableBackgroundLivenessTimer) {
-          this.startLivenessMonitor();
+    if (this.closed) return this.getSnapshot();
+    if (this.connectInFlight) {
+      return this.connectInFlight;
+    }
+
+    const runConnect = async (): Promise<WebRtcSessionSnapshot> => {
+      if (this.closed) return this.getSnapshot();
+      if (this.mode === 'remote') {
+        if (this.signalPollTimerId === null && !this.closed) {
+          this.signalPollTimerId = setInterval(() => {
+            void this.pumpSignalsOnce();
+          }, 350);
         }
-        this.emitChange();
+        if (this.localRole === 'guest') {
+          await this.pumpSignalsOnce();
+          if (this.closed) return this.getSnapshot();
+          const nowPerf = performance.now();
+          this.lastHostHeartbeatPerfMs = nowPerf;
+          this.lastGuestHeartbeatPerfMs = nowPerf;
+          if (this.enableBackgroundLivenessTimer) {
+            this.startLivenessMonitor();
+          }
+          this.emitChange();
+          return this.getSnapshot();
+        }
+      }
+
+      if (this.hostDataChannel) {
         return this.getSnapshot();
       }
-    }
 
-    if (this.hostDataChannel) {
+      if (!this.pcHost) {
+        return this.getSnapshot();
+      }
+
+      // Create reliable, ordered DataChannel for bidirectional private 1:1 chat
+      this.hostDataChannel = this.pcHost.createDataChannel('elm-private-chat', {
+        ordered: true,
+      });
+      this.attachDataChannelHandlers(this.hostDataChannel, 'host');
+
+      await this.renegotiateHostToGuest();
+      if (this.closed) return this.getSnapshot();
+      if (this.mode === 'loopback') {
+        await this.waitForDataChannelOpen(4000);
+        if (this.closed) return this.getSnapshot();
+      }
+      const nowPerf = performance.now();
+      this.lastHostHeartbeatPerfMs = nowPerf;
+      this.lastGuestHeartbeatPerfMs = nowPerf;
+      if (this.enableBackgroundLivenessTimer) {
+        this.startLivenessMonitor();
+      }
+      this.emitChange();
       return this.getSnapshot();
-    }
+    };
 
-    if (!this.pcHost) {
-      return this.getSnapshot();
-    }
-
-    // Create reliable, ordered DataChannel for bidirectional private 1:1 chat
-    this.hostDataChannel = this.pcHost.createDataChannel('elm-private-chat', {
-      ordered: true,
+    this.connectInFlight = runConnect().finally(() => {
+      this.connectInFlight = null;
     });
-    this.attachDataChannelHandlers(this.hostDataChannel, 'host');
-
-    await this.renegotiateHostToGuest();
-    if (this.mode === 'loopback') {
-      await this.waitForDataChannelOpen(4000);
-    }
-    const nowPerf = performance.now();
-    this.lastHostHeartbeatPerfMs = nowPerf;
-    this.lastGuestHeartbeatPerfMs = nowPerf;
-    if (this.enableBackgroundLivenessTimer) {
-      this.startLivenessMonitor();
-    }
-    this.emitChange();
-    return this.getSnapshot();
+    return this.connectInFlight;
   }
 
   /**
@@ -2029,10 +2047,26 @@ export class ApprovedWebRtcSessionController {
     }
 
     try {
+      this.updateSourceStatus(
+        'microphoneAudio',
+        true,
+        false,
+        'starting',
+        'Starting Microphone Audio capture...'
+      );
+      this.emitChange();
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: false,
       });
+
+      if (this.closed) {
+        for (const t of stream.getTracks()) {
+          t.stop();
+        }
+        return;
+      }
 
       // Strictly guarantee zero video tracks
       for (const strayVideo of stream.getVideoTracks()) {
@@ -2125,11 +2159,27 @@ export class ApprovedWebRtcSessionController {
     }
 
     try {
+      this.updateSourceStatus(
+        'deviceAudio',
+        true,
+        false,
+        'starting',
+        'Starting Device Audio capture...'
+      );
+      this.emitChange();
+
       // Verified Windows prototype capture path #1: Windows-native WASAPI Loopback helper -> WebAudio MediaStreamAudioDestinationNode
       // Never requests or enables video!
       const probe = await window.elmDesktop.startWasapiLoopback({
         playTestTone,
       });
+
+      if (this.closed) {
+        if (probe.ok) {
+          void window.elmDesktop.stopWasapiLoopback();
+        }
+        return;
+      }
 
       if (probe.ok) {
         const audioCtx = new AudioContext({
@@ -2341,6 +2391,81 @@ export class ApprovedWebRtcSessionController {
           },
         });
       }
+    }
+
+    if (this.closed) return this.getSnapshot();
+    this.emitChange();
+    return this.getSnapshot();
+  }
+
+  /**
+   * Automatically activates approved audio sources (microphoneAudio and deviceAudio)
+   * once per accepted session on the Host, batching them into a single WebRTC
+   * renegotiation. Screen Video remains strictly manual until the Host clicks Start Sharing.
+   */
+  public async startApprovedInitialAudio(): Promise<WebRtcSessionSnapshot> {
+    if (
+      this.closed ||
+      this.localRole !== 'host' ||
+      this.initialApprovedAudioStarted
+    ) {
+      return this.getSnapshot();
+    }
+    this.initialApprovedAudioStarted = true;
+
+    const wantMic = Boolean(this.session.hostMediaSelection.microphoneAudio);
+    const wantDeviceSound = Boolean(this.session.hostMediaSelection.deviceAudio);
+    if (!wantMic && !wantDeviceSound) {
+      return this.getSnapshot();
+    }
+
+    if (!this.hostDataChannel) {
+      await this.connectAcceptedSession();
+      if (this.closed) return this.getSnapshot();
+    }
+
+    this.sharingStartedByHost = true;
+
+    if (wantMic && !this.hostSenders.has('microphoneAudio')) {
+      await this.startMicrophoneAudioCapture();
+      if (this.closed) return this.getSnapshot();
+    }
+
+    if (wantDeviceSound && !this.hostSenders.has('deviceAudio')) {
+      await this.startDeviceAudioCapture(false);
+      if (this.closed) return this.getSnapshot();
+    }
+
+    const hasNewAudioSender =
+      (wantMic && this.hostSenders.has('microphoneAudio')) ||
+      (wantDeviceSound && this.hostSenders.has('deviceAudio'));
+
+    if (hasNewAudioSender) {
+      await this.renegotiateHostToGuest();
+    } else {
+      const sourceStatuses: Partial<
+        Record<
+          MediaSourceKind,
+          { readonly status: MediaSourceStatusKind; readonly message: string }
+        >
+      > = {};
+      if (wantMic) {
+        sourceStatuses.microphoneAudio = {
+          status: this.hostMediaState.microphoneAudio.status,
+          message: this.hostMediaState.microphoneAudio.message,
+        };
+      }
+      if (wantDeviceSound) {
+        sourceStatuses.deviceAudio = {
+          status: this.hostMediaState.deviceAudio.status,
+          message: this.hostMediaState.deviceAudio.message,
+        };
+      }
+      await this.sendSignalFrom(this.session.hostAccountId, {
+        type: 'media-status',
+        activeTracks: this.buildActiveTrackDescriptors(),
+        sourceStatuses,
+      });
     }
 
     if (this.closed) return this.getSnapshot();
