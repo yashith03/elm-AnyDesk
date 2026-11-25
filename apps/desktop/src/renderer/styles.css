@@ -118,6 +118,13 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+:root[data-overlay-window='true'],
+:root[data-overlay-window='true'] body {
+  background: transparent !important;
+  background-color: transparent !important;
+  overflow: hidden;
+}
+
 .app-shell {
   max-width: 100%;
   margin: 0 auto;
@@ -638,6 +645,7 @@ p code {
 }
 
 .small-secondary-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -648,6 +656,17 @@ p code {
   padding: 0 10px;
   font-size: 0.78rem;
   line-height: 1;
+}
+
+.chat-unread-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background-color: #ef4444;
+  pointer-events: none;
 }
 
 .small-secondary-btn:hover:not(:disabled) {
@@ -1946,6 +1965,7 @@ select:focus-visible,
 }
 
 .toolbar-icon-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2077,15 +2097,17 @@ select:focus-visible,
 }
 
 .overlay-toolbar-shell {
+  position: relative;
   width: 100vw;
   height: 100vh;
   margin: 0;
-  padding: 2px 4px;
+  padding: 2px 4px 0;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   overflow: hidden;
   background: transparent;
+  pointer-events: none;
 }
 
 .overlay-toolbar-bar {
@@ -2101,6 +2123,32 @@ select:focus-visible,
   color: var(--text-primary);
   overflow: hidden;
   white-space: nowrap;
+  pointer-events: auto;
+}
+
+.host-tooltip-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.host-toolbar-tooltip {
+  position: absolute;
+  top: 54px;
+  z-index: 20;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background-color: var(--surface-elevated);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  user-select: none;
 }
 
 .overlay-toolbar-bar .presence-pill {
@@ -2198,7 +2246,7 @@ select:focus-visible,
   gap: 10px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--border-subtle);
-  background-color: var(--surface-primary);
+  background-color: transparent;
   flex-shrink: 0;
 }
 
@@ -2226,4 +2274,44 @@ select:focus-visible,
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
+}
+
+.host-icon-only-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 7px;
+  flex-shrink: 0;
+}
+
+/* Host-scoped arrow cursor (never changes Viewer UI; preserves text I-beam & native window resize) */
+.host-ui-scope button,
+.host-ui-scope button:hover,
+.host-ui-scope button:disabled,
+.host-ui-scope .toolbar-icon-btn,
+.host-ui-scope .toolbar-icon-btn:hover,
+.host-ui-scope .toolbar-icon-btn:disabled,
+.host-ui-scope .host-icon-only-btn,
+.host-ui-scope .host-icon-only-btn:hover,
+.host-ui-scope .host-icon-only-btn:disabled,
+.host-ui-scope .small-secondary-btn,
+.host-ui-scope .primary-btn,
+.host-ui-scope .danger-btn,
+.host-ui-scope .test-protection-btn,
+.host-ui-scope .theme-toggle-btn,
+.host-ui-scope .host-source-option,
+.host-ui-scope .floating-drag-handle,
+.host-ui-scope .win-control-btn {
+  cursor: default !important;
+}
+
+.host-ui-scope input[type='text'],
+.host-ui-scope input[type='email'],
+.host-ui-scope input[type='tel'],
+.host-ui-scope textarea {
+  cursor: text !important;
 }

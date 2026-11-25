@@ -1719,6 +1719,7 @@ export class SignalingCoordinator implements DurableObject {
         alreadyEnded: result.alreadyEnded,
         sessionId: result.sessionId,
         receipt: result.receipt,
+        snapshot: this.buildPresenceSnapshot(body.caller),
       });
     }
 

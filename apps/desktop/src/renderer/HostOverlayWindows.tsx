@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   MAX_CHAT_IMAGE_BYTES,
   SUPPORTED_CHAT_IMAGE_MIME_TYPES,
@@ -29,12 +29,19 @@ function OverlayThemeToggleButton(props: {
       className="theme-toggle-btn no-drag"
       aria-label={`Switch to ${isDark ? 'Light' : 'Dark'} theme`}
       aria-pressed={isDark}
-      title={`Current theme: ${isDark ? 'Dark' : 'Light'}`}
       onClick={props.onToggle}
     >
       <span>{isDark ? 'Dark' : 'Light'}</span>
     </button>
   );
+}
+
+const HOST_TOOLTIP_DELAY_MS = 400;
+
+interface ActiveHostTooltip {
+  readonly id: string;
+  readonly label: string;
+  readonly anchorCenterX: number;
 }
 
 export function HostFloatingToolbarWindow(props: {
@@ -57,33 +64,151 @@ export function HostFloatingToolbarWindow(props: {
   const statusLabel = isScreenSharing
     ? 'Sharing'
     : overlay.connectionState === 'connected'
-      ? 'Connected'
+      ? 'Not Sharing'
       : overlay.connectionState === 'failed'
         ? 'Failed'
         : 'Connecting';
   const statusTone = isScreenSharing
     ? 'online'
     : overlay.connectionState === 'connected'
-      ? 'online'
+      ? 'pending'
       : overlay.connectionState === 'failed'
         ? 'offline'
         : 'pending';
 
   const protection = overlay.captureProtection;
 
+  const shellRef = useRef<HTMLElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [activeTooltip, setActiveTooltip] = useState<ActiveHostTooltip | null>(
+    null
+  );
+  const [tooltipLeftPx, setTooltipLeftPx] = useState<number>(8);
+
+  const hideTooltip = useCallback(() => {
+    if (tooltipTimerRef.current !== null) {
+      clearTimeout(tooltipTimerRef.current);
+      tooltipTimerRef.current = null;
+    }
+    setActiveTooltip(null);
+  }, []);
+
+  const scheduleTooltip = useCallback(
+    (id: string, label: string, targetEl: HTMLElement | null) => {
+      if (tooltipTimerRef.current !== null) {
+        clearTimeout(tooltipTimerRef.current);
+        tooltipTimerRef.current = null;
+      }
+      if (!targetEl || !shellRef.current) {
+        setActiveTooltip(null);
+        return;
+      }
+      const shellRect = shellRef.current.getBoundingClientRect();
+      const targetRect = targetEl.getBoundingClientRect();
+      const anchorCenterX =
+        targetRect.left - shellRect.left + targetRect.width / 2;
+      tooltipTimerRef.current = setTimeout(() => {
+        tooltipTimerRef.current = null;
+        setActiveTooltip({ id, label, anchorCenterX });
+      }, HOST_TOOLTIP_DELAY_MS);
+    },
+    []
+  );
+
+  // Hide tooltip on window blur, visibility change, or popup/state transitions
+  useEffect(() => {
+    const onWindowBlur = () => hideTooltip();
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') hideTooltip();
+    };
+    window.addEventListener('blur', onWindowBlur);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', onWindowBlur);
+      document.removeEventListener('visibilitychange', onVisibility);
+      hideTooltip();
+    };
+  }, [hideTooltip]);
+
+  useEffect(() => {
+    hideTooltip();
+  }, [
+    isScreenSharing,
+    overlay.sourcePickerOpen,
+    overlay.settingsOpen,
+    overlay.chatOpen,
+    hideTooltip,
+  ]);
+
+  // Clamp tooltip horizontally inside the capture-protected toolbar window so it never clips
+  useLayoutEffect(() => {
+    if (!activeTooltip || !shellRef.current || !tooltipRef.current) return;
+    const shellWidth = shellRef.current.clientWidth;
+    const tipWidth = tooltipRef.current.offsetWidth;
+    const edgePad = 8;
+    const rawLeft = activeTooltip.anchorCenterX - tipWidth / 2;
+    const clamped = Math.max(
+      edgePad,
+      Math.min(rawLeft, Math.max(edgePad, shellWidth - tipWidth - edgePad))
+    );
+    setTooltipLeftPx(Math.round(clamped));
+  }, [activeTooltip]);
+
+  const micTooltipLabel =
+    controls?.myMic.state === 'active'
+      ? 'Mute Mic'
+      : controls?.myMic.state === 'muted'
+        ? 'Unmute Mic'
+        : controls?.myMic.state === 'unavailable'
+          ? 'My Mic (Not Approved)'
+          : 'My Mic';
+
+  const deviceSoundTooltipLabel =
+    controls?.deviceSound.state === 'active'
+      ? 'Stop Device Sound'
+      : controls?.deviceSound.state === 'unavailable'
+        ? 'Device Sound (Not Approved)'
+        : 'Device Sound';
+
+  const peerMicTooltipLabel = overlay.peerMicActive
+    ? overlay.peerMicMutedLocally
+      ? 'Unmute Viewer Mic'
+      : 'Mute Viewer Mic'
+    : overlay.peerMicRequestPending
+      ? 'Waiting for Viewer…'
+      : 'Ask Viewer to Turn On Mic';
+
+  const shareTooltipLabel =
+    controls?.myScreen.state === 'sharing'
+      ? 'Stop Sharing'
+      : controls?.myScreen.state === 'starting'
+        ? 'Starting Share…'
+        : controls?.myScreen.state === 'unavailable'
+          ? 'Screen Sharing (Not Approved)'
+          : 'Start Sharing';
+
   return (
     <main
-      className="overlay-toolbar-shell"
+      ref={shellRef}
+      className="overlay-toolbar-shell host-ui-scope"
       data-testid="floating-viewer-panel"
       style={{
-        backgroundColor: buildBackgroundRgba(
-          themeState.mode,
-          overlay.appearance.barBgOpacity
-        ),
+        backgroundColor: 'transparent',
         fontSize: `${overlay.appearance.barTextSizePx}px`,
       }}
     >
-      <div className="overlay-toolbar-bar" data-testid="floating-panel-bar">
+      <div
+        className="overlay-toolbar-bar"
+        data-testid="floating-panel-bar"
+        onPointerLeave={hideTooltip}
+        style={{
+          backgroundColor: buildBackgroundRgba(
+            themeState.mode,
+            overlay.appearance.barBgOpacity
+          ),
+        }}
+      >
         {protection.toggleAllowed && (
           <button
             type="button"
@@ -91,13 +216,18 @@ export function HostFloatingToolbarWindow(props: {
             className={`test-protection-btn no-drag ${
               protection.enabled ? 'test-on' : 'test-off'
             }`}
+            aria-label={
+              protection.enabled
+                ? 'Capture Protection Test ON'
+                : 'Capture Protection Test OFF'
+            }
             aria-pressed={protection.enabled}
-            title="Capture Protection Test — toggle Windows capture exclusion in dev/test builds only (defaults ON)"
-            onClick={() =>
+            onClick={() => {
+              hideTooltip();
               void window.elmDesktop.setCaptureProtectionTestEnabled(
                 !protection.enabled
-              )
-            }
+              );
+            }}
           >
             {protection.enabled ? 'Test ON' : 'Test OFF'}
           </button>
@@ -107,7 +237,6 @@ export function HostFloatingToolbarWindow(props: {
           className="floating-drag-handle host-os-drag-handle"
           data-testid="floating-panel-drag-handle"
           aria-label="Drag floating toolbar"
-          title="Drag toolbar"
         >
           ⋮⋮
         </div>
@@ -121,138 +250,43 @@ export function HostFloatingToolbarWindow(props: {
 
         <span className="floating-toolbar-divider" aria-hidden="true" />
 
-        {/* My Mic */}
-        <button
-          type="button"
-          data-testid="toolbar-my-mic-btn"
-          data-state={controls?.myMic.state ?? 'stopped'}
-          className={
-            controls?.myMic.state === 'active'
-              ? 'toolbar-icon-btn no-drag active'
-              : controls?.myMic.state === 'muted'
-                ? 'toolbar-icon-btn no-drag muted-state'
-                : 'toolbar-icon-btn no-drag'
+        {/* My Mic (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('mic', micTooltipLabel, e.currentTarget)
           }
-          disabled={!controls || controls.myMic.disabled}
-          aria-pressed={controls?.myMic.pressed ?? false}
-          title={controls?.myMic.title ?? 'Microphone'}
-          aria-label={controls?.myMic.title ?? 'My Mic'}
-          onClick={() =>
-            void window.elmDesktop.dispatchHostToolbarAction({
-              type: 'toggle-mic',
-            })
-          }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
         >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            {controls?.myMic.state === 'active' ? (
-              <>
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                <line x1="12" y1="19" x2="12" y2="22" />
-              </>
-            ) : (
-              <>
-                <line x1="2" y1="2" x2="22" y2="22" />
-                <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
-                <path d="M5 10v2a7 7 0 0 0 12 5" />
-                <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
-                <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
-                <line x1="12" y1="19" x2="12" y2="22" />
-              </>
-            )}
-          </svg>
-          <span>
-            {controls?.myMic.state === 'active'
-              ? 'Mic On'
-              : controls?.myMic.state === 'muted'
-                ? 'Muted'
-                : controls?.myMic.state === 'unavailable'
-                  ? 'Mic N/A'
-                  : 'My Mic'}
-          </span>
-        </button>
-
-        {/* Device Sound */}
-        <button
-          type="button"
-          data-testid="toolbar-device-sound-btn"
-          data-state={controls?.deviceSound.state ?? 'stopped'}
-          className={
-            controls?.deviceSound.state === 'active'
-              ? 'toolbar-icon-btn no-drag active'
-              : 'toolbar-icon-btn no-drag'
-          }
-          disabled={!controls || controls.deviceSound.disabled}
-          aria-pressed={controls?.deviceSound.pressed ?? false}
-          title={controls?.deviceSound.title ?? 'Device Sound'}
-          aria-label={controls?.deviceSound.title ?? 'Device Sound'}
-          onClick={() =>
-            void window.elmDesktop.dispatchHostToolbarAction({
-              type: 'toggle-device-sound',
-            })
-          }
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            {controls?.deviceSound.state === 'active' ? (
-              <>
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-              </>
-            ) : (
-              <>
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                <line x1="22" y1="9" x2="16" y2="15" />
-                <line x1="16" y1="9" x2="22" y2="15" />
-              </>
-            )}
-          </svg>
-          <span>
-            {controls?.deviceSound.state === 'active'
-              ? 'Sound On'
-              : controls?.deviceSound.state === 'unavailable'
-                ? 'Sound N/A'
-                : 'Device Sound'}
-          </span>
-        </button>
-
-        {/* My Screen (Start / Stop Sharing) */}
-        {controls?.myScreen.state === 'sharing' ? (
           <button
             type="button"
-            data-testid="host-stop-sharing-button"
-            className="toolbar-icon-btn no-drag active"
-            title={controls.myScreen.title}
-            aria-label="Stop Sharing"
-            onClick={() =>
-              void window.elmDesktop.dispatchHostToolbarAction({
-                type: 'stop-screen',
-              })
+            data-testid="toolbar-my-mic-btn"
+            data-state={controls?.myMic.state ?? 'stopped'}
+            className={
+              controls?.myMic.state === 'active'
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : controls?.myMic.state === 'muted'
+                  ? 'toolbar-icon-btn host-icon-only-btn no-drag muted-state'
+                  : 'toolbar-icon-btn host-icon-only-btn no-drag'
             }
+            disabled={!controls || controls.myMic.disabled}
+            aria-pressed={controls?.myMic.pressed ?? false}
+            aria-label={controls?.myMic.title ?? 'My Microphone'}
+            onFocus={(e) =>
+              scheduleTooltip('mic', micTooltipLabel, e.currentTarget)
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.dispatchHostToolbarAction({
+                type: 'toggle-mic',
+              });
+            }}
           >
             <svg
-              width="14"
-              height="14"
+              width="15"
+              height="15"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
@@ -261,29 +295,69 @@ export function HostFloatingToolbarWindow(props: {
               strokeLinejoin="round"
               aria-hidden="true"
             >
-              <rect x="2" y="3" width="20" height="14" rx="2" />
-              <line x1="8" y1="21" x2="16" y2="21" />
-              <line x1="12" y1="17" x2="12" y2="21" />
+              {controls?.myMic.state === 'active' ? (
+                <>
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </>
+              ) : (
+                <>
+                  <line x1="2" y1="2" x2="22" y2="22" />
+                  <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
+                  <path d="M5 10v2a7 7 0 0 0 12 5" />
+                  <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </>
+              )}
             </svg>
-            <span>Stop Sharing</span>
           </button>
-        ) : (
+        </span>
+
+        {/* Device Sound (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip(
+              'device-sound',
+              deviceSoundTooltipLabel,
+              e.currentTarget
+            )
+          }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
+        >
           <button
             type="button"
-            data-testid="host-start-sharing-button"
-            className="primary-btn compact-toolbar-primary no-drag"
-            disabled={!controls || controls.myScreen.disabled}
-            title={controls?.myScreen.title ?? 'Start Sharing'}
-            aria-label="Start Sharing"
-            onClick={() =>
-              void window.elmDesktop.dispatchHostToolbarAction({
-                type: 'start-screen',
-              })
+            data-testid="toolbar-device-sound-btn"
+            data-state={controls?.deviceSound.state ?? 'stopped'}
+            className={
+              controls?.deviceSound.state === 'active'
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : 'toolbar-icon-btn host-icon-only-btn no-drag'
             }
+            disabled={!controls || controls.deviceSound.disabled}
+            aria-pressed={controls?.deviceSound.pressed ?? false}
+            aria-label={controls?.deviceSound.title ?? 'Device Sound'}
+            onFocus={(e) =>
+              scheduleTooltip(
+                'device-sound',
+                deviceSoundTooltipLabel,
+                e.currentTarget
+              )
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.dispatchHostToolbarAction({
+                type: 'toggle-device-sound',
+              });
+            }}
           >
             <svg
-              width="14"
-              height="14"
+              width="15"
+              height="15"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
@@ -292,91 +366,393 @@ export function HostFloatingToolbarWindow(props: {
               strokeLinejoin="round"
               aria-hidden="true"
             >
-              <rect x="2" y="3" width="20" height="14" rx="2" />
-              <line x1="8" y1="21" x2="16" y2="21" />
-              <line x1="12" y1="17" x2="12" y2="21" />
+              {controls?.deviceSound.state === 'active' ? (
+                <>
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                </>
+              ) : (
+                <>
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <line x1="22" y1="9" x2="16" y2="15" />
+                  <line x1="16" y1="9" x2="22" y2="15" />
+                </>
+              )}
             </svg>
-            <span>
-              {controls?.myScreen.state === 'starting'
-                ? 'Starting…'
-                : controls?.myScreen.state === 'unavailable'
-                  ? 'Screen N/A'
-                  : 'Start Sharing'}
-            </span>
           </button>
-        )}
+        </span>
 
-        {/* Source Picker */}
-        <button
-          type="button"
-          data-testid="host-source-picker-toggle"
-          className={
-            overlay.sourcePickerOpen
-              ? 'small-secondary-btn no-drag active'
-              : 'small-secondary-btn no-drag'
+        {/* Peer / Viewer Mic (icon-only: request Viewer mic ON, or mute/unmute incoming Viewer mic) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('peer-mic', peerMicTooltipLabel, e.currentTarget)
           }
-          disabled={!controls || controls.sourcePicker.disabled}
-          aria-expanded={overlay.sourcePickerOpen}
-          title={controls?.sourcePicker.title ?? 'Select window or display'}
-          onClick={() => void window.elmDesktop.toggleHostSourcePickerPopup()}
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
         >
-          Source ▾
-        </button>
-
-        {/* Chat Popup */}
-        <button
-          type="button"
-          data-testid="floating-chat-toggle"
-          className={
-            overlay.chatOpen
-              ? 'small-secondary-btn no-drag active'
-              : 'small-secondary-btn no-drag'
-          }
-          title="Open or close independent private Chat popup"
-          onClick={() => {
-            if (overlay.chatOpen) {
-              void window.elmDesktop.closeSeparateChatWindow();
-            } else {
-              void window.elmDesktop.openSeparateChatWindow();
+          <button
+            type="button"
+            data-testid="toolbar-peer-mic-btn"
+            data-state={
+              overlay.peerMicActive
+                ? overlay.peerMicMutedLocally
+                  ? 'muted'
+                  : 'active'
+                : overlay.peerMicRequestPending
+                  ? 'pending'
+                  : 'stopped'
             }
-          }}
-        >
-          Chat
-        </button>
+            className={
+              overlay.peerMicActive && !overlay.peerMicMutedLocally
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : overlay.peerMicActive && overlay.peerMicMutedLocally
+                  ? 'toolbar-icon-btn host-icon-only-btn no-drag muted-state'
+                  : 'toolbar-icon-btn host-icon-only-btn no-drag'
+            }
+            disabled={!controls}
+            aria-pressed={Boolean(
+              overlay.peerMicActive && !overlay.peerMicMutedLocally
+            )}
+            aria-label={peerMicTooltipLabel}
+            onFocus={(e) =>
+              scheduleTooltip('peer-mic', peerMicTooltipLabel, e.currentTarget)
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.dispatchHostToolbarAction({
+                type: 'toggle-peer-mic',
+              });
+            }}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              {overlay.peerMicActive && !overlay.peerMicMutedLocally ? (
+                <>
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </>
+              ) : (
+                <>
+                  <line x1="2" y1="2" x2="22" y2="22" />
+                  <path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2" />
+                  <path d="M5 10v2a7 7 0 0 0 12 5" />
+                  <path d="M15 9.34V5a3 3 0 0 0-5.68-1.33" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </>
+              )}
+            </svg>
+          </button>
+        </span>
 
-        {/* Settings Popup */}
-        <button
-          type="button"
-          data-testid="floating-settings-toggle"
-          className={
-            overlay.settingsOpen
-              ? 'small-secondary-btn no-drag active'
-              : 'small-secondary-btn no-drag'
+        {/* My Screen — Start / Stop Sharing (icon-only, distinct icons) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('share', shareTooltipLabel, e.currentTarget)
           }
-          aria-expanded={overlay.settingsOpen}
-          title="Appearance settings"
-          onClick={() => void window.elmDesktop.toggleHostSettingsPopup()}
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
         >
-          Settings
-        </button>
+          {controls?.myScreen.state === 'sharing' ? (
+            <button
+              type="button"
+              data-testid="host-stop-sharing-button"
+              className="toolbar-icon-btn host-icon-only-btn no-drag active"
+              aria-label="Stop Sharing"
+              aria-pressed={true}
+              onFocus={(e) =>
+                scheduleTooltip('share', shareTooltipLabel, e.currentTarget)
+              }
+              onBlur={hideTooltip}
+              onClick={() => {
+                hideTooltip();
+                void window.elmDesktop.dispatchHostToolbarAction({
+                  type: 'stop-screen',
+                });
+              }}
+            >
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <rect x="9" y="7" width="6" height="6" fill="currentColor" />
+                <line x1="8" y1="21" x2="16" y2="21" />
+                <line x1="12" y1="17" x2="12" y2="21" />
+              </svg>
+            </button>
+          ) : (
+            <button
+              type="button"
+              data-testid="host-start-sharing-button"
+              className="primary-btn host-icon-only-btn no-drag"
+              disabled={!controls || controls.myScreen.disabled}
+              aria-label={
+                controls?.myScreen.state === 'starting'
+                  ? 'Starting screen share'
+                  : 'Start Sharing'
+              }
+              aria-pressed={false}
+              onFocus={(e) =>
+                scheduleTooltip('share', shareTooltipLabel, e.currentTarget)
+              }
+              onBlur={hideTooltip}
+              onClick={() => {
+                hideTooltip();
+                void window.elmDesktop.dispatchHostToolbarAction({
+                  type: 'start-screen',
+                });
+              }}
+            >
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <polygon points="10 7 16 10 10 13 10 7" fill="currentColor" />
+                <line x1="8" y1="21" x2="16" y2="21" />
+                <line x1="12" y1="17" x2="12" y2="21" />
+              </svg>
+            </button>
+          )}
+        </span>
+
+        {/* Source Picker (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('source', 'Select Source', e.currentTarget)
+          }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
+        >
+          <button
+            type="button"
+            data-testid="host-source-picker-toggle"
+            className={
+              overlay.sourcePickerOpen
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : 'toolbar-icon-btn host-icon-only-btn no-drag'
+            }
+            disabled={!controls || controls.sourcePicker.disabled}
+            aria-expanded={overlay.sourcePickerOpen}
+            aria-label="Select window or display source"
+            onFocus={(e) =>
+              scheduleTooltip('source', 'Select Source', e.currentTarget)
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.toggleHostSourcePickerPopup();
+            }}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="3" y="4" width="14" height="11" rx="2" />
+              <path d="M7 19h12a2 2 0 0 0 2-2V9" />
+            </svg>
+          </button>
+        </span>
+
+        {/* Chat Popup (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('chat', 'Private Chat', e.currentTarget)
+          }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
+        >
+          <button
+            type="button"
+            data-testid="floating-chat-toggle"
+            className={
+              overlay.chatOpen
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : 'toolbar-icon-btn host-icon-only-btn no-drag'
+            }
+            aria-pressed={overlay.chatOpen}
+            aria-label="Toggle private Chat popup"
+            onFocus={(e) =>
+              scheduleTooltip('chat', 'Private Chat', e.currentTarget)
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              if (overlay.chatOpen) {
+                void window.elmDesktop.closeSeparateChatWindow();
+              } else {
+                void window.elmDesktop.openSeparateChatWindow();
+              }
+            }}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            {overlay.hasUnreadChat && (
+              <span
+                className="chat-unread-dot"
+                data-testid="chat-unread-dot"
+                aria-hidden="true"
+              />
+            )}
+          </button>
+        </span>
+
+        {/* Settings Popup (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('settings', 'Appearance Settings', e.currentTarget)
+          }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
+        >
+          <button
+            type="button"
+            data-testid="floating-settings-toggle"
+            className={
+              overlay.settingsOpen
+                ? 'toolbar-icon-btn host-icon-only-btn no-drag active'
+                : 'toolbar-icon-btn host-icon-only-btn no-drag'
+            }
+            aria-expanded={overlay.settingsOpen}
+            aria-label="Appearance settings"
+            onFocus={(e) =>
+              scheduleTooltip(
+                'settings',
+                'Appearance Settings',
+                e.currentTarget
+              )
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.toggleHostSettingsPopup();
+            }}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        </span>
 
         <span className="floating-toolbar-divider" aria-hidden="true" />
 
-        {/* End Session */}
-        <button
-          type="button"
-          data-testid="floating-end-session"
-          className="danger-btn no-drag"
-          title="End approved session for both participants"
-          onClick={() =>
-            void window.elmDesktop.dispatchHostToolbarAction({
-              type: 'end-session',
-            })
+        {/* End Session (icon-only) */}
+        <span
+          className="host-tooltip-trigger no-drag"
+          onPointerEnter={(e) =>
+            scheduleTooltip('end-session', 'End Session', e.currentTarget)
           }
+          onPointerLeave={hideTooltip}
+          onPointerDown={hideTooltip}
         >
-          End Session
-        </button>
+          <button
+            type="button"
+            data-testid="floating-end-session"
+            className="danger-btn host-icon-only-btn no-drag"
+            aria-label="End Session"
+            onFocus={(e) =>
+              scheduleTooltip('end-session', 'End Session', e.currentTarget)
+            }
+            onBlur={hideTooltip}
+            onClick={() => {
+              hideTooltip();
+              void window.elmDesktop.dispatchHostToolbarAction({
+                type: 'end-session',
+              });
+            }}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </span>
       </div>
+
+      {activeTooltip && (
+        <div
+          ref={tooltipRef}
+          role="tooltip"
+          data-testid="host-toolbar-tooltip"
+          data-tooltip-id={activeTooltip.id}
+          className="host-toolbar-tooltip"
+          style={{ left: `${tooltipLeftPx}px` }}
+        >
+          {activeTooltip.label}
+        </div>
+      )}
     </main>
   );
 }
@@ -443,7 +819,7 @@ export function HostSourcePickerPopup(props: {
 
   return (
     <main
-      className="overlay-popup-shell"
+      className="overlay-popup-shell host-ui-scope"
       data-testid="host-source-popover"
       role="dialog"
       aria-label="Select display or window to share"
@@ -511,7 +887,7 @@ export function HostSettingsPopup(props: {
 
   return (
     <main
-      className="overlay-popup-shell floating-settings-sidebar"
+      className="overlay-popup-shell floating-settings-sidebar host-ui-scope"
       data-testid="floating-settings-sidebar"
       role="dialog"
       aria-label="Host appearance settings"
@@ -569,36 +945,6 @@ export function HostSettingsPopup(props: {
             value={appearance.chatBgOpacity}
             onChange={(e) =>
               updateAppearance({ chatBgOpacity: Number(e.target.value) })
-            }
-          />
-        </label>
-
-        <label className="sidebar-slider">
-          <span>Toolbar Font Size: {appearance.barTextSizePx}px</span>
-          <input
-            type="range"
-            data-testid="settings-toolbar-fontsize-slider"
-            min={11}
-            max={16}
-            step={1}
-            value={appearance.barTextSizePx}
-            onChange={(e) =>
-              updateAppearance({ barTextSizePx: Number(e.target.value) })
-            }
-          />
-        </label>
-
-        <label className="sidebar-slider">
-          <span>Chat Font Size: {appearance.chatTextSizePx}px</span>
-          <input
-            type="range"
-            data-testid="settings-chat-fontsize-slider"
-            min={12}
-            max={18}
-            step={1}
-            value={appearance.chatTextSizePx}
-            onChange={(e) =>
-              updateAppearance({ chatTextSizePx: Number(e.target.value) })
             }
           />
         </label>
@@ -721,7 +1067,7 @@ export function PrivateChatPopupWindow(props: {
 
   return (
     <main
-      className="chat-popup-shell"
+      className="chat-popup-shell host-ui-scope"
       data-testid="floating-panel-chat"
       style={{
         backgroundColor: buildBackgroundRgba(
@@ -751,7 +1097,6 @@ export function PrivateChatPopupWindow(props: {
             type="button"
             data-testid="chat-popup-close-button"
             className="small-secondary-btn no-drag"
-            title="Close Chat popup without ending session"
             aria-label="Close Chat"
             onClick={() => void window.elmDesktop.closeSeparateChatWindow()}
           >
@@ -847,8 +1192,8 @@ export function PrivateChatPopupWindow(props: {
             <button
               type="button"
               className="small-secondary-btn"
+              aria-label="Attach image"
               onClick={() => fileInputRef.current?.click()}
-              title="Attach an image in memory for this session only"
             >
               Attach Image
             </button>

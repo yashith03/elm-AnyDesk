@@ -4,6 +4,7 @@ import {
   PILOT_NETWORK_POLICY,
   PRESENCE_LOOKUP_MAX_BATCH_SIZE,
   PROTOCOL_VERSION,
+  REQUIRED_API_CAPABILITIES,
   type AccountProfile,
   type AnonymousDeviceRegistrationResponse,
   type ApiHealthResponse,
@@ -355,6 +356,7 @@ export function createApiWorker(deps?: ApiWorkerDependencies): ExportedHandler<E
           phase: 'phase-5-staging-and-installer-pilot',
           protocolVersion: PROTOCOL_VERSION,
           timestamp: new Date().toISOString(),
+          capabilities: [...REQUIRED_API_CAPABILITIES],
         };
         return withCors(Response.json(payload));
       }

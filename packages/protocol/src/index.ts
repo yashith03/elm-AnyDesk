@@ -336,10 +336,12 @@ export type WebRtcSignalPayload =
       readonly type: 'offer';
       readonly sdp: string;
       readonly activeTracks: readonly WebRtcTrackDescriptor[];
+      readonly negotiationId?: string;
     }
   | {
       readonly type: 'answer';
       readonly sdp: string;
+      readonly negotiationId?: string;
     }
   | {
       readonly type: 'ice-candidate';
@@ -491,6 +493,28 @@ export interface PilotDownloadManifest {
 }
 
 /**
+ * Required backend capabilities expected by the current desktop client.
+ * Older Workers (e.g. pre-f7b8477) omit `capabilities` on GET /health.
+ */
+export const REQUIRED_API_CAPABILITIES = Object.freeze([
+  'presence_heartbeat',
+  'presence_lookup',
+  'invite_cancel',
+  'session_heartbeat',
+  'mutation_snapshots',
+] as const);
+
+export type ApiCapability = (typeof REQUIRED_API_CAPABILITIES)[number];
+
+export interface BackendCompatibilityStatus {
+  readonly checked: boolean;
+  readonly compatible: boolean;
+  readonly missingCapabilities: readonly string[];
+  readonly serverProtocolVersion: string | null;
+  readonly message: string | null;
+}
+
+/**
  * API health check response contract.
  */
 export interface ApiHealthResponse {
@@ -498,4 +522,5 @@ export interface ApiHealthResponse {
   readonly phase: 'phase-5-staging-and-installer-pilot';
   readonly protocolVersion: typeof PROTOCOL_VERSION;
   readonly timestamp: string;
+  readonly capabilities?: readonly string[];
 }
